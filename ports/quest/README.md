@@ -336,11 +336,11 @@ and look, so you can walk a full circle around Link and look behind you.
 - Every rig change (turns, recenters, placements, blinks, following Link, the floor) happens at the
   game's camera update, before your head is written, so the frame culled from your head is the frame
   drawn with that rig.
-- No comfort vignette by default. `TRIAEVUM_XR_VIGNETTE=1` darkens the edge of view while the anchor or
-  the floor glides (running, landing, swimming, diving) or during a smooth turn.
+- No comfort vignette: it is gone (there is no knob for it). Glides and smooth turns show the full field
+  of view.
 - `TRIAEVUM_XR_CAMERA=native` runs W1 for A/B on the device: the native camera, no stick rotation (even
   with `TRIAEVUM_XR_MOVE_REF` set), no snap turns or D-pad flicks (the right stick moves Link while the
-  left stick is idle, as in W1) and no vignette. `held` runs mode L (the native camera with the stick
+  left stick is idle, as in W1). `held` runs mode L (the native camera with the stick
   rotation, snap turns and flicks). Without the TopScreen profile the mode is `held`
   (`TRIAEVUM_XR_WORLD camera=held reason=ui_profile`).
 
@@ -352,13 +352,12 @@ and look, so you can walk a full circle around Link and look behind you.
 | `TRIAEVUM_XR_TURN` | `smooth` (default) or snap degrees (10-90, instant, no blink) |
 | `TRIAEVUM_XR_TURN_SPEED` | smooth turn rate, 30-360 deg/s, default 120 |
 | `TRIAEVUM_XR_TETHER` | `glide` (default: the world slides with running Link, keeping him within the placement distance of the play-area centre) or `leash` (W1's blink when he outruns the leash) |
-| `TRIAEVUM_XR_VIGNETTE=1` | the comfort vignette during glides and smooth turns (off by default) |
 | `TRIAEVUM_XR_SEATED=1` | seated: LOCAL_FLOOR, the floor offset from your seated eye height at each placement, leash 2.5 m |
 | `TRIAEVUM_XR_INPUT_LOG=1` | also log `TRIAEVUM_XR_STICK theta= yaw_cam= yaw_dir= psi_ref=` (latches and every 0.5 s) |
 
 | Line | Meaning |
 |---|---|
-| `TRIAEVUM_XR_WORLD camera=r reason= cull_fov= move_ref= turn= flicks= vignette=` | the camera mode at start (`camera=native`: `stick=0 flicks=0 vignette=0`) |
+| `TRIAEVUM_XR_WORLD camera=r reason= cull_fov= move_ref= turn= flicks=` | the camera mode at start (`camera=native`: `stick=0 flicks=0`) |
 | `TRIAEVUM_XR_CAMERA owner=vr\|vr_probe\|native held=0x.. (names) probe_held=0x.. rig_frozen= talking= z_target= layer= pending= wall_fade=` | every owner change at Camera_Update (`owner=` is also on the `state=` lines) |
 | `TRIAEVUM_XR_CAMWRITE first eye= at= yaw= pitch= fov= head_t=` | the first head write after each owner change |
 | `TRIAEVUM_XR_CAMWRITE updates= owned= owned_pct= probes= held= eye= yaw= pitch= fov= fov_max= fov_widened= fov_hooks= fov_loaded= fov_restored= head_failures= seq_lag= wall_fade_updates= reseeds= rescues= reseed_hits= always_candidates= always_granted= turns=` | every 5 s: `owned_pct` > 95 in gameplay; `fov_hooks` > 0 and `fov=130` (the FovScalar returned the cull FOV; `fov_loaded` is play+0x198 as the native load read it; `fov_max` > 130 after looking steeply up or down); `seq_lag` = visual frames between the camera write and the frame drawn (0 expected) |
@@ -366,12 +365,11 @@ and look, so you can walk a full circle around Link and look behind you.
 | `TRIAEVUM_XR_HELD entries=reason:count,...` | Held entries by reason (5 s) |
 | `TRIAEVUM_XR_CAMERA cutscene_camera_settled settle_s= by=still\|time`, `TRIAEVUM_XR_CAMERA cutscene_camera_moved moved_m= turned_deg= settle_s= by=` | the hand-over ended (the motion window opens); a Held cutscene went to the screen |
 | `TRIAEVUM_XR_PROBE start reason= length_m=`, `TRIAEVUM_XR_PROBE reason= choice=back\|back_left\|back_right\|left\|right\|fallback dist_m= clear_m=b,bl,br,l,r probes= timeout= wait_s= held_bypassed=0x.. (names) held_updates=` | placement probes; `TRIAEVUM_XR_RIG event=place ... probed=1`; `timeout=0` and `probes>=3` expected after doors and loads |
-| `TRIAEVUM_XR_GEOMETRY fade= cause=q\|link\|below_floor\|reseed\|place\|layer q= head=` | the wall fade starts or ends; `TRIAEVUM_XR_OVERLAY wall_fade_frames= vignette_frames=` every 5 s |
+| `TRIAEVUM_XR_GEOMETRY fade= cause=q\|link\|below_floor\|reseed\|place\|layer q= head=` | the wall fade starts or ends; `TRIAEVUM_XR_OVERLAY wall_fade_frames= wall_fade_max=` every 5 s |
 | `TRIAEVUM_XR_GEOMETRY reseed=soft\|hard result=clear\|hit p_u= fade=` | the head test from Link's head after Held updates (soft) or a blink (hard; a hit re-places, `reason=blink_geometry`) |
 | `TRIAEVUM_XR_FLICK axis=x\|y dir=`, `TRIAEVUM_XR_TURN dir= step_deg= psi= wall_fade=`, `TRIAEVUM_XR_RIG event=turn` | right stick flicks and snap turns |
 | `TRIAEVUM_XR_INPUT right_stick=flicks\|move`, `TRIAEVUM_XR_INPUT flicks=0\|1 left_active=` | the right stick's job at start (by camera mode) and whenever the left controller comes or goes |
 | `TRIAEVUM_XR_STICK rotations= bypassed= theta_abs_max= mode=` | stick rotation (5 s) |
-| `TRIAEVUM_XR_VIGNETTE strength=`, `TRIAEVUM_XR_SWAPCHAIN vignette=64x64 array=8`, `TRIAEVUM_XR_VIGNETTE ready` | the vignette |
 
 On a PC, `TRIAEVUM_XR_PREVIEW=left` with `TRIAEVUM_XR_PREVIEW_HEAD=circle:1.2,8` (and the TopScreen
 profile) drives the game camera from a head walking a 1.2 m circle around Link in 8 s, looking at him;
@@ -406,7 +404,7 @@ Implementation notes (where W2 differs from the spec text):
   pose (G11, W5). The ocarina bypass uses TopScreen's ocarina state and flags2 0x08000000. In a mirrored
   (Master Quest) frame theta is computed in the VR world [unverified until W5].
 - `TRIAEVUM_XR_CAMERA=native` is the W1 baseline: no flicks (`SetWorldFlicks(false)`: the right stick
-  keeps the one-handed movement of `RightStickMove::WhenLeftIdle`), no turns, no vignette, no stick
+  keeps the one-handed movement of `RightStickMove::WhenLeftIdle`), no turns, no stick
   rotation; `TRIAEVUM_XR_MOVE_REF` is ignored there.
 - The R_always light budget walk runs while the head owns the camera even with Extended draw distance
   off (with the light arena's overflow relief). The pop-in counter of the W2 exit is approximated by

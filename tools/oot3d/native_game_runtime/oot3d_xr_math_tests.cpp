@@ -923,10 +923,6 @@ void TestSnapTurn() {
     CHECK_NEAR(WrapAngle(spun.Yaw - rig.Yaw), 0.0, 1e-12);
     CHECK_LE(Length(spun.Anchor - rig.Anchor), 1e-9);
     CHECK(spun.Yaw > -kPi && spun.Yaw <= kPi);
-    // Vignette strength (§5.7).
-    CHECK_NEAR(VignetteStrength(1.5, 0.0), 0.5, 1e-12);
-    CHECK_NEAR(VignetteStrength(0.0, kPi / 4.0), 0.5, 1e-12);
-    CHECK_NEAR(VignetteStrength(-9.0, 0.0), 1.0, 0.0);
     Report("snap turn");
 }
 
@@ -1228,7 +1224,6 @@ void TestRobustness() {
         SnapTurnDetector detector;
         CHECK(detector.Update(std::nan("")) == 0);
         CHECK(WrapAngle(std::nan("")) == 0.0);
-        CHECK(VignetteStrength(std::nan(""), std::nan("")) == 0.0);
         CHECK(RadiansToBinAngle(1e9) == RadiansToBinAngle(WrapAngle(1e9)));
         CHECK(std::string_view(RigEventName(RigEvent::Idle)) == "idle");
     }

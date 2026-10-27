@@ -136,23 +136,21 @@ bool XrWorldSession::ConfigureCamera(bool topScreenProfile) {
     mStickEnabled = !native && mMoveRef != C::MoveReference::Native;
     mCullFov = C::ParseCullFov(std::getenv("TRIAEVUM_XR_CULL_FOV"));
     mWriteFov = mCullFov;
-    // Smooth turning by default (TRIAEVUM_XR_TURN=<degrees> snaps instead); no comfort vignette unless
-    // TRIAEVUM_XR_VIGNETTE=1.
+    // Smooth turning by default (TRIAEVUM_XR_TURN=<degrees> snaps instead). No comfort vignette.
     const std::string_view turn = EnvText("TRIAEVUM_XR_TURN");
     mSmoothTurn = turn.empty() || turn == "smooth";
     if (!mSmoothTurn) mTurnDegrees = EnvNumber("TRIAEVUM_XR_TURN", M::kDefaultSnapDegrees, 10.0, 90.0);
     mSmoothTurnDegreesPerSecond = EnvNumber("TRIAEVUM_XR_TURN_SPEED", 120.0, 30.0, 360.0);
-    mVignetteEnabled = !native && EnvIs("TRIAEVUM_XR_VIGNETTE", "1");
 #if defined(TRIAEVUM_QUEST_OPENXR)
     // W2's right-stick job (§5.5, §7): snap turns and D-pad flicks in mode R and mode L. The native A/B
     // baseline keeps W1's right stick (it moves Link while the left stick is idle, nothing else).
     TriAevumQuestXr::SetWorldFlicks(!native);
 #endif
     XrWorldLog("TRIAEVUM_XR_WORLD camera=%s reason=%s ui_profile=%s cull_fov=%.0f move_ref=%s stick=%d turn=%s "
-               "turn_deg=%.0f turn_dps=%.0f flicks=%d vignette=%d",
+               "turn_deg=%.0f turn_dps=%.0f flicks=%d",
                XrCameraModeName(mCameraMode), reason, topScreenProfile ? "topscreen" : "other", mCullFov,
                C::MoveReferenceName(mMoveRef), mStickEnabled ? 1 : 0, mSmoothTurn ? "smooth" : "snap", mTurnDegrees,
-               mSmoothTurnDegreesPerSecond, native ? 0 : 1, mVignetteEnabled ? 1 : 0);
+               mSmoothTurnDegreesPerSecond, native ? 0 : 1);
     return mModeR;
 }
 
@@ -413,18 +411,6 @@ void XrWorldSession::SetWallFade(double fade, const char* cause) {
 #endif
 }
 
-void XrWorldSession::SetVignette(double strength) {
-    strength = std::clamp(std::isfinite(strength) ? strength : 0.0, 0.0, 1.0);
-    if ((strength > 0.05) != (mVignette > 0.05))
-        XrWorldLog("TRIAEVUM_XR_VIGNETTE strength=%.2f anchor_mps=%.2f yaw_dps=%.0f", strength, mAnchorSpeedMps,
-                   Degrees(mYawRate));
-    if (std::fabs(strength - mVignette) < 1e-3) return;
-    mVignette = strength;
-#if defined(TRIAEVUM_QUEST_OPENXR)
-    TriAevumQuestXr::SetVignette(static_cast<float>(strength));
-#endif
-}
-
 void XrWorldSession::PublishActorHead(bool valid, const M::Vec3& head) {
     if (mActors == nullptr) return;
     mActors->VrAlways = valid;
@@ -493,7 +479,6 @@ void XrWorldSession::ApplyRigInputs(const XrGuestSnapshot& snapshot, double now,
         }
         return;
     }
-    mYawRate = 0.0;
     if (!worldShown) return;
     M::Pose head;
     if (!HeadInTracking(&head)) return;
@@ -512,7 +497,6 @@ void XrWorldSession::ApplyRigInputs(const XrGuestSnapshot& snapshot, double now,
         if (std::fabs(axis) > 0.2F) {
             const double rate = -static_cast<double>(axis) * M::DegreesToRadians(mSmoothTurnDegreesPerSecond);
             mRig = M::ApplyYawTurn(mRig, head.Position, rate * dt);
-            mYawRate = rate;
         }
     }
 #else
@@ -526,7 +510,6 @@ void XrWorldSession::ApplyRigInputs(const XrGuestSnapshot& snapshot, double now,
 // row freezes the rig (talks, shops, item gets, cutscenes, subcameras). A blink moves the head in the game
 // world, so the head-in-geometry test is reseeded from Link's head (§4.4).
 void XrWorldSession::FollowLink(const XrGuestSnapshot& snapshot, double dt, bool frozen) {
-    mAnchorSpeedMps = 0.0;
     if (mClassifierState != W::XrWorldState::World || !mRigValid || mPending.Active || !snapshot.PlayerValid ||
         frozen || !(dt > 0.0))
         return;
@@ -545,7 +528,6 @@ void XrWorldSession::FollowLink(const XrGuestSnapshot& snapshot, double dt, bool
 #endif
     } else if (tether.Event == M::RigEvent::Glide) {
         mRig = tether.NewRig;
-        mAnchorSpeedMps = std::max(mAnchorSpeedMps, tether.AnchorSpeedMps);
     }
     M::FloorInput floor;
     floor.LinkY = linkWorld.Y;
@@ -559,7 +541,6 @@ void XrWorldSession::FollowLink(const XrGuestSnapshot& snapshot, double dt, bool
     floor.Dt = dt;
     const auto floorStep = M::UpdateFloor(mFloor, mFloorConfig, floor);
     if (std::isfinite(floorStep.AnchorY)) mRig.Anchor.Y = floorStep.AnchorY;
-    mAnchorSpeedMps = std::max(mAnchorSpeedMps, floorStep.SpeedMps);
     if (floorStep.Blink) {
         ++mBlinks;
         BumpEpoch("floor", 0.0);
@@ -964,9 +945,6 @@ void XrWorldSession::StampFrame(const XrGuestSnapshot& snapshot, const XrFrameFa
     mState.World = world;
     mState.Rig = mRig;
     mState.RigEpoch = mRigEpoch;
-    // §5.7: the vignette from the anchor's glides and the smooth turn's yaw rate, World only; the native A/B
-    // baseline has none (W1).
-    SetVignette(world && mVignetteEnabled ? M::VignetteStrength(mAnchorSpeedMps, mYawRate) : 0.0);
     if (!world) {
         SetWallFade(0.0, "layer");
         if (mActorHeadPublished) PublishActorHead(false, {});

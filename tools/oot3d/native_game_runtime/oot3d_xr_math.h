@@ -5,7 +5,7 @@
 //    the z/w rows; the per-eye replacement rows F' = blockdiag(R+, I2) * P_eye,d * V_i * M * V_g,d^-1;
 //  - the mirror rule (det R against det Rot(V_g)) and the sky rows (rotation only);
 //  - the rig's state functions: placement and recenter, leash/glide tether with idle re-centre, floor
-//    follow (ground, swim, dive), snap turn, seated offset, vignette strength.
+//    follow (ground, swim, dive), snap turn, seated offset.
 //
 // No renderer, OpenXR, SDL or guest types; callers convert at the boundary. Header-only, C++20, std only.
 //
@@ -802,8 +802,8 @@ struct TetherConfig {
     double TeleportSpeedMps = 30.0;   // a faster step is a teleport: no travel direction from it
     // Glide: the anchor takes the excess beyond r_room, but never faster than this. Running Link (~3.6 m/s)
     // glides exactly; an excess that appears at once (a snap turn pivoting on the head, a near-centre
-    // placement ahead of the gaze, a hookshot pull) is worked off over a few frames under the
-    // vignette instead of jumping the world by metres in one unannounced frame.
+    // placement ahead of the gaze, a hookshot pull) is worked off over a few frames
+    // instead of jumping the world by metres in one unannounced frame.
     double GlideMaxSpeedMps = 8.0;
     PlayArea Area;
     Vec3 CentreT;
@@ -841,7 +841,7 @@ struct TetherStep {
     Rig NewRig;
     Vec3 LinkT;                 // Link in T after the step
     double HeadDistanceM = 0.0; // Link to head, horizontal, after the step
-    double AnchorSpeedMps = 0.0;// glide speed (vignette input)
+    double AnchorSpeedMps = 0.0;// glide speed
 };
 
 // One guest update. `linkWorld` and `linkFacingYaw` are VR world; `headT` is the head position in T;
@@ -999,7 +999,7 @@ struct FloorStep {
     double AnchorY = 0.0;
     bool Blink = false;
     bool Gliding = false;
-    double SpeedMps = 0.0;  // |d a.y / dt| (vignette input)
+    double SpeedMps = 0.0;  // |d a.y / dt|
     FloorMode Mode = FloorMode::Ground;
 };
 
@@ -1124,7 +1124,7 @@ inline FloorStep UpdateFloor(FloorState& state, const FloorConfig& config, const
             state.BelowSeconds = 0.0;
             // The dive follow lags Link by about v * tau; a fast ascent (>= 3 m/s) would leave more than the
             // 1.5 m blink threshold to the swim target. The swim glide that takes over continues the dive's
-            // motion under the vignette, so it never blinks (until it settles).
+            // motion, so it never blinks (until it settles).
             state.FromDive = state.Gliding;
         }
 
@@ -1134,7 +1134,7 @@ inline FloorStep UpdateFloor(FloorState& state, const FloorConfig& config, const
                                 state.FromDive ? std::numeric_limits<double>::infinity() : blink, settle, false);
             if (!state.Gliding) state.FromDive = false;
         } else {
-            // Continuous follow under the vignette: no hysteresis, never a blink.
+            // Continuous follow: no hysteresis, never a blink.
             const double target = input.LinkY + s * (config.DiveHeadAboveLinkM - input.EyeHeightM);
             Detail::MoveAnchorY(state, step, target, dt, config.DiveTauS, hysteresis,
                                 std::numeric_limits<double>::infinity(), settle, true);
@@ -1192,13 +1192,6 @@ inline Rig SnapTurn(const Rig& rig, const Vec3& headT, int direction,
 inline double SeatedYOffset(double seatedEyeHeightM, double standingEyeHeightM = kStandingEyeHeightM) {
     if (!std::isfinite(seatedEyeHeightM)) return 0.0;
     return std::clamp(standingEyeHeightM - seatedEyeHeightM, -1.0, standingEyeHeightM);
-}
-
-// §5.7: clamp(max(|da/dt| / 3 m/s, |dpsi/dt| / 90 deg/s)).
-inline double VignetteStrength(double anchorSpeedMps, double yawRateRadiansPerSecond) {
-    const double a = std::isfinite(anchorSpeedMps) ? std::fabs(anchorSpeedMps) / 3.0 : 0.0;
-    const double b = std::isfinite(yawRateRadiansPerSecond) ? std::fabs(yawRateRadiansPerSecond) / (kPi / 2.0) : 0.0;
-    return std::clamp(std::max(a, b), 0.0, 1.0);
 }
 
 } // namespace Oot3dNativeGame::XrMath

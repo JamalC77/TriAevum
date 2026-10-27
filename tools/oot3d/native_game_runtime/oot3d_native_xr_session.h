@@ -163,7 +163,6 @@ class XrWorldSession {
     void LogDecision(const XrCamera::OwnerDecision& decision, const XrGuestSnapshot& snapshot,
                      const XrCameraGuest& camera);
     void SetWallFade(double fade, const char* cause);
-    void SetVignette(double strength);
     void PublishActorHead(bool valid, const XrMath::Vec3& head);
     XrMath::Vec3 LinkVrWorld(const XrGuestSnapshot& snapshot, bool floor) const;
     bool HeadInTracking(XrMath::Pose* head) const;
@@ -221,7 +220,6 @@ class XrWorldSession {
     double mTurnDegrees = XrMath::kDefaultSnapDegrees;
     bool mSmoothTurn = true;
     double mSmoothTurnDegreesPerSecond = 120.0;
-    bool mVignetteEnabled = false;      // TRIAEVUM_XR_VIGNETTE=1
     double mLastCameraUpdate = -1.0;
     double mLastRigInputs = -1.0;
     XrCamera::OwnerDecision mDecision;
@@ -257,8 +255,6 @@ class XrWorldSession {
     XrCamera::StickReference mStick;
     double mLastStickTime = -1.0;
     double mLastStickLog = -1.0;
-    double mVignette = 0.0;
-    double mAnchorSpeedMps = 0.0, mYawRate = 0.0;
     uint64_t mRecordingSequence = 0;
     NativeActorVisibilityState* mActors = nullptr;
     bool mActorHeadPublished = false;

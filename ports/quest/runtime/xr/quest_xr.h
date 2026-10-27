@@ -139,11 +139,9 @@ void RequestBlink(uint32_t rigEpoch, uint32_t fadeMs);
 const char* LayerModeName(LayerMode mode);
 // Haptic pulse: hand 0 left, 1 right, 2 both.
 void Pulse(int hand, uint32_t milliseconds);
-// W2 (§3.1, §4.4, §5.5, §5.7). Head inside geometry: 0..1 of black over the world while it shows
-// (combined with the transition fade by max). Vignette: 0..1, a VIEW-locked radial mask while the world
-// shows. Both any thread, applied on the next display frame.
+// W2 (§3.1, §4.4). Head inside geometry: 0..1 of black over the world while it shows (combined with the
+// transition fade by max). Any thread, applied on the next display frame.
 void SetWallFade(float alpha);
-void SetVignette(float strength);
 // W2's right-stick job (§5.5, §7), set by the guest at window setup: armed in mode R and mode L, off for
 // the TRIAEVUM_XR_CAMERA=native A/B baseline (W1's right stick: it moves Link while the left stick is
 // idle). Armed, the right stick moves Link only while the left controller is inactive
