@@ -323,6 +323,11 @@ class GfxRenderingAPIVulkan final : public GfxRenderingAPI,
     bool HasActiveFrame() const override { return mFrameActive; }
     void EndFrame() override;
     void FinishRender() override;
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    bool SelectXrView(uint32_t view) override;
+    void SetXrStereoViews(const StereoViews& views) override;
+    void SetNamespaceOutputExtent(uint64_t renderTargetNamespace, uint32_t width, uint32_t height) override;
+#endif
     int CreateFramebuffer() override;
     void UpdateFramebufferParameters(int fbId, uint32_t width, uint32_t height, uint32_t msaaLevel,
                                      bool openglInvertY, bool renderTarget, bool hasDepthBuffer,
@@ -967,6 +972,16 @@ class GfxRenderingAPIVulkan final : public GfxRenderingAPI,
             : Oot3d::RenderExtent{mSwapchainExtent.width,
                                   mSwapchainExtent.height};
     }
+    // The output the targets of one namespace follow: its own extent when set (in-world mode: ns1 at
+    // native density, the eye namespaces at the eye extent), else the presentation picture.
+    [[nodiscard]] Oot3d::RenderExtent NativePicaOutputExtent(uint64_t renderTargetNamespace) const noexcept {
+#if defined(TRIAEVUM_QUEST_OPENXR)
+        if (renderTargetNamespace < mXrNamespaceExtentSet.size() && mXrNamespaceExtentSet[renderTargetNamespace])
+            return mXrNamespaceExtents[renderTargetNamespace];
+#endif
+        (void)renderTargetNamespace;
+        return NativePicaOutputExtent();
+    }
     void ResetNativePicaRenderTargets(bool preserveDisplayImages = false);
     void ForgetNativePicaEffectNriTextures();
     void ApplyPendingNativePicaMemoryFills(NativePicaRenderTarget& target);
@@ -1122,7 +1137,22 @@ class GfxRenderingAPIVulkan final : public GfxRenderingAPI,
     std::string BuildFragmentShaderSource(uint64_t shaderId0, uint64_t shaderId1) const;
     static VulkanShaderProgram BuildShaderProgram(uint64_t shaderId0, uint64_t shaderId1);
     void CreateDepthResources();
-    void CreateNoPresentTargets(VkFormat format, VkExtent2D extent);
+    // One private image per frame slot at `extent`, or one per entry of `perImage` at its extent.
+    void CreateNoPresentTargets(VkFormat format, VkExtent2D extent,
+                                const std::vector<VkExtent2D>* perImage = nullptr);
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    // In-world mode: kFramesInFlight * 3 private images (slot * 3 + view), panel and eye extents.
+    void CreateXrViewTargets(VkFormat format);
+    void BeginXrViewFrame();
+#endif
+    // The extent of private/swapchain image `index` (its own in in-world mode).
+    [[nodiscard]] VkExtent2D SwapchainImageExtent(size_t index) const noexcept {
+#if defined(TRIAEVUM_QUEST_OPENXR)
+        if (index < mXrImageExtents.size()) return mXrImageExtents[index];
+#endif
+        (void)index;
+        return mSwapchainExtent;
+    }
     void BeginRenderPassIfNeeded();
     void ApplyDynamicViewportAndScissor();
     void DrawTrianglesFromBuffer(VkBuffer vertexBuffer, VkDeviceSize vertexOffset,
@@ -1205,6 +1235,20 @@ class GfxRenderingAPIVulkan final : public GfxRenderingAPI,
     uint32_t mXrQueueIndex = 1;
     uint64_t mXrRenderValue = 0;
     bool mXrRendererThreadRegistered = false;
+    // In-world mode (TriAevumQuestXr::WorldRequested(), inworld-spec §2.4): three images per frame slot,
+    // each with its own extent; SelectXrView switches the current image, extent and picture, and keeps
+    // each view's "presented this frame" flag and last presented display transfer apart.
+    bool mXrWorld = false;
+    uint32_t mXrView = kXrViewPanel;
+    std::array<VkExtent2D, kXrViewCount> mXrViewExtents{};
+    std::vector<VkExtent2D> mXrImageExtents;
+    std::array<bool, kXrViewCount> mXrViewPresented{};
+    std::array<std::optional<GfxNativePicaDisplayTransferView>, kXrViewCount> mXrViewLastTransfer;
+    Oot3d::PresentationPicture mXrPanelPicture{};
+    StereoViews mXrStereoViews{};
+    bool mXrWorldFrame = false;  // SetXrStereoViews this frame
+    std::array<bool, 8> mXrNamespaceExtentSet{};
+    std::array<Oot3d::RenderExtent, 8> mXrNamespaceExtents{};
 #endif
 #if defined(__ANDROID__)
     std::atomic<bool> mSurfaceLost{false};

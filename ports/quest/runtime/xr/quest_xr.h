@@ -10,6 +10,8 @@
 
 #include <cstdint>
 
+#include "fast/backends/stereo_views.h"
+
 struct ImGuiIO;
 
 namespace TriAevumQuestXr {
@@ -73,6 +75,23 @@ void LogLine(const char* line);
 // ---- In-world mode (quest-research/inworld-spec.md §3.1). Opt-in: TRIAEVUM_XR_VIEW=world in
 // <ext>/triaevum-env.txt (or TRIAEVUM_XR_WORLD=1); the default stays the Q3 screen. Valid before init.
 bool WorldRequested();
+// The eye image extent (TRIAEVUM_XR_EYE_WIDTH/HEIGHT, default 1024x1104, §2.6). Valid before init.
+VkExtent2D EyeExtent();
+// Renderer sink, in-world: three private targets per frame slot (images[slot * 3 + view], views
+// Fast::kXrView*), extents {panel, eye, eye}. WaitTargetFree takes the image index.
+void AttachViewTargets(const VkImage* images, uint32_t slots, const VkExtent2D extents[3]);
+// Both eyes of `slot` with the poses they were rendered for (the projection layer shows exactly these).
+void PublishStereo(uint32_t slot, uint64_t renderValue, const Fast::StereoViews& views, bool panelValid);
+// The panel of `slot` (cinema picture on the quad).
+void PublishPanel(uint32_t slot, uint64_t renderValue);
+// Median display ticks from a pair's PaceTick to its first display (default 2 until measured).
+uint32_t ShownLatencyTicks();
+struct PairStats {
+    uint64_t Pairs = 0;      // stereo pairs shown since the last take
+    uint64_t LatePairs = 0;  // first shown after their TargetTick
+    uint32_t LatencyTicks = 2;
+};
+PairStats TakePairStats();
 
 }  // namespace TriAevumQuestXr
 

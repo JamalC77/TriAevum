@@ -1,9 +1,12 @@
 // TriAevum Quest immersive mode: the quad swapchain, the renderer's private targets and their
 // publication, the copy into the swapchain on the XR queue, the timelines and the XR queue lock.
-// q3-spec §4.1, §5.
+// q3-spec §4.1, §5. In-world mode (inworld-spec §2.4, §3.3): three targets per frame slot (panel,
+// eye L, eye R), stereo publications that carry their eye poses, the eye swapchain (arraySize 2) and
+// the static fade swapchain.
 #include "quest_xr_internal.h"
 
 #include <algorithm>
+#include <array>
 #include <condition_variable>
 #include <cstdlib>
 #include <stdexcept>
@@ -18,49 +21,70 @@ namespace {
 std::mutex gQueueMutex;
 std::atomic<double> gLastLockLog{0.0};
 
-// ---- swapchain and copy resources (created on the game thread before the XR thread starts)
+// ---- swapchains and copy resources (created on the game thread before the XR thread starts)
 struct CopySlot {
     VkCommandBuffer Command = VK_NULL_HANDLE;
     VkFence Fence = VK_NULL_HANDLE;
 };
-XrSwapchain gSwapchain = XR_NULL_HANDLE;
+struct SwapchainState {
+    const char* Name = "";
+    XrSwapchain Handle = XR_NULL_HANDLE;
+    VkExtent2D Extent{};
+    uint32_t ArraySize = 1;
+    std::vector<XrSwapchainImageVulkan2KHR> Images;
+    std::vector<CopySlot> Slots;  // one per swapchain image
+    // XR thread only: OpenXR waits the oldest acquired image and releases the oldest waited one, so
+    // an image is never acquired while another is still unwaited (q3-spec §5.3).
+    int PendingAcquire = -1;
+    bool PendingWaited = false;
+    std::atomic<bool> Released{false};  // at least one image released (the layer may reference it)
+};
+SwapchainState gQuad;  // Q3 screen / cinema picture
+SwapchainState gEye;   // in-world: eye L -> layer 0, eye R -> layer 1
+SwapchainState gFade;  // in-world: static 16-layer array of (0, 0, 0, k/15)
+constexpr uint32_t kFadeLevels = 16;
 VkFormat gSwapchainFormat = VK_FORMAT_UNDEFINED;
 VkFormat gTargetFormat = VK_FORMAT_R8G8B8A8_UNORM;
-VkExtent2D gSwapchainExtent{};
-std::vector<XrSwapchainImageVulkan2KHR> gSwapchainImages;
-std::vector<CopySlot> gCopySlots;
 VkCommandPool gCommandPool = VK_NULL_HANDLE;
 VkSemaphore gRenderTimeline = VK_NULL_HANDLE;
 VkSemaphore gCopyTimeline = VK_NULL_HANDLE;
 PFN_vkWaitSemaphores gWaitSemaphores = nullptr;
 PFN_vkGetSemaphoreCounterValue gGetSemaphoreCounterValue = nullptr;
-std::atomic<bool> gQuadReleased{false};
 
 // ---- the sink, under gSink
 struct Target {
     VkImage Image = VK_NULL_HANDLE;
+    VkExtent2D Extent{};
     uint64_t LastCopyValue = 0;
     bool Copying = false;
 };
+enum class PublicationKind : uint8_t { Panel, Stereo };
 struct Publication {
-    int Image = -1;
+    int Slot = -1;  // frame slot (Q3: the target index, one per slot)
     uint64_t RenderValue = 0;
     uint64_t Serial = 0;
+    PublicationKind Kind = PublicationKind::Panel;
+    Fast::StereoViews Views{};
+    bool PanelValid = false;
 };
 std::mutex gSink;
 std::condition_variable gSinkChanged;
 std::vector<Target> gTargets;
-VkExtent2D gTargetExtent{};
+bool gViewTargets = false;  // in-world: three targets per slot (slot * 3 + view)
 Publication gLatest;
 uint64_t gSerial = 0;
 uint64_t gShownSerial = 0;
 SinkStats gStats;
+// Shown-latency of stereo pairs (ticks from PaceTick to the first display tick), last 15.
+std::array<uint32_t, 15> gLatency{};
+size_t gLatencyCount = 0, gLatencyNext = 0;
+PairStats gPairStats;
 
 // ---- XR thread only
-int gPendingAcquire = -1;    // acquired and not yet released
-bool gPendingWaited = false;  // xrWaitSwapchainImage succeeded for gPendingAcquire
 uint64_t gCopyValue = 0;
 bool gFirstImageLogged = false;
+Fast::StereoViews gShownViews{};
+bool gHasShownViews = false;
 
 VkFormat UnormTwin(VkFormat format) {
     switch (format) {
@@ -105,16 +129,18 @@ void WaitCopyTimeline(uint64_t value, const char* what) {
     gStats.CopyWaitMsMax = std::max(gStats.CopyWaitMsMax, waitedMs);
 }
 
-void ClearCopying(int image) {
+void ClearCopying(const std::array<int, 2>& images, size_t count) {
     {
         std::lock_guard lock(gSink);
-        if (image >= 0 && static_cast<size_t>(image) < gTargets.size()) gTargets[image].Copying = false;
+        for (size_t i = 0; i < count; ++i)
+            if (images[i] >= 0 && static_cast<size_t>(images[i]) < gTargets.size()) gTargets[images[i]].Copying = false;
     }
     gSinkChanged.notify_all();
 }
 
 void Barrier(VkCommandBuffer command, VkImage image, VkImageLayout from, VkImageLayout to, VkAccessFlags srcAccess,
-             VkAccessFlags dstAccess, VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage) {
+             VkAccessFlags dstAccess, VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage,
+             uint32_t layers = 1) {
     VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     barrier.srcAccessMask = srcAccess;
     barrier.dstAccessMask = dstAccess;
@@ -123,8 +149,157 @@ void Barrier(VkCommandBuffer command, VkImage image, VkImageLayout from, VkImage
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = image;
-    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
     vkCmdPipelineBarrier(command, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+}
+
+void CreateSwapchain(SwapchainState& swapchain, const char* name, VkExtent2D extent, uint32_t arraySize,
+                     XrSwapchainCreateFlags flags = 0) {
+    XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    info.createFlags = flags;
+    info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT |
+                      XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    info.format = static_cast<int64_t>(gSwapchainFormat);
+    info.sampleCount = 1;
+    info.width = extent.width;
+    info.height = extent.height;
+    info.faceCount = 1;
+    info.arraySize = arraySize;
+    info.mipCount = 1;
+    swapchain.Name = name;
+    swapchain.Extent = extent;
+    swapchain.ArraySize = arraySize;
+    XrResult result = xrCreateSwapchain(G().Session, &info, &swapchain.Handle);
+    if (XR_FAILED(result))
+        throw std::runtime_error(std::string("xrCreateSwapchain(") + name + ") failed: XrResult " +
+                                 std::to_string(static_cast<int>(result)));
+    uint32_t images = 0;
+    xrEnumerateSwapchainImages(swapchain.Handle, 0, &images, nullptr);
+    swapchain.Images.assign(images, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR});
+    result = xrEnumerateSwapchainImages(swapchain.Handle, images, &images,
+                                        reinterpret_cast<XrSwapchainImageBaseHeader*>(swapchain.Images.data()));
+    if (XR_FAILED(result) || images == 0U)
+        throw std::runtime_error(std::string("xrEnumerateSwapchainImages(") + name + ") failed");
+}
+
+// Acquire (only when nothing is pending) and wait (100 ms, without the queue lock). The image index
+// ready for writing, or -1 to try again next display frame.
+int AcquireAndWait(SwapchainState& swapchain) {
+    if (swapchain.PendingAcquire < 0) {
+        uint32_t index = 0;
+        XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+        XrResult result;
+        {
+            QueueLock lock("xr");
+            result = xrAcquireSwapchainImage(swapchain.Handle, &acquire, &index);
+        }
+        if (XR_FAILED(result)) {
+            XRWARN("TRIAEVUM_XR_ERROR call=xrAcquireSwapchainImage swapchain=%s result=%d", swapchain.Name,
+                   static_cast<int>(result));
+            return -1;
+        }
+        swapchain.PendingAcquire = static_cast<int>(index);
+        swapchain.PendingWaited = false;
+    }
+    if (!swapchain.PendingWaited) {
+        XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+        wait.timeout = 100'000'000;  // 100 ms
+        const XrResult waited = xrWaitSwapchainImage(swapchain.Handle, &wait);
+        if (waited == XR_TIMEOUT_EXPIRED || XR_FAILED(waited)) {
+            if (waited != XR_TIMEOUT_EXPIRED)
+                XRWARN("TRIAEVUM_XR_ERROR call=xrWaitSwapchainImage swapchain=%s result=%d", swapchain.Name,
+                       static_cast<int>(waited));
+            std::lock_guard lock(gSink);
+            ++gStats.SwapchainWaitTimeouts;
+            return -1;
+        }
+        swapchain.PendingWaited = true;
+    }
+    return swapchain.PendingAcquire;
+}
+
+void ReleaseImage(SwapchainState& swapchain) {
+    XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    XrResult released;
+    {
+        QueueLock lock("xr");
+        released = xrReleaseSwapchainImage(swapchain.Handle, &release);
+    }
+    if (XR_FAILED(released))
+        XRWARN("TRIAEVUM_XR_ERROR call=xrReleaseSwapchainImage swapchain=%s result=%d", swapchain.Name,
+               static_cast<int>(released));
+    swapchain.PendingAcquire = -1;
+    swapchain.PendingWaited = false;
+    swapchain.Released = true;
+}
+
+// Submits `command` on queue 1 with `fence`; waits the render timeline at `renderValue` (0: none) and
+// signals the copy timeline. False on a failed submit (the fence is replaced by a signalled one).
+bool SubmitCopy(CopySlot& slot, uint64_t renderValue, uint64_t* signalled) {
+    auto& g = G();
+    const uint64_t signalValue = gCopyValue + 1;
+    VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    timeline.waitSemaphoreValueCount = renderValue != 0U ? 1U : 0U;
+    timeline.pWaitSemaphoreValues = &renderValue;
+    timeline.signalSemaphoreValueCount = 1;
+    timeline.pSignalSemaphoreValues = &signalValue;
+    const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.pNext = &timeline;
+    submit.waitSemaphoreCount = renderValue != 0U ? 1U : 0U;
+    submit.pWaitSemaphores = &gRenderTimeline;
+    submit.pWaitDstStageMask = &waitStage;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &slot.Command;
+    submit.signalSemaphoreCount = 1;
+    submit.pSignalSemaphores = &gCopyTimeline;
+    VkResult submitted;
+    {
+        QueueLock lock("xr");
+        submitted = vkQueueSubmit(g.Queue, 1, &submit, slot.Fence);
+    }
+    if (submitted != VK_SUCCESS) {
+        XRERR("TRIAEVUM_XR_ERROR call=vkQueueSubmit(copy) result=%d", static_cast<int>(submitted));
+        // The fence stays unsignaled after a failed submit; make the slot reusable.
+        VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        fence.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        vkDestroyFence(g.Device, slot.Fence, nullptr);
+        vkCreateFence(g.Device, &fence, nullptr, &slot.Fence);
+        if (submitted == VK_ERROR_DEVICE_LOST) {
+            // Nothing will recover: stop showing the layers and end the run instead of looping.
+            gQuad.Released = false;
+            gEye.Released = false;
+            BeginExit("device_lost");
+        }
+        return false;
+    }
+    gCopyValue = signalValue;
+    *signalled = signalValue;
+    return true;
+}
+
+VkCommandBuffer BeginSlot(CopySlot& slot) {
+    auto& g = G();
+    vkWaitForFences(g.Device, 1, &slot.Fence, VK_TRUE, UINT64_MAX);
+    vkResetFences(g.Device, 1, &slot.Fence);
+    vkResetCommandBuffer(slot.Command, 0);
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(slot.Command, &begin);
+    return slot.Command;
+}
+
+void DestroySwapchain(SwapchainState& swapchain) {
+    if (swapchain.Handle != XR_NULL_HANDLE) xrDestroySwapchain(swapchain.Handle);
+    swapchain.Handle = XR_NULL_HANDLE;
+    swapchain.Images.clear();
+    swapchain.PendingAcquire = -1;
+    swapchain.PendingWaited = false;
+    swapchain.Released = false;
+}
+
+int TargetIndex(int slot, uint32_t view) {
+    return gViewTargets ? slot * static_cast<int>(Fast::kXrViewCount) + static_cast<int>(view) : slot;
 }
 
 }  // namespace
@@ -152,9 +327,14 @@ VkResult DeviceWaitIdleLocked(VkDevice device) {
 }
 
 VkFormat TargetFormat() { return gTargetFormat; }
-XrSwapchain QuadSwapchain() { return gSwapchain; }
-VkExtent2D QuadExtent() { return gSwapchainExtent; }
-bool QuadReleased() { return gQuadReleased.load(); }
+XrSwapchain QuadSwapchain() { return gQuad.Handle; }
+VkExtent2D QuadExtent() { return gQuad.Extent; }
+bool QuadReleased() { return gQuad.Released.load(); }
+XrSwapchain EyeSwapchain() { return gEye.Handle; }
+VkExtent2D EyeSwapchainExtent() { return gEye.Extent; }
+bool EyeReleased() { return gEye.Released.load(); }
+XrSwapchain FadeSwapchain() { return gFade.Handle; }
+uint32_t FadeLevels() { return kFadeLevels; }
 VkSemaphore RenderTimeline() { return gRenderTimeline; }
 VkSemaphore CopyTimeline() { return gCopyTimeline; }
 
@@ -180,32 +360,52 @@ void CreateQuadSwapchain() {
     if (chosen == 0) throw std::runtime_error("the runtime offers no RGBA8/BGRA8 swapchain format");
     gSwapchainFormat = static_cast<VkFormat>(chosen);
     gTargetFormat = UnormTwin(gSwapchainFormat);
-    gSwapchainExtent = PanelExtent();
-
-    XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
-    info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT |
-                      XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-    info.format = chosen;
-    info.sampleCount = 1;
-    info.width = gSwapchainExtent.width;
-    info.height = gSwapchainExtent.height;
-    info.faceCount = 1;
-    info.arraySize = 1;
-    info.mipCount = 1;
-    XrResult result = xrCreateSwapchain(g.Session, &info, &gSwapchain);
-    if (XR_FAILED(result))
-        throw std::runtime_error("xrCreateSwapchain failed: XrResult " + std::to_string(static_cast<int>(result)));
-    uint32_t images = 0;
-    xrEnumerateSwapchainImages(gSwapchain, 0, &images, nullptr);
-    gSwapchainImages.assign(images, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR});
-    result = xrEnumerateSwapchainImages(gSwapchain, images, &images,
-                                        reinterpret_cast<XrSwapchainImageBaseHeader*>(gSwapchainImages.data()));
-    if (XR_FAILED(result) || images == 0U) throw std::runtime_error("xrEnumerateSwapchainImages failed");
+    CreateSwapchain(gQuad, "quad", PanelExtent(), 1);
     std::string list;
     for (int64_t format : formats) list += (list.empty() ? "" : ",") + std::to_string(format);
-    XRLOG("TRIAEVUM_XR_SWAPCHAIN w=%u h=%u format=%d target_format=%d images=%u offered=%s", gSwapchainExtent.width,
-          gSwapchainExtent.height, static_cast<int>(gSwapchainFormat), static_cast<int>(gTargetFormat), images,
-          list.c_str());
+    XRLOG("TRIAEVUM_XR_SWAPCHAIN w=%u h=%u format=%d target_format=%d images=%zu offered=%s", gQuad.Extent.width,
+          gQuad.Extent.height, static_cast<int>(gSwapchainFormat), static_cast<int>(gTargetFormat),
+          gQuad.Images.size(), list.c_str());
+}
+
+void CreateWorldSwapchains() {
+    // The eye swapchain (§3.3): Q3's format rule, EyeExtent(), one array image with a layer per eye.
+    const VkExtent2D eye = EyeExtent();
+    CreateSwapchain(gEye, "eye", eye, 2);
+    XRLOG("TRIAEVUM_XR_SWAPCHAIN eye=%ux%u array=2 format=%d target_format=%d images=%zu", eye.width, eye.height,
+          static_cast<int>(gSwapchainFormat), static_cast<int>(gTargetFormat), gEye.Images.size());
+    // The fade: a static 4x4 array, layer k = (0, 0, 0, k / 15); a fade picks a layer, nothing is
+    // rendered per frame (cleared once, on the XR thread, by PrepareFadeSwapchain).
+    CreateSwapchain(gFade, "fade", {4, 4}, kFadeLevels, XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT);
+    XRLOG("TRIAEVUM_XR_SWAPCHAIN fade=4x4 array=%u images=%zu", kFadeLevels, gFade.Images.size());
+}
+
+bool PrepareFadeSwapchain() {
+    if (gFade.Handle == XR_NULL_HANDLE) return false;
+    if (gFade.Released.load()) return true;
+    const int index = AcquireAndWait(gFade);
+    if (index < 0) return false;
+    CopySlot& slot = gFade.Slots[static_cast<size_t>(index)];
+    VkCommandBuffer command = BeginSlot(slot);
+    const VkImage image = gFade.Images[static_cast<size_t>(index)].image;
+    Barrier(command, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            kFadeLevels);
+    for (uint32_t level = 0; level < kFadeLevels; ++level) {
+        VkClearColorValue color{};
+        color.float32[3] = static_cast<float>(level) / static_cast<float>(kFadeLevels - 1);  // black, premultiplied
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, level, 1};
+        vkCmdClearColorImage(command, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
+    }
+    Barrier(command, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            kFadeLevels);
+    vkEndCommandBuffer(command);
+    uint64_t signalled = 0;
+    if (!SubmitCopy(slot, 0, &signalled)) return false;
+    ReleaseImage(gFade);
+    XRLOG("TRIAEVUM_XR_FADE ready levels=%u", kFadeLevels);
+    return true;
 }
 
 void CreateCopyResources() {
@@ -214,16 +414,18 @@ void CreateCopyResources() {
     pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pool.queueFamilyIndex = g.QueueFamily;
     Require(vkCreateCommandPool(g.Device, &pool, nullptr, &gCommandPool), "vkCreateCommandPool(xr)");
-    gCopySlots.assign(gSwapchainImages.size(), {});
-    for (auto& slot : gCopySlots) {
-        VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        allocate.commandPool = gCommandPool;
-        allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocate.commandBufferCount = 1;
-        Require(vkAllocateCommandBuffers(g.Device, &allocate, &slot.Command), "vkAllocateCommandBuffers(xr)");
-        VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        fence.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-        Require(vkCreateFence(g.Device, &fence, nullptr, &slot.Fence), "vkCreateFence(xr)");
+    for (SwapchainState* swapchain : {&gQuad, &gEye, &gFade}) {
+        swapchain->Slots.assign(swapchain->Images.size(), {});
+        for (auto& slot : swapchain->Slots) {
+            VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+            allocate.commandPool = gCommandPool;
+            allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            allocate.commandBufferCount = 1;
+            Require(vkAllocateCommandBuffers(g.Device, &allocate, &slot.Command), "vkAllocateCommandBuffers(xr)");
+            VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            fence.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+            Require(vkCreateFence(g.Device, &fence, nullptr, &slot.Fence), "vkCreateFence(xr)");
+        }
     }
     VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
     type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
@@ -243,12 +445,30 @@ void AttachTargets(const VkImage* images, uint32_t count, VkExtent2D extent) {
     {
         std::lock_guard lock(gSink);
         gTargets.assign(count, {});
-        for (uint32_t index = 0; index < count; ++index) gTargets[index].Image = images[index];
-        gTargetExtent = extent;
+        for (uint32_t index = 0; index < count; ++index) {
+            gTargets[index].Image = images[index];
+            gTargets[index].Extent = extent;
+        }
+        gViewTargets = false;
         gLatest = {};
     }
     XRLOG("TRIAEVUM_XR_TARGETS count=%u w=%u h=%u format=%d", count, extent.width, extent.height,
           static_cast<int>(gTargetFormat));
+}
+
+void AttachViewTargets(const VkImage* images, uint32_t slots, const VkExtent2D extents[3]) {
+    {
+        std::lock_guard lock(gSink);
+        gTargets.assign(static_cast<size_t>(slots) * Fast::kXrViewCount, {});
+        for (uint32_t index = 0; index < gTargets.size(); ++index) {
+            gTargets[index].Image = images[index];
+            gTargets[index].Extent = extents[index % Fast::kXrViewCount];
+        }
+        gViewTargets = true;
+        gLatest = {};
+    }
+    XRLOG("TRIAEVUM_XR_TARGETS slots=%u views=3 panel=%ux%u eye=%ux%u format=%d", slots, extents[0].width,
+          extents[0].height, extents[1].width, extents[1].height, static_cast<int>(gTargetFormat));
 }
 
 void DetachTargets() {
@@ -280,9 +500,10 @@ uint64_t WaitTargetFree(uint32_t image) {
     {
         std::unique_lock lock(gSink);
         if (image >= gTargets.size()) return 0;
-        if (gLatest.Image == static_cast<int>(image)) {
+        const int slot = gViewTargets ? static_cast<int>(image / Fast::kXrViewCount) : static_cast<int>(image);
+        if (gLatest.Slot == slot) {
             // The renderer reuses the slot before the XR thread showed it: drop that frame.
-            gLatest.Image = -1;
+            gLatest.Slot = -1;
             ++gStats.PublicationsDropped;
         }
         const double start = NowSeconds();
@@ -299,19 +520,50 @@ uint64_t WaitTargetFree(uint32_t image) {
 
 void Publish(uint32_t image, uint64_t renderValue) {
     std::lock_guard lock(gSink);
-    if (image >= gTargets.size()) return;
-    gLatest = {static_cast<int>(image), renderValue, ++gSerial};
+    if (image >= gTargets.size() || gViewTargets) return;
+    gLatest = {};
+    gLatest.Slot = static_cast<int>(image);
+    gLatest.RenderValue = renderValue;
+    gLatest.Serial = ++gSerial;
     ++gStats.Publications;
 }
 
-void CopyLatest() {
+void PublishPanel(uint32_t slot, uint64_t renderValue) {
+    std::lock_guard lock(gSink);
+    if (!gViewTargets || static_cast<size_t>(slot) * Fast::kXrViewCount >= gTargets.size()) return;
+    gLatest = {};
+    gLatest.Slot = static_cast<int>(slot);
+    gLatest.RenderValue = renderValue;
+    gLatest.Serial = ++gSerial;
+    gLatest.Kind = PublicationKind::Panel;
+    ++gStats.Publications;
+}
+
+void PublishStereo(uint32_t slot, uint64_t renderValue, const Fast::StereoViews& views, bool panelValid) {
+    std::lock_guard lock(gSink);
+    if (!gViewTargets || static_cast<size_t>(slot) * Fast::kXrViewCount >= gTargets.size()) return;
+    gLatest = {};
+    gLatest.Slot = static_cast<int>(slot);
+    gLatest.RenderValue = renderValue;
+    gLatest.Serial = ++gSerial;
+    gLatest.Kind = PublicationKind::Stereo;
+    gLatest.Views = views;
+    gLatest.PanelValid = panelValid;
+    ++gStats.Publications;
+    ++gStats.StereoPublications;
+}
+
+void CopyLatest(uint64_t tick) {
     auto& g = G();
     Publication publication;
-    VkImage source = VK_NULL_HANDLE;
-    VkExtent2D region{};
+    std::array<int, 2> sources{-1, -1};
+    std::array<VkImage, 2> images{};
+    std::array<VkExtent2D, 2> extents{};
+    size_t count = 0;
+    SwapchainState* swapchain = &gQuad;
     {
         std::lock_guard lock(gSink);
-        if (gTargets.empty() || gLatest.Image < 0 || gLatest.Serial == gShownSerial) {
+        if (gTargets.empty() || gLatest.Slot < 0 || gLatest.Serial == gShownSerial) {
             ++gStats.StaleDisplayFrames;
             return;
         }
@@ -323,145 +575,142 @@ void CopyLatest() {
             return;
         }
         publication = gLatest;
-        Target& target = gTargets[publication.Image];
-        target.Copying = true;
-        source = target.Image;
-        region = {std::min(gTargetExtent.width, gSwapchainExtent.width),
-                  std::min(gTargetExtent.height, gSwapchainExtent.height)};
-    }
-    // Acquire only when no image is waiting for xrWaitSwapchainImage; a timed-out wait is retried
-    // for the same image next display frame (OpenXR waits/releases the oldest acquired image).
-    if (gPendingAcquire < 0) {
-        uint32_t index = 0;
-        XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-        XrResult result;
-        {
-            QueueLock lock("xr");
-            result = xrAcquireSwapchainImage(gSwapchain, &acquire, &index);
-        }
-        if (XR_FAILED(result)) {
-            XRWARN("TRIAEVUM_XR_ERROR call=xrAcquireSwapchainImage result=%d", static_cast<int>(result));
-            ClearCopying(publication.Image);
-            return;
-        }
-        gPendingAcquire = static_cast<int>(index);
-        gPendingWaited = false;
-    }
-    if (!gPendingWaited) {
-        XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-        wait.timeout = 100'000'000;  // 100 ms
-        const XrResult waited = xrWaitSwapchainImage(gSwapchain, &wait);
-        if (waited == XR_TIMEOUT_EXPIRED || XR_FAILED(waited)) {
-            if (waited != XR_TIMEOUT_EXPIRED)
-                XRWARN("TRIAEVUM_XR_ERROR call=xrWaitSwapchainImage result=%d", static_cast<int>(waited));
-            {
-                std::lock_guard lock(gSink);
-                ++gStats.SwapchainWaitTimeouts;
+        if (publication.Kind == PublicationKind::Stereo) {
+            if (gEye.Handle == XR_NULL_HANDLE) {
+                gShownSerial = publication.Serial;  // nothing can show it
+                return;
             }
-            ClearCopying(publication.Image);
-            return;
+            sources = {TargetIndex(publication.Slot, Fast::kXrViewEyeLeft),
+                       TargetIndex(publication.Slot, Fast::kXrViewEyeRight)};
+            count = 2;
+            swapchain = &gEye;
+        } else {
+            sources[0] = TargetIndex(publication.Slot, Fast::kXrViewPanel);
+            count = 1;
         }
-        gPendingWaited = true;
-    }
-    const uint32_t index = static_cast<uint32_t>(gPendingAcquire);
-    CopySlot& slot = gCopySlots[index];
-    vkWaitForFences(g.Device, 1, &slot.Fence, VK_TRUE, UINT64_MAX);
-    vkResetFences(g.Device, 1, &slot.Fence);
-    vkResetCommandBuffer(slot.Command, 0);
-    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(slot.Command, &begin);
-    const VkImage destination = gSwapchainImages[index].image;
-    // A: the renderer's target (left in PRESENT_SRC by its last pass) becomes a copy source; the
-    //    render-timeline wait (TRANSFER stage) orders it after the frame.
-    Barrier(slot.Command, source, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0,
-            VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-    // B: the swapchain image's previous contents are discarded.
-    Barrier(slot.Command, destination, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
-            VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-    // Same-size formats (UNORM target into its sRGB twin): the encoded bytes pass unchanged.
-    VkImageCopy copy{};
-    copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.extent = {region.width, region.height, 1};
-    vkCmdCopyImage(slot.Command, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination,
-                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-    // C: the target goes back to the layout the renderer's passes expect.
-    Barrier(slot.Command, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, 0, 0,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-    // D: a released color swapchain image is in COLOR_ATTACHMENT_OPTIMAL (XR_KHR_vulkan_enable).
-    Barrier(slot.Command, destination, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-    vkEndCommandBuffer(slot.Command);
-
-    const uint64_t signalValue = gCopyValue + 1;
-    VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
-    timeline.waitSemaphoreValueCount = 1;
-    timeline.pWaitSemaphoreValues = &publication.RenderValue;
-    timeline.signalSemaphoreValueCount = 1;
-    timeline.pSignalSemaphoreValues = &signalValue;
-    const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submit.pNext = &timeline;
-    submit.waitSemaphoreCount = 1;
-    submit.pWaitSemaphores = &gRenderTimeline;
-    submit.pWaitDstStageMask = &waitStage;
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &slot.Command;
-    submit.signalSemaphoreCount = 1;
-    submit.pSignalSemaphores = &gCopyTimeline;
-    VkResult submitted;
-    {
-        QueueLock lock("xr");
-        submitted = vkQueueSubmit(g.Queue, 1, &submit, slot.Fence);
-    }
-    if (submitted != VK_SUCCESS) {
-        XRERR("TRIAEVUM_XR_ERROR call=vkQueueSubmit(copy) result=%d", static_cast<int>(submitted));
-        // The fence stays unsignaled after a failed submit; make the slot reusable.
-        VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        fence.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-        vkDestroyFence(g.Device, slot.Fence, nullptr);
-        vkCreateFence(g.Device, &fence, nullptr, &slot.Fence);
-        ClearCopying(publication.Image);
-        // A released colour image must be written and in COLOR_ATTACHMENT_OPTIMAL: keep this one
-        // acquired and waited, and retry the copy next display frame (no new acquire or wait).
-        if (submitted == VK_ERROR_DEVICE_LOST) {
-            // Nothing will recover: stop showing the quad and end the run instead of looping.
-            gQuadReleased = false;
-            BeginExit("device_lost");
+        for (size_t i = 0; i < count; ++i) {
+            if (sources[i] < 0 || static_cast<size_t>(sources[i]) >= gTargets.size()) {
+                gShownSerial = publication.Serial;
+                return;
+            }
+            Target& target = gTargets[sources[i]];
+            target.Copying = true;
+            images[i] = target.Image;
+            extents[i] = {std::min(target.Extent.width, swapchain->Extent.width),
+                          std::min(target.Extent.height, swapchain->Extent.height)};
         }
+    }
+    const int index = AcquireAndWait(*swapchain);
+    if (index < 0) {
+        ClearCopying(sources, count);
         return;
     }
-    gCopyValue = signalValue;
+    CopySlot& slot = swapchain->Slots[static_cast<size_t>(index)];
+    VkCommandBuffer command = BeginSlot(slot);
+    const VkImage destination = swapchain->Images[static_cast<size_t>(index)].image;
+    // A: the renderer's targets (left in PRESENT_SRC by their scanouts) become copy sources; the
+    //    render-timeline wait (TRANSFER stage) orders them after the frame.
+    for (size_t i = 0; i < count; ++i)
+        Barrier(command, images[i], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0,
+                VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    // B: the swapchain image's previous contents are discarded (every layer).
+    Barrier(command, destination, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            swapchain->ArraySize);
+    // Same-size formats (UNORM target into its sRGB twin): the encoded bytes pass unchanged. Eye i goes
+    // to layer i.
+    for (size_t i = 0; i < count; ++i) {
+        VkImageCopy copy{};
+        copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, static_cast<uint32_t>(i), 1};
+        copy.extent = {extents[i].width, extents[i].height, 1};
+        vkCmdCopyImage(command, images[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    }
+    // C: the targets go back to the layout the renderer's passes expect.
+    for (size_t i = 0; i < count; ++i)
+        Barrier(command, images[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, 0, 0,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    // D: a released color swapchain image is in COLOR_ATTACHMENT_OPTIMAL (XR_KHR_vulkan_enable).
+    Barrier(command, destination, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            swapchain->ArraySize);
+    vkEndCommandBuffer(command);
+
+    uint64_t signalValue = 0;
+    if (!SubmitCopy(slot, publication.RenderValue, &signalValue)) {
+        ClearCopying(sources, count);
+        // A released colour image must be written and in COLOR_ATTACHMENT_OPTIMAL: keep this one
+        // acquired and waited, and retry the copy next display frame (no new acquire or wait).
+        return;
+    }
     static const bool releaseWait = EnvFlag("TRIAEVUM_XR_RELEASE_WAIT");
     if (releaseWait) vkWaitForFences(g.Device, 1, &slot.Fence, VK_TRUE, UINT64_MAX);
-    XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    XrResult released;
-    {
-        QueueLock lock("xr");
-        released = xrReleaseSwapchainImage(gSwapchain, &release);
-    }
-    if (XR_FAILED(released))
-        XRWARN("TRIAEVUM_XR_ERROR call=xrReleaseSwapchainImage result=%d", static_cast<int>(released));
-    gPendingAcquire = -1;
-    gPendingWaited = false;
+    ReleaseImage(*swapchain);
     {
         std::lock_guard lock(gSink);
-        Target& target = gTargets[publication.Image];
-        target.LastCopyValue = signalValue;
-        target.Copying = false;
+        for (size_t i = 0; i < count; ++i) {
+            Target& target = gTargets[sources[i]];
+            target.LastCopyValue = signalValue;
+            target.Copying = false;
+        }
         gShownSerial = publication.Serial;
         ++gStats.Copies;
+        if (publication.Kind == PublicationKind::Stereo) {
+            ++gStats.StereoCopies;
+            // Shown latency: ticks from the renderer's pace tick to this first display.
+            const uint64_t pace = publication.Views.PaceTick;
+            const uint32_t latency = tick >= pace ? static_cast<uint32_t>(std::min<uint64_t>(tick - pace, 64)) : 0U;
+            gLatency[gLatencyNext] = latency;
+            gLatencyNext = (gLatencyNext + 1) % gLatency.size();
+            gLatencyCount = std::min(gLatencyCount + 1, gLatency.size());
+            ++gPairStats.Pairs;
+            if (publication.Views.TargetTick != 0U && tick > publication.Views.TargetTick) ++gPairStats.LatePairs;
+        }
     }
     gSinkChanged.notify_all();
-    gQuadReleased = true;
+    if (publication.Kind == PublicationKind::Stereo) {
+        gShownViews = publication.Views;
+        gHasShownViews = true;
+    }
     if (!gFirstImageLogged) {
         gFirstImageLogged = true;
-        XRLOG("TRIAEVUM_XR_FIRST_IMAGE serial=%llu render_value=%llu xr_image=%u",
+        XRLOG("TRIAEVUM_XR_FIRST_IMAGE serial=%llu render_value=%llu xr_image=%d kind=%s",
               static_cast<unsigned long long>(publication.Serial),
-              static_cast<unsigned long long>(publication.RenderValue), index);
+              static_cast<unsigned long long>(publication.RenderValue), index,
+              publication.Kind == PublicationKind::Stereo ? "stereo" : "panel");
         NoteFirstImage();
     }
+}
+
+bool ShownViews(Fast::StereoViews* views) {
+    if (!gHasShownViews) return false;
+    *views = gShownViews;
+    return true;
+}
+
+uint32_t ShownLatencyTicks() {
+    std::lock_guard lock(gSink);
+    if (gLatencyCount == 0) return 2;  // §3.1 default until measured
+    std::array<uint32_t, 15> sorted{};
+    std::copy(gLatency.begin(), gLatency.begin() + static_cast<std::ptrdiff_t>(gLatencyCount), sorted.begin());
+    std::sort(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(gLatencyCount));
+    return std::clamp<uint32_t>(sorted[gLatencyCount / 2], 1U, 6U);
+}
+
+PairStats TakePairStats() {
+    std::lock_guard lock(gSink);
+    PairStats stats = gPairStats;
+    gPairStats = {};
+    if (gLatencyCount != 0) {
+        std::array<uint32_t, 15> sorted{};
+        std::copy(gLatency.begin(), gLatency.begin() + static_cast<std::ptrdiff_t>(gLatencyCount), sorted.begin());
+        std::sort(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(gLatencyCount));
+        stats.LatencyTicks = sorted[gLatencyCount / 2];
+    } else {
+        stats.LatencyTicks = 2;
+    }
+    return stats;
 }
 
 SinkStats TakeSinkStats() {
@@ -472,19 +721,21 @@ SinkStats TakeSinkStats() {
 }
 
 void DestroyQuadSwapchain() {
-    if (gSwapchain != XR_NULL_HANDLE) xrDestroySwapchain(gSwapchain);
-    gSwapchain = XR_NULL_HANDLE;
-    gSwapchainImages.clear();
-    gQuadReleased = false;
+    DestroySwapchain(gQuad);
+    DestroySwapchain(gEye);
+    DestroySwapchain(gFade);
+    gHasShownViews = false;
 }
 
 void DestroyVulkanObjects() {
     if (!Requested()) return;
     auto& g = G();
     if (g.Device == VK_NULL_HANDLE) return;
-    for (auto& slot : gCopySlots)
-        if (slot.Fence != VK_NULL_HANDLE) vkDestroyFence(g.Device, slot.Fence, nullptr);
-    gCopySlots.clear();
+    for (SwapchainState* swapchain : {&gQuad, &gEye, &gFade}) {
+        for (auto& slot : swapchain->Slots)
+            if (slot.Fence != VK_NULL_HANDLE) vkDestroyFence(g.Device, slot.Fence, nullptr);
+        swapchain->Slots.clear();
+    }
     if (gCommandPool != VK_NULL_HANDLE) vkDestroyCommandPool(g.Device, gCommandPool, nullptr);
     gCommandPool = VK_NULL_HANDLE;
     if (gRenderTimeline != VK_NULL_HANDLE) vkDestroySemaphore(g.Device, gRenderTimeline, nullptr);

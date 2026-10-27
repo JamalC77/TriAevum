@@ -729,10 +729,19 @@ void GfxRenderingAPIVulkan::StartFrame() {
         if (!TriAevumQuestXr::RendererMayRun()) {
             return;  // session not focused (or stopping): no active frame, the guest is held
         }
+        if (mXrWorld) {
+            // Every image of the slot (panel, eyes): its last copy must be done; the GPU wait
+            // below takes the latest copy value.
+            for (uint32_t view = 0; view < kXrViewCount; ++view)
+                xrCopyWaitValue = std::max(
+                    xrCopyWaitValue, TriAevumQuestXr::WaitTargetFree(mCurrentFrame * kXrViewCount + view));
+            BeginXrViewFrame();
+        } else {
         // The slot's private target: its last copy into the quad must be done (normally long
         // since), and an unshown publication of it is dropped.
         xrCopyWaitValue = TriAevumQuestXr::WaitTargetFree(mCurrentFrame);
         mCurrentImage = mCurrentFrame;
+        }
         acquire = VK_SUCCESS;
     }
 #endif
@@ -805,6 +814,9 @@ void GfxRenderingAPIVulkan::StartFrame() {
     mPresentationPicture = Oot3d::ResolvePresentationPicture(
         mSwapchainExtent.width, mSwapchainExtent.height,
         graphicsSnapshot.Value.Aspect);
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    mXrPanelPicture = mPresentationPicture;  // in-world: restored when the panel is selected again
+#endif
     // Validate targets against the picture of the successfully acquired
     // swapchain, not the requested window size or the previous swapchain.
     // Mode/present-only changes retain targets; saved display pixels bridge
@@ -815,7 +827,8 @@ void GfxRenderingAPIVulkan::StartFrame() {
         [&](const auto& entry) {
             const auto& [key, target] = entry;
             const auto expected = Oot3d::ResolveNativePicaRenderExtent(
-                {key.Width, key.Height}, pictureExtent,
+                {key.Width, key.Height},
+                NativePicaOutputExtent(key.RenderTargetNamespace),
                 mInternalResolutionScale);
             return target.Width != expected.Width || target.Height != expected.Height;
         });
@@ -950,8 +963,14 @@ void GfxRenderingAPIVulkan::EndFrame() {
         EndOot3dShadow2dDepthEncodePass();
     }
     EndNativePicaRenderPass();
-    if (!mNativePicaPresentedThisFrame &&
-        mLastPresentedNativePicaDisplayTransfer.has_value()) {
+    bool rescanLastDisplay = !mNativePicaPresentedThisFrame &&
+                             mLastPresentedNativePicaDisplayTransfer.has_value();
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    // In-world: a world frame never re-scans an old display (it would put a stale picture into the
+    // panel); the XR thread keeps showing the last eye pair (inworld-spec §2.4).
+    if (mXrWorld && mXrWorldFrame) rescanLastDisplay = false;
+#endif
+    if (rescanLastDisplay) {
         std::string error;
         GfxNativePicaDisplayTransferView transfer =
             *mLastPresentedNativePicaDisplayTransfer;
@@ -970,6 +989,9 @@ void GfxRenderingAPIVulkan::EndFrame() {
         mRenderPassActive = false;
         mOverlayRenderPassActive = false;
     }
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    if (mXrWorld) mXrViewPresented[mXrView] = mXrViewPresented[mXrView] || mNativePicaPresentedThisFrame;
+#endif
     const auto sceneFrameStats = mPicaSceneFrame.Stats();
     if (sceneFrameStats.DrawCount != 0U) ++mTemporalJitterSequence;
     mScanoutProbe.Record(mCommandBuffers[mCurrentFrame], mSwapchainImages[mCurrentImage],
@@ -1005,8 +1027,20 @@ void GfxRenderingAPIVulkan::FinishRender() {
         // Throughput benchmark: the frame is complete once submitted.
 #if defined(TRIAEVUM_QUEST_OPENXR)
     } else if (mXrPresent) {
+        if (mXrWorld) {
+            // In-world: both eyes scanned out this frame -> the pair with its poses; a world frame
+            // without a pair publishes nothing (the last pair stays, timewarped); otherwise the panel.
+            const uint32_t slot = mCurrentImage / kXrViewCount;
+            if (mXrViewPresented[kXrViewEyeLeft] && mXrViewPresented[kXrViewEyeRight] &&
+                mXrStereoViews.Valid) {
+                TriAevumQuestXr::PublishStereo(slot, mXrRenderValue, mXrStereoViews, false);
+            } else if (!mXrWorldFrame) {
+                TriAevumQuestXr::PublishPanel(slot, mXrRenderValue);
+            }
+        } else {
         // Immersive mode: hand the finished target to the XR thread (copied when GPU-complete).
         TriAevumQuestXr::Publish(mCurrentImage, mXrRenderValue);
+        }
 #endif
     } else if (mNriSwapchain.Active()) {
         const auto result = mNriSwapchain.Present(mCurrentImage);
@@ -1073,6 +1107,66 @@ void GfxRenderingAPIVulkan::FinishRender() {
     mFrameSubmitted = false;
     mCurrentFrame = (mCurrentFrame + 1) % kFramesInFlight;
 }
+
+
+#if defined(TRIAEVUM_QUEST_OPENXR)
+void GfxRenderingAPIVulkan::BeginXrViewFrame() {
+    // Each view keeps its own last presented display (its re-scan fallback) across frames.
+    mXrViewLastTransfer[mXrView] = mLastPresentedNativePicaDisplayTransfer;
+    mXrView = kXrViewPanel;
+    mLastPresentedNativePicaDisplayTransfer = mXrViewLastTransfer[kXrViewPanel];
+    mXrViewPresented = {};
+    mXrWorldFrame = false;
+    mXrStereoViews = {};
+    mCurrentImage = mCurrentFrame * kXrViewCount + kXrViewPanel;
+    mSwapchainExtent = mXrViewExtents[kXrViewPanel];
+}
+
+bool GfxRenderingAPIVulkan::SelectXrView(uint32_t view) {
+    if (!mXrPresent || !mXrWorld || view >= kXrViewCount || !mFrameActive || mSwapchainImages.empty())
+        return false;
+    if (view == mXrView) return true;
+    // The open passes belong to the old image.
+    if (mOot3dShadow2dPassActive) EndOot3dShadow2dDepthEncodePass();
+    EndNativePicaRenderPass();
+    if (mRenderPassActive) {
+        vkCmdEndRenderPass(mCommandBuffers[mCurrentFrame]);
+        mRenderPassActive = false;
+        mOverlayRenderPassActive = false;
+    }
+    mXrViewPresented[mXrView] = mXrViewPresented[mXrView] || mNativePicaPresentedThisFrame;
+    mXrViewLastTransfer[mXrView] = mLastPresentedNativePicaDisplayTransfer;
+    mXrView = view;
+    mNativePicaPresentedThisFrame = mXrViewPresented[view];
+    mLastPresentedNativePicaDisplayTransfer = mXrViewLastTransfer[view];
+    mCurrentImage = mCurrentFrame * kXrViewCount + view;
+    mSwapchainExtent = mXrViewExtents[view];
+    // The eyes fill their whole image (Aspect Free); the panel keeps the picture of its aspect.
+    mPresentationPicture = view == kXrViewPanel
+        ? mXrPanelPicture
+        : Oot3d::PresentationPicture{0U, 0U, mSwapchainExtent.width, mSwapchainExtent.height};
+    mViewport = {0.0F, 0.0F, static_cast<float>(mSwapchainExtent.width),
+                 static_cast<float>(mSwapchainExtent.height), 0.0F, 1.0F};
+    mScissor = {{0, 0}, mSwapchainExtent};
+    mViewportSet = true;
+    mScissorSet = true;
+    return true;
+}
+
+void GfxRenderingAPIVulkan::SetXrStereoViews(const StereoViews& views) {
+    if (!mXrPresent || !mXrWorld) return;
+    mXrStereoViews = views;
+    mXrWorldFrame = true;
+}
+
+void GfxRenderingAPIVulkan::SetNamespaceOutputExtent(uint64_t renderTargetNamespace, uint32_t width,
+                                                     uint32_t height) {
+    if (renderTargetNamespace >= mXrNamespaceExtentSet.size()) return;
+    const bool set = width != 0U && height != 0U;
+    mXrNamespaceExtentSet[renderTargetNamespace] = set;
+    mXrNamespaceExtents[renderTargetNamespace] = set ? Oot3d::RenderExtent{width, height} : Oot3d::RenderExtent{};
+}
+#endif
 
 } // namespace Fast
 

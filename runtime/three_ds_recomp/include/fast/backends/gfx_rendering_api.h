@@ -10,6 +10,7 @@
 #include <vector>
 #include "imconfig.h"
 #include "fast/renderer3ds/pica_render_backend.h"
+#include "fast/backends/stereo_views.h"
 
 namespace Fast {
 struct ShaderProgram;
@@ -165,6 +166,17 @@ class GfxRenderingAPI : public ::Fast::Renderer3ds::PicaRenderBackend {
     virtual bool HasActiveFrame() const { return true; }
     virtual void EndFrame() = 0;
     virtual void FinishRender() = 0;
+    // In-world VR mode (quest-research/inworld-spec.md §2.4). The immersive renderer keeps three private
+    // images per frame slot (kXrViewPanel, kXrViewEyeLeft, kXrViewEyeRight); the scanout, overlays and
+    // the screenshot readback work on the selected one. A desktop renderer has one view: false.
+    virtual bool SelectXrView(uint32_t /*view*/) { return false; }
+    // The poses of this frame's eye pair (published with it); any call marks the frame a world frame
+    // (no re-scan of the last display, no panel publication), Valid or not.
+    virtual void SetXrStereoViews(const StereoViews& /*views*/) {}
+    // Native PICA targets of `renderTargetNamespace` follow this extent instead of the presentation
+    // picture (0x0 = follow the picture again).
+    virtual void SetNamespaceOutputExtent(uint64_t /*renderTargetNamespace*/, uint32_t /*width*/,
+                                          uint32_t /*height*/) {}
     virtual int CreateFramebuffer() = 0;
     virtual void UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                              bool opengl_invertY, bool render_target, bool has_depth_buffer,

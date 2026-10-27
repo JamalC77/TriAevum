@@ -101,11 +101,21 @@ void CreateCopyResources();        // StartSession: command pool, timelines, que
 XrSwapchain QuadSwapchain();
 VkExtent2D QuadExtent();
 bool QuadReleased();
-void CopyLatest();                 // XR thread, each display frame with shouldRender
-void DestroyQuadSwapchain();       // StopSession
+// XR thread, each display frame with shouldRender; `tick` = this display frame's tick (shown latency).
+void CopyLatest(uint64_t tick);
+void DestroyQuadSwapchain();       // StopSession (all swapchains)
+// In-world mode (inworld-spec §3.3): the eye swapchain (arraySize 2) and the static fade array.
+void CreateWorldSwapchains();      // StartSession, after CreateQuadSwapchain, before CreateCopyResources
+bool PrepareFadeSwapchain();       // XR thread: clears the fade levels once; true when usable
+XrSwapchain EyeSwapchain();
+VkExtent2D EyeSwapchainExtent();
+bool EyeReleased();
+XrSwapchain FadeSwapchain();
+uint32_t FadeLevels();
+bool ShownViews(Fast::StereoViews* views);  // XR thread: the poses of the pair on the eye swapchain
 struct SinkStats {
     uint64_t Publications = 0, Copies = 0, StaleDisplayFrames = 0, IncompleteSkips = 0, PublicationsDropped = 0,
-             SwapchainWaitTimeouts = 0;
+             SwapchainWaitTimeouts = 0, StereoPublications = 0, StereoCopies = 0;
     double CopyWaitMsMax = 0.0;
 };
 SinkStats TakeSinkStats();

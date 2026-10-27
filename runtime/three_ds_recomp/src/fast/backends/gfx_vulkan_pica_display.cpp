@@ -133,7 +133,7 @@ bool GfxRenderingAPIVulkan::SubmitPicaDisplayTransfer(
                     // frame start).
                     Oot3d::IsNativeTopScreenTarget({source->Key.Width, source->Key.Height}) &&
                         Oot3d::NativeTopScreenAtPresentedDensity(
-                            NativePicaOutputExtent()),
+                            NativePicaOutputExtent(source->Key.RenderTargetNamespace)),
                 }, &transferPlanError);
             if (!transferPlan.has_value()) {
                 throw std::runtime_error(
@@ -4270,7 +4270,13 @@ bool GfxRenderingAPIVulkan::PrepareOverlay(
     if (!mLastPresentedNativePicaDisplayTransfer.has_value()) {
         return true;
     }
-    if (mNativePicaPresentedThisFrame) {
+    bool overlayOnCurrentImage = mNativePicaPresentedThisFrame;
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    // In-world: a world frame's panel (cleared at frame start) takes the overlays as they are; it is not
+    // published before W4, and re-scanning a display into it would only cost.
+    if (mXrWorld && mXrWorldFrame && mXrView == kXrViewPanel) overlayOnCurrentImage = true;
+#endif
+    if (overlayOnCurrentImage) {
         // This frame's scanout already wrote the swapchain image and left it
         // presentable, as the overlay pass loads it: presenting the display
         // again would run its effect graph and scanout a second time for the

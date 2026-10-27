@@ -392,7 +392,7 @@ void XrThreadMain() {
         wasFocused = focused;
         PlaceScreenIfNeeded(frameState.predictedDisplayTime);
         if (frameState.shouldRender) {
-            CopyLatest();
+            CopyLatest(frames.DisplayFrames);
         } else {
             ++frames.ShouldRenderFalse;
         }
@@ -485,6 +485,16 @@ void BeginExit(const char* reason) {
 void NoteFirstImage() { RemoveStartMarker(); }
 
 void LogLine(const char* line) { XRLOG("%s", line); }
+
+VkExtent2D EyeExtent() {
+    static const VkExtent2D extent = [] {
+        const auto dimension = [](const char* name, double fallback) {
+            return static_cast<uint32_t>(std::clamp(std::lround(EnvDouble(name, fallback)), 256L, 4096L));
+        };
+        return VkExtent2D{dimension("TRIAEVUM_XR_EYE_WIDTH", 1024.0), dimension("TRIAEVUM_XR_EYE_HEIGHT", 1104.0)};
+    }();
+    return extent;
+}
 
 bool WorldRequested() {
     static const bool requested = [] {

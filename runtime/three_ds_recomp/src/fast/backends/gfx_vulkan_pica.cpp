@@ -592,7 +592,7 @@ GfxRenderingAPIVulkan::GetOrCreateNativePicaRenderTarget(
         restoredWidth != 0U && restoredHeight != 0U;
     // Targets follow the presentation picture (the aspect ratio's letterbox
     // inside the swapchain), the output the scene is shown in.
-    const auto outputExtent = NativePicaOutputExtent();
+    const auto outputExtent = NativePicaOutputExtent(key.RenderTargetNamespace);
     const auto targetExtent = restoredExtentAvailable
         ? Oot3d::RenderExtent{restoredWidth, restoredHeight}
         : Oot3d::ResolveNativePicaRenderExtent(

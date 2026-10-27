@@ -2566,7 +2566,7 @@ bool GfxRenderingAPIVulkan::SubmitPicaDraw(
             renderTarget.Height,
             Oot3d::NativeTopScreenStorageSamplingX(
                 {draw.FramebufferWidth, draw.FramebufferHeight},
-                NativePicaOutputExtent()));
+                NativePicaOutputExtent(renderTarget.Key.RenderTargetNamespace)));
         const float framebufferScaleX = rasterCanvas.ScaleX;
         const float framebufferScaleY = rasterCanvas.ScaleY;
         mViewport = {rasterCanvas.X + draw.ViewportX * framebufferScaleX,

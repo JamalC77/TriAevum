@@ -1013,8 +1013,10 @@ void GfxRenderingAPIVulkan::CreateSyncObjects() {
 }
 
 void GfxRenderingAPIVulkan::CreateNoPresentTargets(VkFormat format,
-                                                   VkExtent2D extent) {
-    const uint32_t count = kFramesInFlight;
+                                                   VkExtent2D extent,
+                                                   const std::vector<VkExtent2D>* perImage) {
+    const uint32_t count = perImage != nullptr
+        ? static_cast<uint32_t>(perImage->size()) : kFramesInFlight;
     mSwapchainImages.assign(count, VK_NULL_HANDLE);
     mSwapchainImageViews.assign(count, VK_NULL_HANDLE);
     mNoPresentMemories.assign(count, VK_NULL_HANDLE);
@@ -1022,7 +1024,8 @@ void GfxRenderingAPIVulkan::CreateNoPresentTargets(VkFormat format,
         VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         imageInfo.imageType = VK_IMAGE_TYPE_2D;
         imageInfo.format = format;
-        imageInfo.extent = {extent.width, extent.height, 1U};
+        const VkExtent2D imageExtent = perImage != nullptr ? (*perImage)[index] : extent;
+        imageInfo.extent = {imageExtent.width, imageExtent.height, 1U};
         imageInfo.mipLevels = 1U;
         imageInfo.arrayLayers = 1U;
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -1064,6 +1067,21 @@ void GfxRenderingAPIVulkan::CreateNoPresentTargets(VkFormat format,
     mSwapchainFormat = format;
     mSwapchainExtent = extent;
 }
+
+#if defined(TRIAEVUM_QUEST_OPENXR)
+void GfxRenderingAPIVulkan::CreateXrViewTargets(VkFormat format) {
+    const VkExtent2D panel = TriAevumQuestXr::PanelExtent();
+    const VkExtent2D eye = TriAevumQuestXr::EyeExtent();
+    mXrViewExtents = {panel, eye, eye};
+    mXrImageExtents.clear();
+    for (uint32_t slot = 0; slot < kFramesInFlight; ++slot)
+        for (uint32_t view = 0; view < kXrViewCount; ++view) mXrImageExtents.push_back(mXrViewExtents[view]);
+    CreateNoPresentTargets(format, panel, &mXrImageExtents);
+    mXrView = kXrViewPanel;
+    mXrViewLastTransfer = {};
+    TriAevumQuestXr::AttachViewTargets(mSwapchainImages.data(), kFramesInFlight, mXrViewExtents.data());
+}
+#endif
 
 void GfxRenderingAPIVulkan::CreateSwapchainResources() {
     const auto support = QuerySwapchainSupport(mPhysicalDevice);
@@ -1127,11 +1145,17 @@ void GfxRenderingAPIVulkan::CreateSwapchainResources() {
                 mNriSwapchain.ReleaseSemaphore(index);
 #if defined(TRIAEVUM_QUEST_OPENXR)
     } else if (mXrPresent) {
+        if (mXrWorld) {
+            // In-world mode: panel and two eyes per frame slot, each at its own extent.
+            CreateXrViewTargets(surfaceFormat.format);
+            imageCount = static_cast<uint32_t>(mSwapchainImages.size());
+        } else {
         // Immersive mode: one private target per frame slot (as the no-present benchmark), in the
         // UNORM twin of the quad swapchain's sRGB format; the XR thread copies each finished frame.
         CreateNoPresentTargets(surfaceFormat.format, extent);
         imageCount = static_cast<uint32_t>(mSwapchainImages.size());
         TriAevumQuestXr::AttachTargets(mSwapchainImages.data(), imageCount, extent);
+        }
 #endif
     } else if (mBenchmarkNoPresent) {
         SPDLOG_WARN("OOT3D Vulkan benchmark no-present mode: frames are rendered "
@@ -1315,8 +1339,10 @@ void GfxRenderingAPIVulkan::CreateSwapchainResources() {
         framebufferInfo.renderPass = mRenderPass;
         framebufferInfo.attachmentCount = 2;
         framebufferInfo.pAttachments = attachmentsForFramebuffer;
-        framebufferInfo.width = mSwapchainExtent.width;
-        framebufferInfo.height = mSwapchainExtent.height;
+        // Each image's own extent (in-world mode: panel and eyes differ).
+        const VkExtent2D imageExtent = SwapchainImageExtent(index);
+        framebufferInfo.width = imageExtent.width;
+        framebufferInfo.height = imageExtent.height;
         framebufferInfo.layers = 1;
         CheckVk(vkCreateFramebuffer(mDevice, &framebufferInfo, nullptr,
                                     &mSwapchainFramebuffers[index]),
@@ -1394,6 +1420,11 @@ void GfxRenderingAPIVulkan::DestroySwapchainResources() {
     }
     mSwapchainImageViews.clear();
     mSwapchainImages.clear();
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    mXrImageExtents.clear();
+    mXrViewLastTransfer = {};
+    mXrView = kXrViewPanel;
+#endif
     if (mSwapchain != VK_NULL_HANDLE) {
         vkDestroySwapchainKHR(mDevice, mSwapchain, nullptr);
         mSwapchain = VK_NULL_HANDLE;
@@ -1676,7 +1707,8 @@ void GfxRenderingAPIVulkan::CreateDepthResources() {
     for (size_t index = 0; index < count; ++index) {
         VkImageCreateInfo imageInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
         imageInfo.imageType = VK_IMAGE_TYPE_2D;
-        imageInfo.extent = { mSwapchainExtent.width, mSwapchainExtent.height, 1 };
+        const VkExtent2D imageExtent = SwapchainImageExtent(index);
+        imageInfo.extent = { imageExtent.width, imageExtent.height, 1 };
         imageInfo.mipLevels = 1;
         imageInfo.arrayLayers = 1;
         imageInfo.format = mDepthFormat;

@@ -151,6 +151,8 @@ void GfxRenderingAPIVulkan::Init() {
     // Immersive mode (TriAevumXrActivity sets TRIAEVUM_XR=1): the instance and device come from the
     // OpenXR runtime and frames go to private targets copied into the quad (q3-spec §4).
     mXrPresent = TriAevumQuestXr::Requested();
+    // In-world mode (opt-in TRIAEVUM_XR_VIEW=world): panel and eye images per frame slot.
+    mXrWorld = mXrPresent && TriAevumQuestXr::WorldRequested();
 #endif
     CreateInstance();
     CreateSurface();
