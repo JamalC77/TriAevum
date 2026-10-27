@@ -2,6 +2,8 @@ name: TriAevum release policy
 
 on:
   push:
+    # Not on the Quest hello branch: it only adds ports/quest/hello.
+    branches-ignore: [quest-hello]
     paths:
       - ".github/workflows/triaevum-release-policy.yml"
       - "runtime/triaevum_module/**"

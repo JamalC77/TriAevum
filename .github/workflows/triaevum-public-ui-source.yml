@@ -2,6 +2,8 @@ name: TriAevum public UI source
 
 on:
   push:
+    # Not on the Quest hello branch: it only adds ports/quest/hello.
+    branches-ignore: [quest-hello]
     paths:
       - '.github/workflows/triaevum-public-ui-source.yml'
       - 'CMakeLists.txt'

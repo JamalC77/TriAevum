@@ -1,0 +1,89 @@
+name: Quest hello
+
+# TriAevum XR Test (ports/quest/hello): an immersive OpenXR + Vulkan APK for
+# Meta Quest 3, plus libprobe.so for the side-load probe. Title-free: nothing
+# here is ROM-derived.
+on:
+  push:
+    branches: [quest-hello]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    name: TriAevum XR Test APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+
+      - name: Install NDK and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build
+          "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --install \
+            'ndk;29.0.14206865' 'platforms;android-35' 'build-tools;35.0.0' > /dev/null
+
+      - name: Signing keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.TRIAEVUM_QUEST_KEYSTORE_BASE64 }}
+        run: |
+          if [[ -z "${KEYSTORE_BASE64}" ]]; then
+            echo "::error::TRIAEVUM_QUEST_KEYSTORE_BASE64 is not set"
+            exit 1
+          fi
+          base64 -d <<< "${KEYSTORE_BASE64}" > "${RUNNER_TEMP}/triaevum-quest.p12"
+          echo "TRIAEVUM_QUEST_KEYSTORE_FILE=${RUNNER_TEMP}/triaevum-quest.p12" >> "${GITHUB_ENV}"
+
+      - name: Build
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/29.0.14206865
+          TRIAEVUM_QUEST_KEYSTORE_PASSWORD: ${{ secrets.TRIAEVUM_QUEST_KEYSTORE_PASSWORD }}
+          TRIAEVUM_QUEST_KEY_ALIAS: ${{ secrets.TRIAEVUM_QUEST_KEY_ALIAS }}
+          TRIAEVUM_QUEST_KEY_PASSWORD: ${{ secrets.TRIAEVUM_QUEST_KEY_PASSWORD }}
+        run: bash ports/quest/hello/build.sh
+
+      - name: Verify
+        run: |
+          apksigner="${ANDROID_HOME}/build-tools/35.0.0/apksigner"
+          "${apksigner}" verify --min-sdk-version 32 dist/TriAevum-XR-Test.apk
+          # The signing certificate's digest (public), to compare across builds.
+          "${apksigner}" verify --print-certs dist/TriAevum-XR-Test.apk | grep -i 'SHA-256 digest' || true
+          unzip -l dist/TriAevum-XR-Test.apk | grep -E 'lib/arm64-v8a/|AndroidManifest'
+          if unzip -l dist/TriAevum-XR-Test.apk | grep -q libprobe.so; then
+            echo "::error::libprobe.so must not be inside the APK"; exit 1
+          fi
+          sha256sum dist/TriAevum-XR-Test.apk dist/libprobe.so
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TriAevum-XR-Test.apk
+          path: dist/TriAevum-XR-Test.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libprobe.so
+          path: dist/libprobe.so
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Remove keystore
+        if: always()
+        run: rm -f "${RUNNER_TEMP}/triaevum-quest.p12"
