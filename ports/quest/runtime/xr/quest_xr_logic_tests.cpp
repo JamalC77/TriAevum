@@ -409,6 +409,53 @@ void DisplayTicks() {
     CHECK(clock.Advance(t += k72, k72) == 10U);
 }
 
+// In-world W2: right stick flicks (snap turns, D-pad) and the vignette masks.
+void FlicksAndVignette() {
+    StickFlicks f;
+    auto out = f.Update(0.0F, 0.0F);  // at rest: armed
+    CHECK(out.Turn == 0 && out.Vertical == 0);
+    out = f.Update(0.8F, 0.1F);
+    CHECK(out.Turn == 1 && out.Vertical == 0);
+    out = f.Update(0.95F, 0.0F);  // held: no repeat
+    CHECK(out.Turn == 0);
+    out = f.Update(0.5F, 0.0F);   // above re-arm: still no repeat
+    out = f.Update(0.9F, 0.0F);
+    CHECK(out.Turn == 0);
+    f.Update(0.1F, 0.0F);         // back to rest
+    out = f.Update(-0.75F, 0.0F);
+    CHECK(out.Turn == -1);
+    f.Update(0.0F, 0.0F);
+    out = f.Update(0.1F, 0.9F);   // Y dominant: the D-pad, no turn
+    CHECK(out.Turn == 0 && out.Vertical == 1);
+    f.Update(0.0F, 0.0F);
+    out = f.Update(0.1F, -0.9F);
+    CHECK(out.Vertical == -1);
+    f.Update(0.0F, 0.0F);
+    out = f.Update(0.75F, 0.8F);  // a diagonal fires only its dominant axis
+    CHECK(out.Turn == 0 && out.Vertical == 1);
+    f.Reset();                    // leaving the world with the stick held right
+    out = f.Update(0.9F, 0.0F);
+    CHECK(out.Turn == 0);
+    f.Update(0.0F, 0.0F);
+    CHECK(f.Update(0.9F, 0.0F).Turn == 1);
+    CHECK(f.Update(NAN, NAN).Turn == 0);
+
+    constexpr uint32_t kLevels = 8;
+    for (uint32_t level = 0; level < kLevels; ++level) CHECK(VignetteMaskAlpha(0.0F, 0.0F, level, kLevels) == 0.0F);
+    CHECK(VignetteMaskAlpha(1.0F, 1.0F, 0, kLevels) == 0.0F);
+    CHECK(Near(VignetteMaskAlpha(1.0F, 0.0F, kLevels - 1, kLevels), 1.0F));
+    CHECK(Near(VignetteMaskAlpha(0.8F, 0.0F, 1, kLevels), 1.0F));
+    // Stronger levels darken more at every radius; each mask rises with the radius.
+    for (float r = 0.0F; r <= 1.4F; r += 0.05F) {
+        for (uint32_t level = 1; level + 1 < kLevels; ++level)
+            CHECK(VignetteMaskAlpha(r, 0.0F, level + 1, kLevels) >= VignetteMaskAlpha(r, 0.0F, level, kLevels));
+        CHECK(VignetteMaskAlpha(r + 0.05F, 0.0F, 4, kLevels) >= VignetteMaskAlpha(r, 0.0F, 4, kLevels));
+    }
+    // The weakest level leaves the eyes' field (r < 0.5, about 45 deg) clear.
+    CHECK(VignetteMaskAlpha(0.49F, 0.0F, 1, kLevels) == 0.0F);
+    CHECK(VignetteMaskAlpha(0.0F, 0.0F, 3, 1) == 0.0F && VignetteMaskAlpha(NAN, 0.0F, 3, kLevels) == 0.0F);
+}
+
 int main() {
     TapsAndChords();
     DeliberateMenu();
@@ -417,6 +464,7 @@ int main() {
     Placement();
     HudFollowTests();
     DisplayTicks();
+    FlicksAndVignette();
     if (failures != 0) {
         std::printf("quest_xr_logic_tests: %d failure(s)\n", failures);
         return 1;

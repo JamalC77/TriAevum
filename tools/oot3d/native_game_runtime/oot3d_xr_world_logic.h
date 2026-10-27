@@ -7,8 +7,10 @@
 //  - the eye-row rewrite with its per-camera chain cache (§2.2 "one rigid inverse per distinct V_g,d");
 //  - the tick-locked pacing p_N (§3.4) and the display time of a tick;
 //  - the render-safety hold (§2.3): Cinema for a timed hold after 30 fallback frames, then World again;
-//  - the W1 state classifier (§4.3 rows that need no hook): World / Cinema / Black with blockers;
-//  - the PC preview heads (§2.7): identity, an offset from the frame camera, the 90/180 deg sweeps.
+//  - the W1 state classifier (§4.3 rows that need no hook): World / Cinema / Black with blockers, and its
+//    mode R rows (W2): cutscenes stay in the world (Held, rig static) until their camera moves;
+//  - the PC preview heads (§2.7): identity, an offset from the frame camera, the 90/180 deg sweeps and
+//    (W2) the circle around Link that drives the game camera in mode R.
 #pragma once
 
 #include "oot3d_xr_math.h"
@@ -357,6 +359,9 @@ class XrRenderSafetyHold {
 //    teleport; held while the door setting lasts (3 s cap, then Cinema), then placed and World.
 //  - World needs 0.5 s without Cinema blockers; Cinema exit is Black -> placement -> World.
 //  - Held rows of §4.3 (talking, item get, secondary camera) stay World in W1 with the rig frozen.
+//  - Mode R (W2, ModeR): flags1 0x20000000 joins the Held rows (rig static, the native camera owns) and
+//    leaves Cinema only for a cutscene index >= 0xFFF0 or a cutscene camera that moved (the motion test of
+//    oot3d_xr_camera_logic.h, never while talking); shop browsing (setting 0x17) freezes the tether.
 
 enum class XrWorldState : uint8_t { World, Cinema, Black };
 inline const char* XrWorldStateName(XrWorldState state) {
@@ -372,7 +377,7 @@ enum XrBlocker : uint32_t {
     kXrBlockGameMode = 1U << 0,     // not gameplay: title, file select, game over
     kXrBlockHostGui = 1U << 1,      // F1, the menu bar, the in-game menu
     kXrBlockUi = 1U << 2,           // non-HUD PICA Ui draws for >= 0.3 s (text boxes, pause) until W4
-    kXrBlockCutscene = 1U << 3,     // flags1 0x20000000, cutscene index >= 0xFFF0
+    kXrBlockCutscene = 1U << 3,     // flags1 0x20000000 (W1), cutscene index >= 0xFFF0, a moving cutscene camera (R)
     kXrBlockFirstPerson = 1U << 4,  // flags1 0x100000 (W2-W4)
     kXrBlockCrawl = 1U << 5,        // flags2 0x40000, settings 0x16/0x1E
     kXrBlockFixedCamera = 1U << 6,  // settings 0x19-0x1B
@@ -383,7 +388,7 @@ enum XrBlocker : uint32_t {
     kXrBlackDoor = 1U << 16,        // door / scene-transition setting
     kXrBlackScene = 1U << 17,       // scene or entrance change
     kXrBlackTeleport = 1U << 18,    // |dL| > 1.5 m * s in one update
-    kXrHoldRig = 1U << 24,          // Held rows: talking, item get, secondary camera (rig frozen)
+    kXrHoldRig = 1U << 24,          // Held rows: talking, item get, secondary camera, (R) cutscene, shop
 };
 inline constexpr uint32_t kXrCinemaMask = 0xFFFFU;
 inline constexpr uint32_t kXrBlackMask = 0xFF0000U;
@@ -406,6 +411,8 @@ struct XrWorldSignals {
     int32_t Entrance = -1;
     M::Vec3 Link;          // game world (u)
     double Scale = M::kDefaultScale;
+    bool ModeR = false;                // W2: the head owns the game camera (cutscene and shop rows differ)
+    bool CutsceneCameraMoving = false; // W2: a Held-static row's camera moved (CutsceneCameraMonitor)
 };
 
 struct XrClassifierStep {
@@ -420,7 +427,8 @@ inline uint32_t XrCinemaBlockers(const XrWorldSignals& s) {
     uint32_t b = 0;
     if (!s.Gameplay) b |= kXrBlockGameMode;
     if (s.HostGui) b |= kXrBlockHostGui;
-    if ((s.Flags1 & 0x20000000U) != 0U || (s.CutsceneIndex >= 0xFFF0 && s.CutsceneIndex <= 0xFFFF))
+    const bool cutsceneIndex = s.CutsceneIndex >= 0xFFF0 && s.CutsceneIndex <= 0xFFFF;
+    if (s.ModeR ? (cutsceneIndex || s.CutsceneCameraMoving) : ((s.Flags1 & 0x20000000U) != 0U || cutsceneIndex))
         b |= kXrBlockCutscene;
     if ((s.Flags1 & 0x00100000U) != 0U) b |= kXrBlockFirstPerson;
     if ((s.Flags2 & 0x00040000U) != 0U || s.CameraSetting == 0x16 || s.CameraSetting == 0x1E) b |= kXrBlockCrawl;
@@ -434,7 +442,8 @@ inline uint32_t XrCinemaBlockers(const XrWorldSignals& s) {
 inline bool XrDoorSetting(int16_t setting) { return setting == 0x1C || setting == 0x1D || setting == 0x2F; }
 
 inline uint32_t XrHeldRows(const XrWorldSignals& s) {
-    const bool held = (s.Flags1 & (0x00000040U | 0x00000400U | 0x10000000U)) != 0U || s.ActiveCamera != 0;
+    const uint32_t mask = 0x00000040U | 0x00000400U | 0x10000000U | (s.ModeR ? 0x20000000U : 0U);
+    const bool held = (s.Flags1 & mask) != 0U || s.ActiveCamera != 0 || (s.ModeR && s.CameraSetting == 0x17);
     return held ? static_cast<uint32_t>(kXrHoldRig) : 0U;
 }
 
@@ -560,15 +569,38 @@ inline std::string XrBlockerNames(uint32_t blockers) {
 // ---------------------------------------------------------------------------------------------------
 // PC preview heads (§2.7): eye poses for TRIAEVUM_XR_PREVIEW_HEAD without a headset.
 
-enum class XrPreviewHeadKind : uint8_t { Identity, Offset, Sweep90, Sweep180 };
+enum class XrPreviewHeadKind : uint8_t { Identity, Offset, Sweep90, Sweep180, Circle };
 struct XrPreviewHead {
     XrPreviewHeadKind Kind = XrPreviewHeadKind::Identity;
     double YawDegrees = 0.0, X = 0.0, Y = 0.0, Z = 0.0;  // Offset: relative to the frame camera (m)
-    double PeriodSeconds = 8.0;                         // sweeps
-    // "identity", "sweep90", "sweep180" or "yaw,x,y,z"; false on anything else.
+    double PeriodSeconds = 8.0;                         // sweeps, circle
+    double RadiusM = 1.2;                               // circle
+    // "identity", "sweep90", "sweep180", "circle:radius_m,period_s" or "yaw,x,y,z"; false on anything else.
+    // The circle drives the game camera itself (mode R on the PC, W2 day 5): the eye is then the frame
+    // camera at the preview's field of view (no offset, no yaw).
     bool Parse(std::string_view text) {
         if (text.empty() || text == "identity") {
             Kind = XrPreviewHeadKind::Identity;
+            return true;
+        }
+        if (text.substr(0, 7) == "circle:" || text == "circle") {
+            double radius = 1.2, period = 8.0;
+            if (text.size() > 7) {
+                const std::string rest(text.substr(7));
+                char* stop = nullptr;
+                radius = std::strtod(rest.c_str(), &stop);
+                if (stop == rest.c_str() || *stop != ',') return false;
+                const char* second = stop + 1;
+                period = std::strtod(second, &stop);
+                if (stop == second || *stop != '\0') return false;
+            }
+            if (!std::isfinite(radius) || !std::isfinite(period) || radius < 0.3 || radius > 10.0 || period < 1.0 ||
+                period > 600.0)
+                return false;
+            Kind = XrPreviewHeadKind::Circle;
+            RadiusM = radius;
+            PeriodSeconds = period;
+            YawDegrees = X = Y = Z = 0.0;
             return true;
         }
         if (text == "sweep90" || text == "sweep180") {
@@ -599,7 +631,7 @@ struct XrPreviewHead {
     // The head's yaw (degrees, positive turns left) and position (m) in the frame camera's space at time t.
     double YawAt(double t) const {
         if (Kind == XrPreviewHeadKind::Offset) return YawDegrees;
-        if (Kind == XrPreviewHeadKind::Identity) return 0.0;
+        if (Kind == XrPreviewHeadKind::Identity || Kind == XrPreviewHeadKind::Circle) return 0.0;
         const double amplitude = Kind == XrPreviewHeadKind::Sweep90 ? 90.0 : 180.0;
         const double phase = std::fmod(std::max(t, 0.0), PeriodSeconds) / PeriodSeconds;  // 0..1
         // Triangle wave -A..A: a constant turn rate, the case that shows screen-locked draws.

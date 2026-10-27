@@ -331,6 +331,57 @@ struct HudFollow {
     }
 };
 
+// ---- In-world right stick (inworld-spec §5.5, §7), sampled every display frame while the world shows:
+// X flicks are snap turns (+1 right, -1 left), Y flicks press the D-pad (+1 up, -1 down). A flick fires
+// once past kTrigger on the dominant axis and re-arms below kRearm. After Reset (the world was not shown)
+// a stick still held must come back to rest before it can fire.
+struct FlickOutput {
+    int Turn = 0;
+    int Vertical = 0;
+};
+class StickFlicks {
+  public:
+    static constexpr float kTrigger = 0.7F;
+    static constexpr float kRearm = 0.3F;
+    FlickOutput Update(float x, float y) {
+        if (!std::isfinite(x)) x = 0.0F;
+        if (!std::isfinite(y)) y = 0.0F;
+        const float ax = std::fabs(x), ay = std::fabs(y);
+        FlickOutput out;
+        if (mArmedX && ax > kTrigger && ax >= ay) {
+            mArmedX = false;
+            out.Turn = x > 0.0F ? 1 : -1;
+        } else if (!mArmedX && ax < kRearm) {
+            mArmedX = true;
+        }
+        if (mArmedY && ay > kTrigger && ay > ax) {
+            mArmedY = false;
+            out.Vertical = y > 0.0F ? 1 : -1;
+        } else if (!mArmedY && ay < kRearm) {
+            mArmedY = true;
+        }
+        return out;
+    }
+    void Reset() { mArmedX = mArmedY = false; }
+
+  private:
+    bool mArmedX = false, mArmedY = false;
+};
+
+// ---- The vignette's radial masks (inworld-spec §5.7): premultiplied black with this alpha at (x, y) in
+// [-1, 1] across the head-locked quad (2 m wide at 0.5 m, so r = 0.5 * tan of the angle off the gaze: the
+// eyes' edge is r ~ 0.6). Level 0 is clear; level k of `levels` is strength k / (levels - 1): the clear
+// disc's radius is 0.55 - 0.35 * strength (0.5, about 45 deg, at the weakest of 8 levels; 0.2, about 22 deg,
+// at full strength), with a 0.2 soft edge.
+inline float VignetteMaskAlpha(float x, float y, uint32_t level, uint32_t levels) {
+    if (levels < 2U || level == 0U || !std::isfinite(x) || !std::isfinite(y)) return 0.0F;
+    const float k = static_cast<float>(std::min(level, levels - 1U)) / static_cast<float>(levels - 1U);
+    const float inner = 0.55F - 0.35F * k;
+    constexpr float kFeather = 0.2F;
+    const float t = std::clamp((std::hypot(x, y) - inner) / kFeather, 0.0F, 1.0F);
+    return t * t * (3.0F - 2.0F * t);
+}
+
 // ---- The display clock's tick (inworld-spec §3.4): display periods since the session began, from the
 // runtime's predicted display times, not a count of xrWaitFrame calls. A late wait that skips periods
 // advances the tick by the periods that passed (counted in Skipped); a stopped session (Pause) does not

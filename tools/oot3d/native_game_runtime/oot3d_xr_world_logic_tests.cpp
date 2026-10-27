@@ -573,6 +573,71 @@ void TestRenderSafety() {
     Report("safety");
 }
 
+// W2 mode R rows of the classifier (§4.3) and the preview circle head (§2.7).
+void TestModeR() {
+    XrWorldSignals s;
+    s.Flags1 = 0x20000000U;  // cutscene
+    CHECK((XrCinemaBlockers(s) & kXrBlockCutscene) != 0U);  // W1: the screen
+    CHECK((XrHeldRows(s) & kXrHoldRig) == 0U);
+    s.ModeR = true;
+    CHECK(XrCinemaBlockers(s) == 0U);                  // mode R: stays in the world ...
+    CHECK((XrHeldRows(s) & kXrHoldRig) != 0U);         // ... with the rig static
+    s.CutsceneCameraMoving = true;                      // until its camera moves
+    CHECK((XrCinemaBlockers(s) & kXrBlockCutscene) != 0U);
+    s = {};
+    s.ModeR = true;
+    s.CutsceneIndex = 0xFFF0;
+    CHECK((XrCinemaBlockers(s) & kXrBlockCutscene) != 0U);
+    s = {};
+    s.CameraSetting = 0x17;  // shop browsing: tether frozen in mode R only
+    CHECK(XrHeldRows(s) == 0U);
+    s.ModeR = true;
+    CHECK(XrHeldRows(s) == kXrHoldRig && XrCinemaBlockers(s) == 0U);
+    {
+        // Through the classifier: a cutscene keeps World in mode R, goes to Cinema once its camera moves.
+        XrWorldClassifier c;
+        XrWorldSignals t;
+        t.ModeR = true;
+        double now = 0.0;
+        for (int i = 0; i < 60; ++i) {
+            t.Now = now = i / 30.0;
+            c.Update(t);
+        }
+        CHECK(c.State() == XrWorldState::World);
+        t.Flags1 = 0x20000000U;
+        for (int i = 0; i < 30; ++i) {
+            t.Now = now += 1.0 / 30;
+            const auto step = c.Update(t);
+            CHECK(step.State == XrWorldState::World && (step.Blockers & kXrHoldRig) != 0U);
+        }
+        t.CutsceneCameraMoving = true;
+        t.Now = now += 1.0 / 30;
+        CHECK(c.Update(t).State == XrWorldState::Cinema);
+        // W1 (mode R off): the same flag is the screen at once.
+        XrWorldClassifier w1;
+        XrWorldSignals u;
+        for (int i = 0; i < 60; ++i) {
+            u.Now = i / 30.0;
+            w1.Update(u);
+        }
+        u.Flags1 = 0x20000000U;
+        u.Now = 2.1;
+        CHECK(w1.Update(u).State == XrWorldState::Cinema);
+    }
+    {
+        XrPreviewHead h;
+        CHECK(h.Parse("circle:1.2,8") && h.Kind == XrPreviewHeadKind::Circle && h.RadiusM == 1.2 &&
+              h.PeriodSeconds == 8.0);
+        CHECK(h.YawAt(3.0) == 0.0 && h.X == 0.0 && h.Y == 0.0 && h.Z == 0.0);
+        CHECK(h.Parse("circle") && h.Kind == XrPreviewHeadKind::Circle && h.RadiusM == 1.2);
+        CHECK(h.Parse("circle:2,16") && h.RadiusM == 2.0 && h.PeriodSeconds == 16.0);
+        XrPreviewHead bad;
+        CHECK(!bad.Parse("circle:abc") && !bad.Parse("circle:0.1,8") && !bad.Parse("circle:1.2") &&
+              !bad.Parse("circle:1.2,8x") && !bad.Parse("circle:1.2,0.5"));
+    }
+    Report("mode_r");
+}
+
 }  // namespace
 
 int main() {
@@ -582,6 +647,7 @@ int main() {
     TestPacing();
     TestClassifier();
     TestRenderSafety();
+    TestModeR();
     std::printf("oot3d_xr_world_logic_tests: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

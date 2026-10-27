@@ -209,6 +209,14 @@ add_executable(oot3d_xr_world_logic_tests EXCLUDE_FROM_ALL
 )
 oot3d_target_defaults(oot3d_xr_world_logic_tests FOLDER Tests)
 
+# In-world mode R (header-only, std only): the camera write, the owner rows, the cutscene-camera motion
+# test, head inside geometry, placement probes, the stick reference and rotation, R_always, the preview
+# circle (quest-research/inworld-spec.md W2).
+add_executable(oot3d_xr_camera_logic_tests EXCLUDE_FROM_ALL
+    tools/oot3d/native_game_runtime/oot3d_xr_camera_logic_tests.cpp
+)
+oot3d_target_defaults(oot3d_xr_camera_logic_tests FOLDER Tests)
+
 add_executable(oot3d_native_a32_actor_visibility_tests EXCLUDE_FROM_ALL
     tools/oot3d/native_game_runtime/oot3d_actor_visibility_policy.cpp
     tools/oot3d/native_game_runtime/oot3d_native_a32_actor_visibility.cpp
