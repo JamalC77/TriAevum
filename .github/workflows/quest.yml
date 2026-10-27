@@ -67,7 +67,8 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: .deps-src
-          key: quest-deps-src-${{ hashFiles('CMakeLists.txt', 'CMake/**', 'runtime/three_ds_recomp/CMakeLists.txt', 'runtime/three_ds_recomp/cmake/**', 'ports/quest/runtime/**') }}
+          # Only the files that pin dependencies: editing XR sources must not refetch everything.
+          key: quest-deps-src-${{ hashFiles('CMakeLists.txt', 'CMake/**', 'runtime/three_ds_recomp/CMakeLists.txt', 'runtime/three_ds_recomp/cmake/**', 'ports/quest/runtime/CMakeLists.txt') }}
 
       - uses: actions/cache@v4
         with:
@@ -118,6 +119,8 @@ jobs:
           unzip -l "${QUEST_OUT}/dist/quest-tools-arm64.zip"
           # The immersive activity's OpenXR loader is packaged; a title module never is.
           unzip -l "${QUEST_OUT}/dist/TriAevum-Quest-arm64.apk" | grep -q 'lib/arm64-v8a/libopenxr_loader.so'
+          unzip -l "${QUEST_OUT}/dist/TriAevum-Quest-arm64.apk" | grep -q 'assets/licenses/openxr_loader.txt'
+          unzip -l "${QUEST_OUT}/dist/quest-tools-arm64.zip" | grep -q 'quest-tools-arm64/LICENSES/openxr_loader.txt'
           if unzip -l "${QUEST_OUT}/dist/TriAevum-Quest-arm64.apk" | grep -q libtriaevum_title_aot.so; then
             echo "::error::a title module must never be packaged"; exit 1
           fi

@@ -57,8 +57,13 @@ if(TRIAEVUM_QUEST_OPENXR)
         message(FATAL_ERROR "${_xr_aar}: SHA-256 ${_xr_hash}, expected ${OPENXR_ANDROID_SHA256}")
     endif()
     set(_xr_so "${_xr_dir}/prefab/modules/openxr_loader/libs/android.${CMAKE_ANDROID_ARCH_ABI}/libopenxr_loader.so")
-    if(NOT EXISTS "${_xr_so}")
+    # The loader's licence (Apache-2.0 OR MIT) ships with it: APK assets/licenses, tools LICENSES/.
+    set(_xr_license "${_xr_dir}/META-INF/LICENSE")
+    if(NOT EXISTS "${_xr_so}" OR NOT EXISTS "${_xr_license}")
         file(ARCHIVE_EXTRACT INPUT "${_xr_aar}" DESTINATION "${_xr_dir}")
+    endif()
+    if(NOT EXISTS "${_xr_license}")
+        message(FATAL_ERROR "${_xr_aar}: no META-INF/LICENSE")
     endif()
     add_library(openxr_loader SHARED IMPORTED GLOBAL)
     set_target_properties(openxr_loader PROPERTIES
@@ -67,6 +72,7 @@ if(TRIAEVUM_QUEST_OPENXR)
         INTERFACE_INCLUDE_DIRECTORIES "${_xr_dir}/prefab/modules/headers/include")
     # The staging step (tools/quest/stage_quest.py --openxr) packages it from here.
     configure_file("${_xr_so}" "${CMAKE_BINARY_DIR}/openxr/libopenxr_loader.so" COPYONLY)
+    configure_file("${_xr_license}" "${CMAKE_BINARY_DIR}/openxr/LICENSE.txt" COPYONLY)
 endif()
 
 get_filename_component(root "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)

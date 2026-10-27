@@ -44,6 +44,9 @@ TOOLS = [
 # the chord/placement logic tests.
 OPENXR_APK_LIBS = {"libopenxr_loader.so": "rt/openxr/libopenxr_loader.so"}
 OPENXR_TOOLS = ["rt/product/quest_xr_logic_tests"]
+# The loader's licence text from the same hash-pinned AAR (META-INF/LICENSE), shipped with it.
+OPENXR_LICENSE = "rt/openxr/LICENSE.txt"
+OPENXR_LICENSE_NAME = "openxr_loader.txt"
 # The synthetic title: one generated function at 0x1000, built by the real Android title target.
 SYNTHETIC_TITLE = "native/libtriaevum_title_aot.so"
 TOOLS_README = """TriAevum Quest tools (arm64-v8a, title-free). Run on the headset as the shell user:
@@ -155,6 +158,13 @@ def main() -> int:
     shutil.rmtree(args.assets, ignore_errors=True)
     args.assets.mkdir(parents=True)
     shutil.copyfile(args.title_abi, args.assets / "title-abi.json")
+    license_source = args.build / OPENXR_LICENSE
+    if args.openxr:
+        if not license_source.is_file():
+            raise FileNotFoundError(f"OpenXR loader licence: {license_source}")
+        (args.assets / "licenses").mkdir()
+        shutil.copyfile(license_source, args.assets / "licenses" / OPENXR_LICENSE_NAME)
+        print(f"apk  assets/licenses/{OPENXR_LICENSE_NAME}")
 
     tools_allowed = allowed | {"libtriaevum_title_whole_aot_support.so"}
     staging = args.tools_zip.parent / "quest-tools-arm64"
@@ -176,6 +186,8 @@ def main() -> int:
     if args.openxr:
         # Tests linking the runtime library NEED it (run_all.sh puts the directory on the path).
         shutil.copyfile(jni / "libopenxr_loader.so", staging / "libopenxr_loader.so")
+        (staging / "LICENSES").mkdir()
+        shutil.copyfile(license_source, staging / "LICENSES" / OPENXR_LICENSE_NAME)
     shutil.copyfile(args.title_abi, staging / "title-abi.json")
     (staging / "README.txt").write_text(TOOLS_README)
     (staging / "run_all.sh").write_text(run_all, newline="\n")

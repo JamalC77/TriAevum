@@ -12,7 +12,6 @@ import android.util.Log;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
-import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import org.libsdl.app.SDLActivity;
@@ -86,18 +85,6 @@ public abstract class TriAevumSdlActivity extends SDLActivity {
             && intent.getStringExtra(EXTRA_LAUNCH_PROFILE) != null;
     }
 
-    /** True when {@code path} names a file inside {@code root} (canonical paths, no escapes). */
-    static boolean isInside(String path, File root) {
-        if (path == null || path.isEmpty() || root == null) return false;
-        try {
-            String file = new File(path).getCanonicalPath();
-            String directory = root.getCanonicalPath();
-            return file.startsWith(directory + File.separator);
-        } catch (IOException error) {
-            return false;
-        }
-    }
-
     @Override protected String[] getLibraries() {
         return new String[] { "SDL2", "triaevum_title_bootstrap", "TriAevum" };
     }
@@ -113,8 +100,13 @@ public abstract class TriAevumSdlActivity extends SDLActivity {
         }
         // Only the installer's directory may provide the module the runtime dlopens, and only the
         // app's external directory the launch profile (the immersive activity is exported).
-        if (!isInside(plugin, new File(getFilesDir(), "title")) || !isInside(profile, externalRoot())) {
-            Log.e(TAG, "Refusing runtime arguments outside the app's directories: " + plugin + ", " + profile);
+        File titleRoot = new File(getFilesDir(), "title");
+        File externalRoot = externalRoot();
+        if (!QuestPaths.isInside(plugin, titleRoot) || !QuestPaths.isInside(profile, externalRoot)) {
+            Log.e(TAG, "Refusing runtime arguments outside the app's directories: module " + plugin
+                + " -> " + QuestPaths.canonical(plugin) + " (allowed under " + QuestPaths.canonical(titleRoot.getPath())
+                + "), profile " + profile + " -> " + QuestPaths.canonical(profile) + " (allowed under "
+                + (externalRoot != null ? QuestPaths.canonical(externalRoot.getPath()) : "no external directory") + ")");
             return new String[] { "--title-plugin", "", "--launch-profile", "" };
         }
         Log.i(TAG, "Runtime arguments: --launch-profile " + profile + " --title-plugin " + plugin);
