@@ -51,6 +51,9 @@ struct Oot3dPicaVisualDrawView {
     std::optional<Fast::Renderer3ds::PicaNativeLightBinding> LightBinding;
     std::vector<Oot3dPicaVulkanVertexBinding> VertexBindings;
     bool HasVertexBindingOverrides = false;
+    // Left out of this execution: neither published in the composition sequence nor submitted, like the
+    // HUD omission (in-world eye passes: PICA Ui, ortho overlays, unusable rows; inworld-spec §2.3).
+    bool Omitted = false;
 
     Oot3dPicaVulkanDrawOverrides Overrides() const;
 };

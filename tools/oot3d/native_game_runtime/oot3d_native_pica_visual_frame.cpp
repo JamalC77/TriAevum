@@ -1657,6 +1657,7 @@ bool SampleVisualFrameViewWithMatching(const Oot3dPicaVisualFrame& previous, con
         sampled.BlendConstantColor.reset();
         sampled.LightBinding.reset();
         sampled.HasVertexBindingOverrides = false;
+        sampled.Omitted = false;
 
         const auto match = matching.PreviousByCurrent[currentIndex];
         if (!match.has_value()) {
@@ -2005,6 +2006,7 @@ bool ViewOot3dPicaVisualFrame(
         view.LightBinding.reset();
         view.VertexBindings.clear();
         view.HasVertexBindingOverrides = false;
+        view.Omitted = false;
     }
     return !frame.Draws.empty();
 }

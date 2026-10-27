@@ -165,6 +165,12 @@ bool Oot3dPicaPresentationScheduler::Execute(
     const auto &draw = *sample.Draws[index].BasePlan;
     const auto domain = static_cast<Oot3d::Renderer::PicaCompositionDomain>(
         static_cast<uint8_t>(draw.CompositionDomain));
+    if (presentation && sample.Draws[index].Omitted) {
+      // Left out by the sample itself (in-world eye passes): same path as the HUD omission.
+      mOmittedDrawScratch[index] = true;
+      ++mStats.OmittedViewDraws;
+      continue;
+    }
     if (presentation && !mNativeGameplayHudVisible &&
         domain == Oot3d::Renderer::PicaCompositionDomain::Ui &&
         draw.Composition.SourcePc == kOot3dGameplayHudDrawEntry) {

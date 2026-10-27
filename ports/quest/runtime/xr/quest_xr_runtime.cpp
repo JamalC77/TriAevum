@@ -484,6 +484,18 @@ void BeginExit(const char* reason) {
 
 void NoteFirstImage() { RemoveStartMarker(); }
 
+void LogLine(const char* line) { XRLOG("%s", line); }
+
+bool WorldRequested() {
+    static const bool requested = [] {
+        const char* view = std::getenv("TRIAEVUM_XR_VIEW");
+        const bool world = (view != nullptr && std::string_view(view) == "world") || EnvFlag("TRIAEVUM_XR_WORLD");
+        XRLOG("TRIAEVUM_XR_VIEW_SELECT view=%s xr=%d", world ? "world" : "screen", Requested() ? 1 : 0);
+        return world;
+    }();
+    return requested;
+}
+
 bool Requested() {
     static const bool requested = [] {
         const bool enabled = EnvFlag("TRIAEVUM_XR");

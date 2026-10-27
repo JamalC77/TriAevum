@@ -67,6 +67,12 @@ void FeedImGui(ImGuiIO& io);     // after ImGui_ImplSDL2_NewFrame
 bool NoteGuestPaused(bool paused);  // true on a pause/resume edge (logs it)
 void NoteGuestRefresh();            // counts guest refreshes that ran while paused (must stay 0)
 void NotePacing(uint32_t targetHz, const char* frameRateMode);  // logged once
+// One line to logcat (tag TriAevumXR) and stderr (logs/native-stderr.log), for the runtime's XR lines.
+void LogLine(const char* line);
+
+// ---- In-world mode (quest-research/inworld-spec.md §3.1). Opt-in: TRIAEVUM_XR_VIEW=world in
+// <ext>/triaevum-env.txt (or TRIAEVUM_XR_WORLD=1); the default stays the Q3 screen. Valid before init.
+bool WorldRequested();
 
 }  // namespace TriAevumQuestXr
 

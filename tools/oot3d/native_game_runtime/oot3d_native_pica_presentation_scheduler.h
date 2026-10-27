@@ -53,6 +53,8 @@ struct Oot3dPicaPresentationSchedulerStats {
   uint64_t CompositionPublicationFailures = 0;
   // Native gameplay HUD draws left out of presentations (TopScreen HUD off).
   uint64_t OmittedHudDraws = 0;
+  // Draws a sample left out itself (Oot3dPicaVisualDrawView::Omitted: in-world eye passes).
+  uint64_t OmittedViewDraws = 0;
   uint64_t Resets = 0;
 };
 

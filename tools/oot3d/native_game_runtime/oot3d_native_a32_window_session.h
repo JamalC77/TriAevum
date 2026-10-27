@@ -58,6 +58,7 @@
 #include "oot3d_native_pica_visual_frame.h"
 #include "oot3d_native_pica_visual_savestate.h"
 #include "oot3d_native_pica_vulkan_bridge.h"
+#include "oot3d_native_xr_view.h"
 #include "oot3d_native_pica_vulkan_plan.h"
 #include "oot3d_native_player_temporal_bridge.h"
 #include "oot3d_native_scenario_bootstrap.h"
@@ -297,6 +298,8 @@ private:
   void PinGpuCopyResources(const Oot3dNativeGame::Oot3dPicaVisualFrameViewSample& sample);
   bool FlushNativeDependencies();
   void ExecuteVisualSample(const Oot3dNativeGame::Oot3dPicaVisualFrameViewSample &sample, Oot3dNativeGame::Oot3dPicaPresentationExecutionKind kind, bool present, const Fast::Oot3d::NativeFrameTemporalSample& temporalSample, uint64_t renderTargetNamespace = kVisualInterpolationRenderTargetNamespace);
+  // The in-world eye passes of a presented sample (inworld-spec §2.1); false: present it as mono.
+  bool ExecuteXrEyes(const Oot3dNativeGame::Oot3dPicaVisualFrameViewSample &sample, Oot3dNativeGame::Oot3dPicaPresentationExecutionKind kind, const Fast::Oot3d::NativeFrameTemporalSample& temporalSample);
   // Deferred: a host continuation is pending, retry at a later frame boundary. Failed: reported once; the request is
   // dropped because every retry repeats the full GPU drain and readback.
   enum class SaveStateOutcome : uint8_t { Saved, Deferred, Failed };
@@ -584,6 +587,12 @@ private:
   bool parallelPresentation{};
   Fast::Fast3dGui *fast3dGui{};
   std::optional<GuiRendererRoutingReset> guiRendererRoutingReset;
+  // In-world VR mode (quest-research/inworld-spec.md): the eye passes, the PC preview and the W0 trace.
+  // Render-side; null unless TRIAEVUM_XR_VIEW=world (immersive), TRIAEVUM_XR_PREVIEW (PC) or
+  // TRIAEVUM_XR_VIEW_TRACE is set.
+  std::unique_ptr<Oot3dNativeGame::XrViewRenderer> xrViewRenderer;
+  std::atomic<int> xrTraceScene{-1};
+  std::chrono::steady_clock::time_point xrPreviewStart = std::chrono::steady_clock::now();
 };
 
 } // namespace Oot3dA32Window

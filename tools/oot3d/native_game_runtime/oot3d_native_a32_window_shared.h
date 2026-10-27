@@ -152,6 +152,11 @@ inline constexpr uint32_t kMinimumHostAudioPrebufferMilliseconds = 100U;
 inline constexpr uint64_t kA32RuntimeSampleDenominator = 64ULL;
 inline constexpr uint64_t kNativeDependencyRenderTargetNamespace = 1ULL;
 inline constexpr uint64_t kVisualInterpolationRenderTargetNamespace = 2ULL;
+// In-world VR mode (quest-research/inworld-spec.md §2.1): each eye replays the presented sample into its
+// own namespace (own targets, RTT replays and display snapshots); the HUD namespace is W4's.
+inline constexpr uint64_t kXrEyeLeftNamespace = 3ULL;
+inline constexpr uint64_t kXrEyeRightNamespace = 4ULL;
+inline constexpr uint64_t kXrHudNamespace = 5ULL;
 inline constexpr size_t kMaximumPicaDrainPassesPerRefresh = 64U;
 inline constexpr uint32_t kMtx4x4BuildFrustum = 0x002FDE9CU;
 inline constexpr uint32_t kMtx4x4BuildOrthographicProjectionRotated = 0x00300AA8U;

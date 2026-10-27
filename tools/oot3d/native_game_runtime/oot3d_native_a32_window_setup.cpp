@@ -1,5 +1,8 @@
 // Native A32 window session: setup (process image, host services, renderer, UI, initial state).
 #include "oot3d_native_a32_window_session.h"
+#if defined(TRIAEVUM_QUEST_OPENXR)
+#include "quest_xr.h"
+#endif
 #include "oot3d_native_direct_aot.h"
 #include "oot3d_title_grass_rules.h"
 #include "fast/oot3d/graphics_settings_persistence.h"
@@ -933,6 +936,15 @@ void NativeA32WindowSession::Setup() {
   }
   apiPointer = &GetActiveRenderingApiForDemo(window);
   auto &api = *apiPointer;
+  // In-world VR mode (inworld-spec): opt-in TRIAEVUM_XR_VIEW=world in the immersive activity; the PC
+  // preview and the W0 trace work in any build.
+  {
+    bool xrWorld = false;
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    xrWorld = TriAevumQuestXr::Requested() && TriAevumQuestXr::WorldRequested();
+#endif
+    xrViewRenderer = Oot3dNativeGame::XrViewRenderer::Create(xrWorld);
+  }
   programPreparation =
       dynamic_cast<Fast::Renderer3ds::PicaProgramPreparationBackend *>(&api);
   alwaysAvailablePrograms =

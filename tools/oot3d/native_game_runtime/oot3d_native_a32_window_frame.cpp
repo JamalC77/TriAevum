@@ -1875,6 +1875,13 @@ void NativeA32WindowSession::PresentVisualFrame(
                 process.Memory(),
                 sceneViewProbe.Stats().LastPlayStateAddress,
                 finished->Sequence);
+            if (xrViewRenderer != nullptr && xrViewRenderer->TraceEnabled()) {
+              // The W0 trace groups its table by scene (play+0x104).
+              uint16_t scene = 0xFFFFU;
+              const uint32_t playState = sceneViewProbe.Stats().LastPlayStateAddress;
+              if (playState != 0U && process.Memory().Read16(playState + 0x104U, &scene))
+                xrTraceScene.store(static_cast<int16_t>(scene));
+            }
             ++visualStats.SnapshotCount;
             suppressTopScreenBackdrop = relocatedFrontend;
             completedFrame =
@@ -2931,6 +2938,13 @@ bool NativeA32WindowSession::FlushNativeDependencies() {
 
 void NativeA32WindowSession::ExecuteVisualSample(const Oot3dNativeGame::Oot3dPicaVisualFrameViewSample &sample, Oot3dNativeGame::Oot3dPicaPresentationExecutionKind kind, bool present, const Fast::Oot3d::NativeFrameTemporalSample& temporalSample, uint64_t renderTargetNamespace) {
   auto &api = *apiPointer;
+  // In-world mode: every presented sample passes here (current, interpolated, repeated, resync), the
+  // single choke point of inworld-spec §2.1. The canonical namespace-1 replay is untouched.
+  if (xrViewRenderer != nullptr && present &&
+      renderTargetNamespace == kVisualInterpolationRenderTargetNamespace) {
+    if (xrViewRenderer->TraceEnabled()) xrViewRenderer->Trace(sample, xrTraceScene.load());
+    if (ExecuteXrEyes(sample, kind, temporalSample)) return;
+  }
   const auto started = std::chrono::steady_clock::now();
   (void)api.PublishPicaFrameTemporalSample(temporalSample);
   // Only displayed samples advance the grass colliders: the authoritative
@@ -2950,6 +2964,40 @@ void NativeA32WindowSession::ExecuteVisualSample(const Oot3dNativeGame::Oot3dPic
   }
   rendererTiming->PicaBackendSeconds += elapsed;
   rendererTiming->VisualReplaySeconds += elapsed;
+}
+
+bool NativeA32WindowSession::ExecuteXrEyes(const Oot3dNativeGame::Oot3dPicaVisualFrameViewSample &sample, Oot3dNativeGame::Oot3dPicaPresentationExecutionKind kind, const Fast::Oot3d::NativeFrameTemporalSample& temporalSample) {
+  auto &api = *apiPointer;
+  auto &xr = *xrViewRenderer;
+  if (!xr.Preview()) return false;
+  // PC preview (inworld-spec §2.7): the chosen eye executes into its own namespace and is presented on
+  // the desktop swapchain (SelectXrView is a no-op there).
+  const auto camera = xr.FindFrameCamera(sample);
+  if (!camera.Valid) {
+    xr.EndPresentation(false);
+    return false;
+  }
+  const auto started = std::chrono::steady_clock::now();
+  (void)api.PublishPicaFrameTemporalSample(temporalSample);
+  Fast::Oot3d::GrassInteractionBridge::Instance().SelectSample(temporalSample);
+  PinGpuCopyResources(sample);
+  const int eyeIndex = xr.PreviewConfig().Eye;
+  const auto& game = camera.Projection.Tangents;
+  const double aspect = (game.TanRight - game.TanLeft) / std::max(1e-6, game.TanUp - game.TanDown);
+  const double seconds = std::chrono::duration<double>(started - xrPreviewStart).count();
+  const auto eye = xr.PreviewEye(camera, seconds, aspect);
+  const auto &eyeSample = xr.BuildEye(sample, camera, eye, camera.Mirrored, eyeIndex);
+  if (!picaPresentationScheduler.Execute(
+          api, eyeSample, eyeIndex == 0 ? kXrEyeLeftNamespace : kXrEyeRightNamespace, kind, true,
+          &renderError)) {
+    throw std::runtime_error("native PICA in-world preview failed: " + renderError);
+  }
+  xr.EndPresentation(true);
+  capturedTemporalSample = temporalSample;
+  const double elapsed = SecondsSince(started);
+  rendererTiming->PicaBackendSeconds += elapsed;
+  rendererTiming->VisualReplaySeconds += elapsed;
+  return true;
 }
 
 } // namespace Oot3dA32Window

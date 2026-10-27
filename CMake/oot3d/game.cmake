@@ -202,6 +202,13 @@ add_executable(oot3d_xr_math_tests EXCLUDE_FROM_ALL
 )
 oot3d_target_defaults(oot3d_xr_math_tests FOLDER Tests)
 
+# In-world first light (header-only, std only): draw classes, eye-row rewrite and its identity check,
+# tick pacing, the W1 state classifier, preview heads (quest-research/inworld-spec.md W1).
+add_executable(oot3d_xr_world_logic_tests EXCLUDE_FROM_ALL
+    tools/oot3d/native_game_runtime/oot3d_xr_world_logic_tests.cpp
+)
+oot3d_target_defaults(oot3d_xr_world_logic_tests FOLDER Tests)
+
 add_executable(oot3d_native_a32_actor_visibility_tests EXCLUDE_FROM_ALL
     tools/oot3d/native_game_runtime/oot3d_actor_visibility_policy.cpp
     tools/oot3d/native_game_runtime/oot3d_native_a32_actor_visibility.cpp
@@ -331,6 +338,7 @@ if (TARGET oot3d_native_a32_aot OR TARGET oot3d_native_whole_aot OR
         tools/oot3d/native_game_runtime/oot3d_native_a32_window.cpp
         tools/oot3d/native_game_runtime/oot3d_native_a32_window_setup.cpp
         tools/oot3d/native_game_runtime/oot3d_native_a32_window_frame.cpp
+        tools/oot3d/native_game_runtime/oot3d_native_xr_view.cpp
         tools/oot3d/native_game_runtime/oot3d_native_a32_window_savestate.cpp
         tools/oot3d/native_game_runtime/oot3d_native_a32_candidate_dispatch.cpp
         tools/oot3d/native_game_runtime/oot3d_native_a32_projection_policy.cpp
