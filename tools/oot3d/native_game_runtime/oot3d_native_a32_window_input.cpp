@@ -1,8 +1,10 @@
 // Host input polling of the A32 window and the TopScreen pause transitions it drives.
 #include "oot3d_native_a32_window_shared.h"
+#include "oot3d_native_pad_diagnostics.h"
 
 #include <algorithm>
 #include <cmath>
+#include <unordered_map>
 #if defined(TRIAEVUM_QUEST_OPENXR)
 #include "quest_xr.h"
 #endif
@@ -65,15 +67,33 @@ PollNativeA32Input(Fast::Fast3dWindow &window,
   const bool mouseCaptured = hostGuiVisible;
 
   ThreeDsRecomp::Input::SdlControllerSelection selectedController;
+  std::unordered_map<int32_t, SDL_GameController *> port0Pads;
   auto *context = Ship::Context::GetRawInstance();
   auto controlDeck = context != nullptr ? context->GetControlDeck() : nullptr;
   if (controlDeck != nullptr) {
     auto devices = controlDeck->GetConnectedPhysicalDeviceManager();
     if (devices != nullptr) {
+      port0Pads = devices->GetConnectedSDLGamepadsForPort(0);
       selectedController = ThreeDsRecomp::Input::ResolveSdlController(
-          devices->GetConnectedSDLGamepadsForPort(0), config.PreferredControllerGuid,
+          port0Pads, config.PreferredControllerGuid,
           config.PreferredControllerSerial, pollingState.ControllerInstance);
     }
+  }
+  {
+    // TRIAEVUM_PAD device-log lines (on by default on Android): SDL's joysticks, the opened pads, this
+    // selection and Controls' enablement; with TRIAEVUM_XR_INPUT_LOG=1 the raw events and pad edges.
+    Oot3dNativeGame::PadPollFacts padFacts;
+    padFacts.Port0 = &port0Pads;
+    padFacts.SelectedInstance = selectedController.InstanceId;
+    padFacts.Selected = selectedController.Controller;
+    padFacts.ControllerEnabled = config.ControllerEnabled;
+    padFacts.PreferredGuid = config.PreferredControllerGuid;
+    padFacts.PreferredSerial = config.PreferredControllerSerial;
+    padFacts.HostGuiVisible = hostGuiVisible;
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    padFacts.TouchActive = xrActive;
+#endif
+    Oot3dNativeGame::ObservePadPoll(padFacts);
   }
   if (pollingState.ControllerInstance != selectedController.InstanceId) {
     pollingState.RightStickProfile = {};

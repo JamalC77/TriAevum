@@ -330,6 +330,10 @@ struct DeviceDescriptor {
     std::string Serial;
     bool Selected = false;
     std::int32_t TouchpadCount = 0;
+    // Automatic selection prefers the highest rank (ties: the attached active device, else the lowest
+    // instance). 0 everywhere except Android, where a pad with both sticks ranks 1 over TV remotes,
+    // D-pad-only and system devices that SDL's automatic Android mapping also makes game controllers.
+    std::int32_t Rank = 0;
 };
 
 // Session IDs are never persisted. A GUID identifies a model; a serial, when
