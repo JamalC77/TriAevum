@@ -109,13 +109,15 @@ TRIAEVUM_XR_VIEW=world
   recenter, door, scene change or return from the screen), Link stands 1.8 m ahead of you
   (`TRIAEVUM_XR_PLACE_M`) facing away from you: along your line to the centre of the play area
   (STAGE), or along your gaze when you stand within 0.6 m of it. With a small (stationary) boundary he
-  stands outside it, which is intended. The game camera itself is still the game's (mode R is W2), so
-  things behind that unseen camera can be missing and billboards face it.
-- The left stick moves Link relative to that game camera. While the world shows, the right stick moves
-  him the same way whenever the left stick is idle or the left controller is off (one-handed play);
-  with both pushed the larger deflection wins (`TRIAEVUM_XR_INPUT stick_source=left|right` on each
-  change). It is never the game's C-stick there. (When W2 gives the right stick snap turns, it moves
-  Link only while the left controller is off: `RightStickMove::WhenLeftInactive`, inworld-spec §7.)
+  stands outside it, which is intended. With `TRIAEVUM_XR_CAMERA=native` the game camera is the game's
+  own, so things behind that unseen camera can be missing and billboards face it; mode R (below, the
+  default from W2) makes it your head.
+- With the native camera the left stick moves Link relative to that game camera (mode R: relative to
+  where you look, below). While the world shows, the right stick moves him the same way whenever the
+  left stick is idle or the left controller is off (one-handed play); with both pushed the larger
+  deflection wins (`TRIAEVUM_XR_INPUT stick_source=left|right` on each change). It is never the game's
+  C-stick there. In mode R (and `held`) the right stick is snap turn and D-pad flicks instead and moves
+  Link only while the left controller is off (`RightStickMove::WhenLeftInactive`, inworld-spec §7).
   The in-game menu then opens with a deliberate hold: right stick click held ~0.7 s with the right
   stick centred (short buzz, right hand); a click while steering or a short click does nothing. On the screen (menus, cinema) a right stick click tap is
   the in-game menu as before. If Link runs past the leash (default the placement distance +
@@ -281,6 +283,96 @@ stick, then read:
 The device table is logged at startup and after every hot-plug or selection change; with
 `TRIAEVUM_PAD_LOG=1`/`2` or `TRIAEVUM_XR_INPUT_LOG=1` set it also repeats every 30 s (`reason=status`).
 Its fields are read under SDL's joystick lock, so a line never mixes two devices during a hot-plug.
+
+## In-world mode R: the game camera is your head (W2)
+
+With `TRIAEVUM_XR_VIEW=world` and the TopScreen UI profile (Forge's default), the game camera follows
+your head from W2 on (`quest-research/inworld-spec.md` §4-§7): every Camera_Update of the main camera
+writes your head, predicted for the frame's display time, through TopScreen's phased Camera_Update
+replacement. The game then culls, picks Z-targets, turns billboards and pans audio for where you stand
+and look, so you can walk a full circle around Link and look behind you.
+
+- The camera's FOV for culling is 130 deg (`TRIAEVUM_XR_CULL_FOV`), unclamped; the picture is still built
+  per eye from your eye poses, so the camera write never judders. Actors within 4 m of your head are
+  drawn even when the culling volume rejects them (through the actor light budget).
+- The native camera takes over (Held: the world still shows from your rig) for cutscenes, item gets,
+  secondary cameras, the TopScreen-blocked camera settings (0x14, 0x15, 0x23, 0x40, 0x46), scene 0x45, a
+  camera status other than 7 and player states 0x20/0x200. Cutscenes, item gets and secondary cameras
+  also freeze the rig; such a scene goes to the screen only when its camera moves more than 2 m or
+  45 deg within 1 s (it stays on the screen until the scene ends), or for a cutscene index >= 0xFFF0.
+  Talking and shop browsing stay head-owned with the rig frozen. First person, crawl spaces, fixed
+  cameras, Epona, doors and menus go to the screen or black as before.
+- Z-targeting stays head-owned: the target choice follows your head.
+- The left stick moves Link relative to where you look (in the head-owned and the Held states alike): the
+  direction is latched from your head when you push the stick and follows your head slowly while you
+  hold it (`TRIAEVUM_XR_MOVE_REF`); Z-targeting latches it at the L press. Talking, shops, first person,
+  crawling and the ocarina keep the game's own stick.
+- Right stick: flick left/right for a 45 deg snap turn around your head (80 ms blink, short buzz on the
+  right hand; `TRIAEVUM_XR_TURN=30` or `smooth`); flick up/down for D-pad up/down (TopScreen's
+  first-person view is D-pad up).
+- Walking your head into a wall darkens the world in proportion to the depth (black at 0.3 m); open-air
+  fences and railings do not, and your head below Link's floor goes black.
+- Placements (first, recenter, doors, scene changes, the screen's end) stay black for up to 0.6 s while
+  up to five collision probes from Link's head (behind, behind-left and -right 35 deg, then left and
+  right) choose where you stand: the farthest clear one minus 0.3 m, capped at the placement distance
+  (`TRIAEVUM_XR_PLACE_M`), at least 0.7 m.
+- A vignette darkens the edge of view while the floor glides (landing, swimming, diving) or during a
+  smooth turn.
+- `TRIAEVUM_XR_CAMERA=native` runs W1 (the native camera, no stick rotation) for A/B on the device;
+  `held` runs mode L (the native camera with the stick rotation). Without the TopScreen profile the
+  mode is `held` (`TRIAEVUM_XR_WORLD camera=held reason=ui_profile`).
+
+| Key (mode R) | Values |
+|---|---|
+| `TRIAEVUM_XR_CAMERA` | `r` (default), `native` (W1), `held` (mode L) |
+| `TRIAEVUM_XR_CULL_FOV` | the head camera's FOV for culling, 60-150, default 130 |
+| `TRIAEVUM_XR_MOVE_REF` | `head-latched` (default), `head`, `line` (Link minus head beyond 0.6 m), `native` (no rotation) |
+| `TRIAEVUM_XR_TURN` | snap degrees (10-90, default 45) or `smooth` (90 deg/s with the vignette) |
+| `TRIAEVUM_XR_TETHER` | `leash` (default) or `glide` (the anchor glides past the room radius, vignette) |
+| `TRIAEVUM_XR_SEATED=1` | seated: LOCAL_FLOOR, the floor offset from your seated eye height at each placement, leash 2.5 m |
+| `TRIAEVUM_XR_INPUT_LOG=1` | also log `TRIAEVUM_XR_STICK theta= yaw_cam= yaw_dir= psi_ref=` (latches and every 0.5 s) |
+
+| Line | Meaning |
+|---|---|
+| `TRIAEVUM_XR_WORLD camera=r reason= cull_fov= move_ref= turn=` | the camera mode at start |
+| `TRIAEVUM_XR_CAMERA owner=vr\|vr_probe\|native held=0x.. (names) rig_frozen= talking= z_target= layer= pending=` | every owner change at Camera_Update (`owner=` is also on the `state=` lines) |
+| `TRIAEVUM_XR_CAMWRITE first eye= at= yaw= pitch= fov= head_t=` | the first head write after each owner change |
+| `TRIAEVUM_XR_CAMWRITE updates= owned= owned_pct= probes= held= eye= yaw= pitch= fov= fov_hooks= fov_loaded= head_failures= seq_lag= wall_fade_updates= always_candidates= always_granted= turns=` | every 5 s: `owned_pct` > 95 in gameplay; `fov_hooks` > 0 and `fov=130` (the FovScalar returned the cull FOV; `fov_loaded` is play+0x198 as the native load read it); `seq_lag` = visual frames between the camera write and the frame drawn (0 expected) |
+| `TRIAEVUM_XR_HELD entries=reason:count,...` | Held entries by reason (5 s) |
+| `TRIAEVUM_XR_CAMERA cutscene_camera_moved moved_m= turned_deg=` | a Held cutscene went to the screen |
+| `TRIAEVUM_XR_PROBE start reason= length_m=`, `TRIAEVUM_XR_PROBE reason= choice=back\|back_left\|back_right\|left\|right\|fallback dist_m= clear_m=b,bl,br,l,r timeout=` | placement probes; `TRIAEVUM_XR_RIG event=place ... probed=1` |
+| `TRIAEVUM_XR_GEOMETRY fade= q= head=` | the wall fade starts or ends; `TRIAEVUM_XR_OVERLAY wall_fade_frames= vignette_frames=` every 5 s |
+| `TRIAEVUM_XR_FLICK axis=x\|y dir=`, `TRIAEVUM_XR_TURN dir= step_deg= psi=`, `TRIAEVUM_XR_RIG event=turn` | right stick flicks and snap turns |
+| `TRIAEVUM_XR_STICK rotations= bypassed= theta_abs_max= mode=` | stick rotation (5 s) |
+| `TRIAEVUM_XR_VIGNETTE strength=`, `TRIAEVUM_XR_SWAPCHAIN vignette=64x64 array=8`, `TRIAEVUM_XR_VIGNETTE ready` | the vignette |
+
+On a PC, `TRIAEVUM_XR_PREVIEW=left` with `TRIAEVUM_XR_PREVIEW_HEAD=circle:1.2,8` (and the TopScreen
+profile) drives the game camera from a head walking a 1.2 m circle around Link in 8 s, looking at him;
+`TRIAEVUM_XR_PREVIEW circle deg=0..315` marks each 45 deg for screenshots. `oot3d_xr_camera_logic_tests`
+runs the pure parts (camera write, owner rows, the cutscene-camera test, head inside geometry, probes,
+stick reference and rotation, R_always, the circle) anywhere.
+
+Implementation notes (where W2 differs from the spec text):
+
+- The frame state still travels by value with each host frame (W1 note 11); turns and recenters are
+  applied at Camera_Update, and `seq_lag` measures whether the drawn frame is the one the camera write
+  belongs to. The sequence ring returns with W3's interpolation.
+- The owner rows are evaluated on the guest's own flags at every Camera_Update, so first person, doors
+  and the other screen rows hand the camera back in the same update, a frame before the layer changes.
+- Camera status != 7 is a Held row (TopScreen's own blocker reads the same offset); it is still not a
+  screen trigger by itself.
+- Probe updates are head-owned updates that keep the camera where it is (no head write, native FOV):
+  the native camera skips those three to five updates under black.
+- The head-in-geometry penetration is measured along the segment: BgCheckInfo extends the ray 8 u past
+  its end, so a wall just ahead of the head's motion would otherwise fade the world 24 cm from it.
+- The stick logic is in `oot3d_xr_camera_logic.h` (not `quest_xr_input_logic.h`): it runs in
+  `SampleGuestRefreshInput`, which the PC build compiles too. The `controller` reference needs the aim
+  pose (G11, W5). The ocarina bypass uses TopScreen's ocarina state and flags2 0x08000000. In a mirrored
+  (Master Quest) frame theta is computed in the VR world [unverified until W5].
+- Snap turns and the vignette also work with `TRIAEVUM_XR_CAMERA=native`; they do not touch the camera.
+- The R_always light budget walk runs while the head owns the camera even with Extended draw distance
+  off (with the light arena's overflow relief). The pop-in counter of the W2 exit is approximated by
+  `always_candidates`/`always_granted`.
 
 ## Title pairing
 
