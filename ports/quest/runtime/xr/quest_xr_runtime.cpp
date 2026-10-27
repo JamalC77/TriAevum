@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -103,6 +104,65 @@ std::atomic<bool> gGuestPaused{false};
 std::atomic<uint64_t> gGuestRefreshesWhilePaused{0};
 std::atomic<bool> gRecenterRequested{false};
 
+// ---- in-world state (inworld-spec §3)
+std::atomic<uint32_t> gWorldRecenters{0};
+PlayArea gPlayArea;  // written at StartSession, read-only afterwards
+
+// The display clock, published after each xrWaitFrame (§3.4 G3).
+std::mutex gTickMutex;
+std::condition_variable gTickChanged;
+TickInfo gTick;
+uint64_t gTickCounter = 0;  // XR thread
+
+void PublishTick(bool valid, int64_t displayTime, int64_t period) {
+    {
+        std::lock_guard lock(gTickMutex);
+        if (valid) {
+            gTick.Tick = ++gTickCounter;
+            gTick.DisplayTimeNs = displayTime;
+            gTick.PeriodNs = period;
+        }
+        gTick.Valid = valid;
+    }
+    gTickChanged.notify_all();
+}
+
+// Layer modes and fades (§3.3): requests from the runtime's threads, the machine on the XR thread.
+struct LayerRequest {
+    bool ModePending = false;
+    LayerMode Mode = LayerMode::Cinema;
+    uint32_t FadeMs = 150;
+    uint32_t MinRigEpoch = 0;
+    bool BlinkPending = false;
+    uint32_t BlinkEpoch = 0;
+    uint32_t BlinkMs = 120;
+};
+std::mutex gLayerMutex;
+LayerRequest gLayerRequest;
+std::atomic<int> gRequestedLayer{static_cast<int>(LayerMode::Cinema)};
+
+struct LayerMachine {
+    enum class Phase : uint8_t { Idle, Out, Hold, In };
+    LayerMode Shown = LayerMode::Cinema;
+    LayerMode Target = LayerMode::Cinema;
+    Phase Step = Phase::Idle;
+    double Alpha = 0.0;       // the fade quad's opacity
+    double FadeSeconds = 0.15;
+    uint32_t HoldEpoch = 0;   // World fades in once a pair of this rig epoch is shown
+    double HoldUntil = 0.0;
+};
+LayerMachine gLayers;  // XR thread only
+
+const char* PhaseName(LayerMachine::Phase phase) {
+    switch (phase) {
+    case LayerMachine::Phase::Idle: return "idle";
+    case LayerMachine::Phase::Out: return "out";
+    case LayerMachine::Phase::Hold: return "hold";
+    case LayerMachine::Phase::In: return "in";
+    }
+    return "?";
+}
+
 // ---- watchdog: no XR shutdown wait may hang the process (q3-spec §4.6, §6.6). One at a time;
 // StopSession disarms it once the XR objects are gone, so the renderer's own shutdown work (the
 // preparation join and drain, StorePipelineCache) runs under the longer renderer watchdog only.
@@ -189,7 +249,8 @@ void OnSessionRunning() {
         if (count != 0U) g.EnumerateRefreshRates(g.Session, count, &count, rates.data());
         std::string available;
         for (float rate : rates) available += Format("%s%.0f", available.empty() ? "" : "/", rate);
-        const float want = static_cast<float>(EnvDouble("TRIAEVUM_XR_REFRESH", 72.0));
+        // In-world: 90 Hz, so the 30 Hz eyes lock 3:1 (inworld-spec §3.4); the Q3 screen keeps 72.
+        const float want = static_cast<float>(EnvDouble("TRIAEVUM_XR_REFRESH", WorldRequested() ? 90.0 : 72.0));
         float best = rates.empty() ? 0.0F : rates.front();
         for (float rate : rates)
             if (std::fabs(rate - want) < std::fabs(best - want)) best = rate;
@@ -289,6 +350,10 @@ void PollEvents() {
                 gPlaceAfter = change.changeTime;
                 gPlaceReason = "space_change";
             }
+            // In-world: a user recenter changes LOCAL, not STAGE; either re-places the world (§3.2).
+            if (WorldRequested() && (change.referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL ||
+                                     change.referenceSpaceType == G().WorldSpaceType))
+                NoteWorldRecenter("space_change");
             break;
         }
         case XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED:
@@ -325,7 +390,8 @@ void LogStats(FrameStats& frames) {
     XRLOG("TRIAEVUM_XR_STATS state=%s display_frames=%llu should_render_false=%llu copies=%llu new_frames=%llu "
           "stale_display_frames=%llu incomplete_skips=%llu publications_dropped=%llu swapchain_wait_timeouts=%llu "
           "wait_frame_ms_max=%.1f begin_frame_ms_max=%.1f copy_wait_ms_max=%.1f guest_paused=%d "
-          "guest_refreshes_while_paused=%llu refresh_hz=%.0f",
+          "guest_refreshes_while_paused=%llu refresh_hz=%.0f stereo_publications=%llu stereo_copies=%llu "
+          "layer=%s target=%s fade=%.2f phase=%s",
           SessionStateName(g.SessionState.load()), static_cast<unsigned long long>(frames.DisplayFrames),
           static_cast<unsigned long long>(frames.ShouldRenderFalse), static_cast<unsigned long long>(sink.Copies),
           static_cast<unsigned long long>(sink.Publications),
@@ -334,8 +400,81 @@ void LogStats(FrameStats& frames) {
           static_cast<unsigned long long>(sink.PublicationsDropped),
           static_cast<unsigned long long>(sink.SwapchainWaitTimeouts), frames.WaitFrameMsMax, frames.BeginFrameMsMax,
           sink.CopyWaitMsMax, gGuestPaused.load() ? 1 : 0,
-          static_cast<unsigned long long>(gGuestRefreshesWhilePaused.load()), g.RefreshHz.load());
+          static_cast<unsigned long long>(gGuestRefreshesWhilePaused.load()), g.RefreshHz.load(),
+          static_cast<unsigned long long>(sink.StereoPublications), static_cast<unsigned long long>(sink.StereoCopies),
+          LayerModeName(gLayers.Shown), LayerModeName(gLayers.Target), gLayers.Alpha, PhaseName(gLayers.Step));
     frames = {};
+}
+
+// The layer machine, once per display frame (§3.3): transitions go out to black over the fade, switch
+// the shown mode (the cinema quad is placed again), hold until the new mode has content (a World pair
+// of the wanted rig epoch, a placed and copied quad; 300 ms at most), then fade in.
+void UpdateLayers(double dt) {
+    auto& m = gLayers;
+    LayerRequest request;
+    {
+        std::lock_guard lock(gLayerMutex);
+        request = gLayerRequest;
+        gLayerRequest.ModePending = false;
+        gLayerRequest.BlinkPending = false;
+    }
+    const double now = NowSeconds();
+    if (request.ModePending && request.Mode != m.Target) {
+        XRLOG("TRIAEVUM_XR_LAYER request=%s from=%s fade_ms=%u epoch=%u", LayerModeName(request.Mode),
+              LayerModeName(m.Shown), request.FadeMs, request.MinRigEpoch);
+        m.Target = request.Mode;
+        m.FadeSeconds = request.FadeMs / 1000.0;
+        m.HoldEpoch = request.MinRigEpoch;
+        m.Step = LayerMachine::Phase::Out;
+    } else if (request.ModePending) {
+        m.HoldEpoch = std::max(m.HoldEpoch, request.MinRigEpoch);
+    }
+    if (request.BlinkPending && m.Target == LayerMode::World) {
+        m.Alpha = 1.0;
+        m.HoldEpoch = std::max(m.HoldEpoch, request.BlinkEpoch);
+        m.FadeSeconds = request.BlinkMs / 1000.0;
+        if (m.Shown == LayerMode::World) {
+            m.Step = LayerMachine::Phase::Hold;
+            m.HoldUntil = now + 0.3;
+        }
+    }
+    const auto step = [&](double seconds) { return seconds > 0.0 ? dt / seconds : 1.0; };
+    switch (m.Step) {
+    case LayerMachine::Phase::Out:
+        m.Alpha = std::min(1.0, m.Alpha + step(m.FadeSeconds));
+        if (m.Alpha >= 1.0) {
+            if (m.Shown != m.Target) {
+                XRLOG("TRIAEVUM_XR_LAYER shown=%s from=%s", LayerModeName(m.Target), LayerModeName(m.Shown));
+            }
+            m.Shown = m.Target;
+            if (m.Shown == LayerMode::Cinema) {
+                gPlaced = false;  // the screen is placed again on each Cinema entry (§1)
+                gPlaceAfter = 0;
+                gPlaceReason = "cinema";
+            }
+            m.Step = m.Shown == LayerMode::Black ? LayerMachine::Phase::Idle : LayerMachine::Phase::Hold;
+            m.HoldUntil = now + 0.3;
+        }
+        break;
+    case LayerMachine::Phase::Hold: {
+        bool ready = now >= m.HoldUntil;
+        if (m.Shown == LayerMode::World) {
+            Fast::StereoViews views;
+            ready = ready || (EyeReleased() && ShownViews(&views) && views.RigEpoch >= m.HoldEpoch);
+        } else if (m.Shown == LayerMode::Cinema) {
+            ready = ready || (QuadReleased() && gPlaced);
+        }
+        if (ready) m.Step = LayerMachine::Phase::In;
+        break;
+    }
+    case LayerMachine::Phase::In:
+        m.Alpha = std::max(0.0, m.Alpha - step(m.FadeSeconds));
+        if (m.Alpha <= 0.0) m.Step = LayerMachine::Phase::Idle;
+        break;
+    case LayerMachine::Phase::Idle:
+        if (m.Shown == LayerMode::Black) m.Alpha = 1.0;
+        break;
+    }
 }
 
 double MillisecondsSince(std::chrono::steady_clock::time_point start) {
@@ -347,9 +486,11 @@ void XrThreadMain() {
     pthread_setname_np(pthread_self(), "TriAevumXR");
     ApplyThreadHint(XR_ANDROID_THREAD_TYPE_RENDERER_MAIN_KHR, gettid());
     XRLOG("TRIAEVUM_XR_THREAD_START tid=%d", gettid());
+    const bool world = WorldRequested();
     FrameStats frames;
     double nextStats = NowSeconds() + kStatsPeriodSeconds;
     bool wasFocused = false;
+    bool tickValid = false;
     while (!g.Stop.load()) {
         ApplyPendingThreadHints();
         PollEvents();
@@ -359,6 +500,10 @@ void XrThreadMain() {
             nextStats = NowSeconds() + kStatsPeriodSeconds;
         }
         if (!g.Running.load()) {
+            if (tickValid) {
+                tickValid = false;
+                PublishTick(false, 0, 0);
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
@@ -372,6 +517,9 @@ void XrThreadMain() {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
+        // The display clock (§3.4): tick N begins now; the renderer's tick waits release here.
+        tickValid = true;
+        PublishTick(true, frameState.predictedDisplayTime, frameState.predictedDisplayPeriod);
         start = std::chrono::steady_clock::now();
         {
             QueueLock lock("xr");
@@ -392,14 +540,22 @@ void XrThreadMain() {
         wasFocused = focused;
         PlaceScreenIfNeeded(frameState.predictedDisplayTime);
         if (frameState.shouldRender) {
-            CopyLatest(frames.DisplayFrames);
+            CopyLatest(gTickCounter);
         } else {
             ++frames.ShouldRenderFalse;
         }
+        const double period = frameState.predictedDisplayPeriod > 0 ? frameState.predictedDisplayPeriod * 1e-9 : 1.0 / 90.0;
+        if (world) UpdateLayers(period);
+        const bool fadeReady = world && PrepareFadeSwapchain();
+
         XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
-        const XrCompositionLayerBaseHeader* layers[1] = {};
+        XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+        XrCompositionLayerProjectionView projectionViews[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
+                                                               {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
+        XrCompositionLayerQuad fade{XR_TYPE_COMPOSITION_LAYER_QUAD};
+        const XrCompositionLayerBaseHeader* layers[3] = {};
         uint32_t layerCount = 0;
-        if (frameState.shouldRender && QuadReleased() && gPlaced) {
+        const auto addQuad = [&] {
             const VkExtent2D extent = QuadExtent();
             quad.layerFlags = 0;  // opaque
             quad.space = g.LocalSpace;
@@ -410,6 +566,48 @@ void XrThreadMain() {
             quad.pose = gScreen.Pose;
             quad.size = gScreen.Size;
             layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad);
+        };
+        if (!world) {
+            if (frameState.shouldRender && QuadReleased() && gPlaced) addQuad();
+        } else if (frameState.shouldRender && gLayers.Alpha < 0.999) {
+            Fast::StereoViews shown;
+            if (gLayers.Shown == LayerMode::World && EyeReleased() && ShownViews(&shown)) {
+                // The pose and the image always come from the same publication (§3.3).
+                const VkExtent2D extent = EyeSwapchainExtent();
+                for (uint32_t eye = 0; eye < 2; ++eye) {
+                    auto& view = projectionViews[eye];
+                    const auto& source = shown.Eye[eye];
+                    view.pose.orientation = {source.Orientation[0], source.Orientation[1], source.Orientation[2],
+                                             source.Orientation[3]};
+                    view.pose.position = {source.Position[0], source.Position[1], source.Position[2]};
+                    view.fov = {std::atan(source.TanLeft), std::atan(source.TanRight), std::atan(source.TanUp),
+                                std::atan(source.TanDown)};
+                    view.subImage.swapchain = EyeSwapchain();
+                    view.subImage.imageRect = {{0, 0},
+                                               {static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height)}};
+                    view.subImage.imageArrayIndex = eye;
+                }
+                projection.layerFlags = 0;  // opaque
+                projection.space = g.WorldSpace;
+                projection.viewCount = 2;
+                projection.views = projectionViews;
+                layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection);
+            } else if (gLayers.Shown == LayerMode::Cinema && QuadReleased() && gPlaced) {
+                addQuad();
+            }
+            const auto level = static_cast<uint32_t>(std::lround(gLayers.Alpha * (FadeLevels() - 1)));
+            if (layerCount != 0U && level != 0U && fadeReady) {
+                // Black over the scene, head-locked: 2 m wide at 0.5 m covers the field of view.
+                fade.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                fade.space = g.ViewSpace;
+                fade.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                fade.subImage.swapchain = FadeSwapchain();
+                fade.subImage.imageRect = {{0, 0}, {4, 4}};
+                fade.subImage.imageArrayIndex = level;
+                fade.pose = {{0.0F, 0.0F, 0.0F, 1.0F}, {0.0F, 0.0F, -0.5F}};
+                fade.size = {2.0F, 2.0F};
+                layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&fade);
+            }
         }
         XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
         endInfo.displayTime = frameState.predictedDisplayTime;
@@ -423,6 +621,7 @@ void XrThreadMain() {
         if (XR_FAILED(result)) XRWARN("TRIAEVUM_XR_ERROR call=xrEndFrame result=%d", static_cast<int>(result));
         ++frames.DisplayFrames;
     }
+    PublishTick(false, 0, 0);
     XRLOG("TRIAEVUM_XR_THREAD_EXIT exiting=%d shutdown_requested=%d", g.Exiting.load() ? 1 : 0,
           g.ShutdownRequested.load() ? 1 : 0);
 }
@@ -468,6 +667,13 @@ const char* SessionStateName(int state) {
 }
 
 void RequestRecenter() { gRecenterRequested = true; }
+
+void NoteWorldRecenter(const char* reason) {
+    const uint32_t count = ++gWorldRecenters;
+    XRLOG("TRIAEVUM_XR_RECENTER world=1 reason=%s pending=%u", reason, count);
+}
+
+LayerMode RequestedLayerMode() { return static_cast<LayerMode>(gRequestedLayer.load()); }
 
 void BeginExit(const char* reason) {
     auto& g = G();
@@ -594,6 +800,7 @@ void CreateInstance() {
     optional(XR_KHR_ANDROID_THREAD_SETTINGS_EXTENSION_NAME, g.HasThread);
     optional("XR_META_touch_controller_plus", g.HasTouchPlus);
     optional("XR_FB_touch_controller_pro", g.HasTouchPro);
+    if (WorldRequested()) optional(XR_EXT_LOCAL_FLOOR_EXTENSION_NAME, g.HasLocalFloor);
 
     XrInstanceCreateInfoAndroidKHR androidInfo{XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
     androidInfo.applicationVM = g.Vm;
@@ -719,6 +926,72 @@ bool TryCreateVulkanDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreate
     return true;
 }
 
+// In-world (inworld-spec §3.2, G1, G2): STAGE when offered with bounds >= 1 x 1 m, else LOCAL_FLOOR,
+// else LOCAL (floor 1.65 m under the origin); the view configuration's recommended size is logged.
+void CreateWorldSpace() {
+    auto& g = G();
+    uint32_t count = 0;
+    xrEnumerateReferenceSpaces(g.Session, 0, &count, nullptr);
+    std::vector<XrReferenceSpaceType> spaces(count);
+    if (count != 0U) xrEnumerateReferenceSpaces(g.Session, count, &count, spaces.data());
+    const auto offered = [&](XrReferenceSpaceType type) {
+        return std::find(spaces.begin(), spaces.end(), type) != spaces.end();
+    };
+    std::string list;
+    for (auto type : spaces) list += Format("%s%d", list.empty() ? "" : ",", static_cast<int>(type));
+    XrReferenceSpaceCreateInfo info{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+    info.poseInReferenceSpace.orientation.w = 1.0F;
+    XrExtent2Df bounds{0.0F, 0.0F};
+    const bool forceLocalFloor = std::string_view(std::getenv("TRIAEVUM_XR_WORLD_SPACE") != nullptr
+                                                      ? std::getenv("TRIAEVUM_XR_WORLD_SPACE") : "") == "local_floor";
+    if (offered(XR_REFERENCE_SPACE_TYPE_STAGE) && !forceLocalFloor) {
+        info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
+        XrSpace stage = XR_NULL_HANDLE;
+        const XrResult created = xrCreateReferenceSpace(g.Session, &info, &stage);
+        const XrResult bounded = XR_SUCCEEDED(created)
+            ? xrGetReferenceSpaceBoundsRect(g.Session, XR_REFERENCE_SPACE_TYPE_STAGE, &bounds)
+            : created;
+        if (XR_SUCCEEDED(created) && bounded == XR_SUCCESS && bounds.width >= 1.0F && bounds.height >= 1.0F) {
+            g.WorldSpace = stage;
+            g.WorldSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
+            gPlayArea = {bounds.width * 0.5F, bounds.height * 0.5F, true, 0.0F, "STAGE"};
+        } else {
+            XRLOG("TRIAEVUM_XR_WORLD stage_rejected create=%d bounds_result=%d bounds=%.2fx%.2f",
+                  static_cast<int>(created), static_cast<int>(bounded), bounds.width, bounds.height);
+            if (stage != XR_NULL_HANDLE) xrDestroySpace(stage);
+        }
+    }
+    if (g.WorldSpace == XR_NULL_HANDLE && g.HasLocalFloor && offered(XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR_EXT)) {
+        info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR_EXT;
+        if (XR_SUCCEEDED(xrCreateReferenceSpace(g.Session, &info, &g.WorldSpace))) {
+            g.WorldSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR_EXT;
+            gPlayArea = {0.0F, 0.0F, false, 0.0F, "LOCAL_FLOOR"};
+        }
+    }
+    if (g.WorldSpace == XR_NULL_HANDLE) {
+        info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+        CheckXr(xrCreateReferenceSpace(g.Session, &info, &g.WorldSpace), "xrCreateReferenceSpace(world LOCAL)");
+        g.WorldSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+        gPlayArea = {0.0F, 0.0F, false, 1.65F, "LOCAL"};
+    }
+    // The view configuration (G2): the runtime's recommended eye size beside the chosen one (§2.6 gate).
+    uint32_t viewCount = 0;
+    xrEnumerateViewConfigurationViews(g.Instance, g.System, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &viewCount,
+                                      nullptr);
+    std::vector<XrViewConfigurationView> views(viewCount, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
+    if (viewCount != 0U)
+        xrEnumerateViewConfigurationViews(g.Instance, g.System, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, viewCount,
+                                          &viewCount, views.data());
+    const VkExtent2D eye = EyeExtent();
+    XRLOG("TRIAEVUM_XR_WORLD space=%s bounds=%.2fx%.2f floor_below_origin_m=%.2f offered_spaces=%s eye=%ux%u "
+          "recommended=%ux%u max=%ux%u views=%u local_floor_ext=%d",
+          gPlayArea.Space, gPlayArea.HalfX * 2.0F, gPlayArea.HalfZ * 2.0F, gPlayArea.FloorBelowOriginM, list.c_str(),
+          eye.width, eye.height, viewCount != 0U ? views[0].recommendedImageRectWidth : 0U,
+          viewCount != 0U ? views[0].recommendedImageRectHeight : 0U,
+          viewCount != 0U ? views[0].maxImageRectWidth : 0U, viewCount != 0U ? views[0].maxImageRectHeight : 0U,
+          viewCount, g.HasLocalFloor ? 1 : 0);
+}
+
 void StartSession(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice device, uint32_t queueFamily,
                   uint32_t xrQueueIndex) {
     auto& g = G();
@@ -746,10 +1019,13 @@ void StartSession(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice
     spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
     CheckXr(xrCreateReferenceSpace(g.Session, &spaceInfo, &g.ViewSpace), "xrCreateReferenceSpace(VIEW)");
 
+    if (WorldRequested()) CreateWorldSpace();
+
     vkGetDeviceQueue(device, queueFamily, xrQueueIndex, &g.Queue);
     if (g.Queue == VK_NULL_HANDLE) Fail(Format("no Vulkan queue %u in family %u", xrQueueIndex, queueFamily));
     try {
         CreateQuadSwapchain();
+        if (WorldRequested()) CreateWorldSwapchains();
         CreateCopyResources();
         CreateActions();
     } catch (const std::exception& error) {
@@ -808,7 +1084,8 @@ void StopSession() {
     DestroyActions();
     if (g.ViewSpace != XR_NULL_HANDLE) xrDestroySpace(g.ViewSpace);
     if (g.LocalSpace != XR_NULL_HANDLE) xrDestroySpace(g.LocalSpace);
-    g.ViewSpace = g.LocalSpace = XR_NULL_HANDLE;
+    if (g.WorldSpace != XR_NULL_HANDLE) xrDestroySpace(g.WorldSpace);
+    g.ViewSpace = g.LocalSpace = g.WorldSpace = XR_NULL_HANDLE;
     if (g.Session != XR_NULL_HANDLE) {
         const XrResult result = xrDestroySession(g.Session);
         XRLOG("TRIAEVUM_XR_EXIT stage=session_destroyed result=%d", static_cast<int>(result));
@@ -820,6 +1097,116 @@ void StopSession() {
     ArmWatchdog("renderer_shutdown",
                 static_cast<int>(std::clamp(EnvDouble("TRIAEVUM_XR_SHUTDOWN_WATCHDOG_S", 120.0), 15.0, 3600.0)));
     // The XrInstance stays: the process leaves through _exit (TriAevumSdlActivity.onDestroy).
+}
+
+TickInfo LatestTick() {
+    std::lock_guard lock(gTickMutex);
+    return gTick;
+}
+
+bool WaitDisplayTick(uint64_t tick, uint32_t timeoutMs) {
+    std::unique_lock lock(gTickMutex);
+    if (!gTick.Valid) return false;
+    return gTickChanged.wait_for(lock, std::chrono::milliseconds(timeoutMs),
+                                 [&] { return !gTick.Valid || gTick.Tick >= tick; }) &&
+           gTick.Valid && gTick.Tick >= tick;
+}
+
+bool PredictEyes(int64_t displayTimeNs, Fast::StereoViews* out) {
+    const auto& g = G();
+    if (g.WorldSpace == XR_NULL_HANDLE || g.SessionStopped.load() || !g.Running.load() || displayTimeNs <= 0)
+        return false;
+    XrViewLocateInfo info{XR_TYPE_VIEW_LOCATE_INFO};
+    info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    info.displayTime = displayTimeNs;
+    info.space = g.WorldSpace;
+    XrViewState state{XR_TYPE_VIEW_STATE};
+    XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+    uint32_t count = 0;
+    if (XR_FAILED(xrLocateViews(g.Session, &info, &state, 2, &count, views)) || count != 2U) return false;
+    constexpr XrViewStateFlags kValid = XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT;
+    if ((state.viewStateFlags & kValid) != kValid) return false;
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        auto& target = out->Eye[eye];
+        const auto& pose = views[eye].pose;
+        target.Orientation[0] = pose.orientation.x;
+        target.Orientation[1] = pose.orientation.y;
+        target.Orientation[2] = pose.orientation.z;
+        target.Orientation[3] = pose.orientation.w;
+        target.Position[0] = pose.position.x;
+        target.Position[1] = pose.position.y;
+        target.Position[2] = pose.position.z;
+        target.TanLeft = std::tan(views[eye].fov.angleLeft);
+        target.TanRight = std::tan(views[eye].fov.angleRight);
+        target.TanUp = std::tan(views[eye].fov.angleUp);
+        target.TanDown = std::tan(views[eye].fov.angleDown);
+    }
+    out->DisplayTimeNs = displayTimeNs;
+    out->Valid = true;
+    return true;
+}
+
+bool LocateHead(int64_t displayTimeNs, HeadPose* out) {
+    const auto& g = G();
+    if (g.WorldSpace == XR_NULL_HANDLE || g.SessionStopped.load() || !g.Running.load() || displayTimeNs <= 0)
+        return false;
+    XrSpaceVelocity velocity{XR_TYPE_SPACE_VELOCITY};
+    XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+    location.next = &velocity;
+    if (XR_FAILED(xrLocateSpace(g.ViewSpace, g.WorldSpace, displayTimeNs, &location))) return false;
+    constexpr XrSpaceLocationFlags kValid = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+    if ((location.locationFlags & kValid) != kValid) return false;
+    const auto& pose = location.pose;
+    *out = {};
+    out->Orientation[0] = pose.orientation.x;
+    out->Orientation[1] = pose.orientation.y;
+    out->Orientation[2] = pose.orientation.z;
+    out->Orientation[3] = pose.orientation.w;
+    out->Position[0] = pose.position.x;
+    out->Position[1] = pose.position.y;
+    out->Position[2] = pose.position.z;
+    if ((velocity.velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT) != 0U) {
+        out->LinearVelocity[0] = velocity.linearVelocity.x;
+        out->LinearVelocity[1] = velocity.linearVelocity.y;
+        out->LinearVelocity[2] = velocity.linearVelocity.z;
+    }
+    out->Valid = true;
+    return true;
+}
+
+PlayArea WorldPlayArea() { return gPlayArea; }
+
+uint32_t TakeWorldRecenter() { return gWorldRecenters.exchange(0); }
+
+const char* LayerModeName(LayerMode mode) {
+    switch (mode) {
+    case LayerMode::World: return "world";
+    case LayerMode::Cinema: return "cinema";
+    case LayerMode::Black: return "black";
+    }
+    return "?";
+}
+
+void RequestLayerMode(LayerMode mode, uint32_t fadeMs, uint32_t minRigEpoch) {
+    {
+        std::lock_guard lock(gLayerMutex);
+        gLayerRequest.ModePending = true;
+        gLayerRequest.Mode = mode;
+        gLayerRequest.FadeMs = fadeMs;
+        gLayerRequest.MinRigEpoch = minRigEpoch;
+    }
+    gRequestedLayer = static_cast<int>(mode);
+}
+
+void RequestBlink(uint32_t rigEpoch, uint32_t fadeMs) {
+    std::lock_guard lock(gLayerMutex);
+    gLayerRequest.BlinkPending = true;
+    gLayerRequest.BlinkEpoch = rigEpoch;
+    gLayerRequest.BlinkMs = fadeMs;
+}
+
+void Pulse(int hand, uint32_t milliseconds) {
+    Haptic(hand == 0 || hand == 2, hand == 1 || hand == 2, static_cast<int>(milliseconds));
 }
 
 bool NoteGuestPaused(bool paused) {

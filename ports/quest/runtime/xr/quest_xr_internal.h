@@ -42,6 +42,7 @@ struct State {
     PFN_xrGetDisplayRefreshRateFB GetRefreshRate = nullptr;
     PFN_xrPerfSettingsSetPerformanceLevelEXT SetPerformanceLevel = nullptr;
     PFN_xrSetAndroidApplicationThreadKHR SetApplicationThread = nullptr;
+    bool HasLocalFloor = false;  // XR_EXT_local_floor
     XrVersion VulkanMin = 0, VulkanMax = 0;
     JavaVM* Vm = nullptr;
     jobject Activity = nullptr;
@@ -50,6 +51,9 @@ struct State {
     XrSession Session = XR_NULL_HANDLE;
     XrSpace LocalSpace = XR_NULL_HANDLE;
     XrSpace ViewSpace = XR_NULL_HANDLE;
+    // In-world: STAGE (bounds >= 1 x 1 m), else LOCAL_FLOOR, else LOCAL (inworld-spec §3.2).
+    XrSpace WorldSpace = XR_NULL_HANDLE;
+    XrReferenceSpaceType WorldSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
     VkInstance VulkanInstance = VK_NULL_HANDLE;
     VkPhysicalDevice PhysicalDevice = VK_NULL_HANDLE;
     VkDevice Device = VK_NULL_HANDLE;
@@ -130,6 +134,8 @@ void LogInteractionProfiles();
 
 // quest_xr_runtime.cpp
 void RequestRecenter();
+void NoteWorldRecenter(const char* reason);  // in-world: the chord and space changes
+LayerMode RequestedLayerMode();              // the mode the runtime asked for last (input routing)
 // Ends the run: Exiting/Stop, SDL_QUIT to the game loop, the 15 s quit watchdog (any thread).
 void BeginExit(const char* reason);
 // The first game image reached the quad: the immersive start worked (removes the start marker).

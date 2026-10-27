@@ -214,7 +214,15 @@ void SyncInput(XrTime) {
     const auto chords = gChords.Update(now, clickL, clickR, menu);
     if (chords.SelectTap) gSelectPulse.Fire(now);
     if (chords.MenuTap) gMenuPulse.Fire(now);
-    if (chords.Recenter) RequestRecenter();
+    if (chords.Recenter) {
+        if (WorldRequested()) {
+            // In-world: the chord re-places the world around Link (§1.1 G9), not the screen.
+            NoteWorldRecenter("chord");
+            Haptic(true, true, 60);
+        } else {
+            RequestRecenter();
+        }
+    }
     if (chords.ToggleSettings) {
         PushSettingsKey();
         Haptic(true, false, 40);
@@ -260,6 +268,9 @@ bool TakePad(PadSnapshot* pad) {
     std::lock_guard lock(gPadMutex);
     *pad = gPad;
     pad->Buttons = gLatch.Take(gPad.Buttons);
+    // In-world, while the world shows: the right stick is the rig's (snap turn from W2), so the game's
+    // C-stick sees nothing (inworld-spec §7); Cinema and menus keep the raw Q3 mapping.
+    if (WorldRequested() && RequestedLayerMode() == LayerMode::World) pad->RightX = pad->RightY = 0;
     return true;
 }
 

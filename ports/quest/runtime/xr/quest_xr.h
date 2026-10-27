@@ -93,6 +93,49 @@ struct PairStats {
 };
 PairStats TakePairStats();
 
+// The display clock (§3.4): published by the XR thread after each xrWaitFrame. Tick counts display
+// frames since the session began; DisplayTimeNs is that frame's predicted display time.
+struct TickInfo {
+    uint64_t Tick = 0;
+    int64_t DisplayTimeNs = 0;
+    int64_t PeriodNs = 0;
+    bool Valid = false;  // the session runs and frames are being waited
+};
+TickInfo LatestTick();  // any thread
+// Render worker: until the display tick `tick` began (true), or timeout / not running (false).
+bool WaitDisplayTick(uint64_t tick, uint32_t timeoutMs);
+// Eye poses and tangents at a display time in the world space (xrLocateViews); any thread.
+bool PredictEyes(int64_t displayTimeNs, Fast::StereoViews* out);
+struct HeadPose {
+    float Orientation[4] = {0.0F, 0.0F, 0.0F, 1.0F};
+    float Position[3] = {0.0F, 0.0F, 0.0F};
+    float LinearVelocity[3] = {0.0F, 0.0F, 0.0F};
+    bool Valid = false;
+};
+bool LocateHead(int64_t displayTimeNs, HeadPose* out);  // VIEW in the world space, with velocity
+// The world space's play area: STAGE bounds when the world space is STAGE; FloorBelowOriginM is the
+// floor's depth under the space origin (LOCAL: 1.65 m, the floor = head height at recenter - 1.65).
+struct PlayArea {
+    float HalfX = 0.0F, HalfZ = 0.0F;
+    bool Bounded = false;
+    float FloorBelowOriginM = 0.0F;
+    const char* Space = "none";
+};
+PlayArea WorldPlayArea();
+// World recenters since the last take: the L3+R3 chord (in world mode it no longer moves the screen)
+// and reference-space changes of the world space or LOCAL.
+uint32_t TakeWorldRecenter();
+// What the compositor shows (§3.3): World = the projection layer of the latest pair, Cinema = the Q3
+// quad (placed again on each entry), Black = nothing. Changes fade through black (fadeMs each way);
+// entering World waits (300 ms at most) for a pair of minRigEpoch or later before fading in.
+enum class LayerMode : uint8_t { World, Cinema, Black };
+void RequestLayerMode(LayerMode mode, uint32_t fadeMs, uint32_t minRigEpoch = 0);
+// A rig blink (§5.3): black at once, then a fade-in once a pair of `rigEpoch` is shown.
+void RequestBlink(uint32_t rigEpoch, uint32_t fadeMs);
+const char* LayerModeName(LayerMode mode);
+// Haptic pulse: hand 0 left, 1 right, 2 both.
+void Pulse(int hand, uint32_t milliseconds);
+
 }  // namespace TriAevumQuestXr
 
 // vkDeviceWaitIdle needs every queue of the device externally synchronized; the XR thread and the
