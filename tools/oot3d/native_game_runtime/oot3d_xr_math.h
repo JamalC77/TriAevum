@@ -318,13 +318,25 @@ inline Mat4 PoseInverseMatrix(const Pose& pose) {
     const Mat4 rotationT = Transpose3(RotationMatrix(pose.Orientation));
     return rotationT * Translation(-pose.Position);
 }
-// The head's horizontal gaze in its parent space. Looking straight up or down, the head's up vector
-// supplies the heading (it points forward when looking down, backward when looking up).
+// The head's horizontal gaze in its parent space. Near straight up or down the gaze's own heading is
+// lost, and the heading blends continuously (smoothstep over |forward.xz| in [0, kGazeBlendXZ], i.e. the
+// last ~5.7 deg) into Y x right = forward * up.y - up * forward.y, the horizontal direction square to the
+// head's right vector: it equals the gaze heading for an unrolled head, is the up vector's heading when
+// looking straight down (the reverse looking up), and is defined at exact vertical (right is horizontal
+// there). A hard switch would jump by the head's roll for a 0.06 deg pitch change.
+inline constexpr double kGazeBlendXZ = 0.1;
 inline Vec3 HorizontalForward(const Quat& orientation) {
     const Vec3 forward = Rotate(orientation, {0.0, 0.0, -1.0});
-    if (LengthXZ(forward) > 1e-3) return NormalizedXZ(forward, {0.0, 0.0, -1.0});
+    const Vec3 fallback{0.0, 0.0, -1.0};
+    if (!IsFinite(forward)) return fallback;
+    const double gazeXZ = LengthXZ(forward);
+    if (gazeXZ >= kGazeBlendXZ) return NormalizedXZ(forward, fallback);
     const Vec3 up = Rotate(orientation, {0.0, 1.0, 0.0});
-    return NormalizedXZ(forward.Y > 0.0 ? -up : up, {0.0, 0.0, -1.0});
+    const Vec3 square = NormalizedXZ(forward * up.Y - up * forward.Y, fallback);
+    const double t = gazeXZ / kGazeBlendXZ;
+    const double w = t * t * (3.0 - 2.0 * t);
+    const Vec3 gaze = gazeXZ > 0.0 ? Vec3{forward.X / gazeXZ, 0.0, forward.Z / gazeXZ} : square;
+    return NormalizedXZ(gaze * w + square * (1.0 - w), gazeXZ > 0.0 ? gaze : square);
 }
 
 // An eye's field of view as tangents (OpenXR XrFovf: angleLeft/angleDown negative).
@@ -582,12 +594,26 @@ inline Mat4 EyeProjection(const GameProjection& g, const EyeFov& fov) {
 }
 
 // The per-eye part shared by every draw with the same camera (cache per distinct V_g,d and eye):
-//   full: V_i * M * V_g,d^-1          sky: Rot(V_i) * M * Rot(V_g,d)^T  (translations dropped)
+//   full: V_i * M * V_g,d^-1          sky: Rot(V_i) * M * Rot(V_g,d)^-1  (translations dropped)
 inline Mat4 EyeChain(const Mat4& eyeView, const Mat4& gameViewInverse, bool mirrored) {
     return eyeView * MirrorMatrix(mirrored) * gameViewInverse;
 }
-inline Mat4 SkyChain(const Mat4& eyeView, const Mat4& gameView, bool mirrored) {
-    return RotationPart(eyeView) * MirrorMatrix(mirrored) * Transpose3(RotationPart(gameView));
+// The spec writes Rot(V_g,d)^T, which is the inverse only while V_g,d is a scaled rotation. A sample whose
+// WorldToView was lerped component-wise (oot3d_native_pica_visual_frame's non-rigid fallback) is not:
+// its axes shrink by cos(theta/2) across the turn, and the transpose then drifts the sky against the
+// world (0.13 deg at a 6 deg step). The true inverse of the scale-normalised block equals the transpose
+// for every rigid camera and stays exact for the lerped one, like the full chain's InverseAffine.
+// False (out untouched) for a non-affine, non-finite or (near-)singular V_g,d or V_i, with the same
+// conditioning test as the full chain, so a collapsed camera axis cannot pass as a sky camera.
+inline bool SkyChain(const Mat4& eyeView, const Mat4& gameView, bool mirrored, Mat4* out) {
+    Mat4 gameViewInverse, eyeViewInverse;
+    if (!InverseAffine(gameView, &gameViewInverse) || !InverseAffine(eyeView, &eyeViewInverse)) return false;
+    Mat4 gameRotationInverse;
+    if (!InverseAffine(RotationPart(gameView), &gameRotationInverse)) return false;
+    const Mat4 chain = RotationPart(eyeView) * MirrorMatrix(mirrored) * gameRotationInverse;
+    if (!IsFinite(chain)) return false;
+    *out = chain;
+    return true;
 }
 
 // F' = blockdiag(R+, I2) * P_eye,d * chain, written as float rows. False (out untouched) when the
@@ -619,8 +645,9 @@ inline bool BuildEyeRows(const Rows& f, const Mat4& eyeView, const Mat4& gameVie
 }
 inline bool BuildSkyRows(const Rows& f, const Mat4& eyeView, const Mat4& gameView, bool mirrored, const EyeFov& fov,
                          Rows* out) {
-    if (!AnalyzeView(gameView).Valid || !AnalyzeView(eyeView).Valid) return false;
-    return ComposeEyeRows(DecomposeGameProjection(f), fov, SkyChain(eyeView, gameView, mirrored), out);
+    Mat4 chain;
+    if (!SkyChain(eyeView, gameView, mirrored, &chain)) return false;
+    return ComposeEyeRows(DecomposeGameProjection(f), fov, chain, out);
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -690,7 +717,9 @@ inline PlacementResult SolvePlacement(const PlacementInput& input, const Placeme
     const double centreDistance = LengthXZ(toCentre);
     Vec3 direction;
     double distance;
-    if (centreDistance < config.NearCentreM) {
+    // The near-centre rule also covers a head too close to c to give a direction, whatever NearCentreM
+    // says (0, negative or NaN would otherwise divide by a zero distance).
+    if (centreDistance < config.NearCentreM || !(centreDistance > 1e-6)) {
         result.NearCentre = true;
         direction = HorizontalForward(input.Head.Orientation);
         distance = config.NearCentreAheadM;
@@ -710,7 +739,9 @@ inline PlacementResult SolvePlacement(const PlacementInput& input, const Placeme
     result.NewRig = rig;
     result.FacingT = direction;
     result.DistanceM = distance;
-    result.Valid = true;
+    // Valid only when everything came out finite (a non-finite config distance would poison the rig).
+    result.Valid = IsFinite(rig.Anchor) && std::isfinite(rig.Yaw) && std::isfinite(rig.SeatY) &&
+                   IsFinite(result.LinkT) && IsFinite(direction) && std::isfinite(distance);
     return result;
 }
 
@@ -749,6 +780,11 @@ struct TetherConfig {
     double StillSpeedMps = 0.1;
     double CentreClearM = 0.6;        // no idle re-centre onto Jamal standing at c
     double TeleportSpeedMps = 30.0;   // a faster step is a teleport: no travel direction from it
+    // Glide: the anchor takes the excess beyond r_room, but never faster than this. Running Link (~3.6 m/s)
+    // glides exactly; an excess that appears at once (a snap turn pivoting on the head, a near-centre
+    // placement 1 m ahead of the gaze, a hookshot pull) is worked off over a few frames under the
+    // vignette instead of jumping the world by metres in one unannounced frame.
+    double GlideMaxSpeedMps = 8.0;
     PlayArea Area;
     Vec3 CentreT;
 };
@@ -779,15 +815,19 @@ inline TetherStep UpdateTether(TetherState& state, const TetherConfig& config, c
     }
     const double safeDt = std::isfinite(dt) && dt > 0.0 ? dt : 0.0;
 
-    // Link's motion (world u -> m/s).
+    // Link's motion (world u -> m/s). "Still" is 3D: a ladder or vine climb, a jump in place or a fall is
+    // motion and never starts the idle re-centre. The travel direction comes from horizontal motion only.
     if (state.HasLast && safeDt > 0.0) {
         const Vec3 delta = linkWorld - state.LastLinkWorld;
-        const double speedMps = LengthXZ(delta) / rig.Scale / safeDt;
+        const double speedMps = Length(delta) / rig.Scale / safeDt;
+        const double horizontalMps = LengthXZ(delta) / rig.Scale / safeDt;
         if (speedMps > config.TeleportSpeedMps) {
             state.StillSeconds = 0.0;
         } else if (speedMps >= config.StillSpeedMps) {
-            state.TravelWorld = NormalizedXZ(delta, YawDirection(linkFacingYaw));
-            state.HasTravel = true;
+            if (horizontalMps >= config.StillSpeedMps) {
+                state.TravelWorld = NormalizedXZ(delta, YawDirection(linkFacingYaw));
+                state.HasTravel = true;
+            }
             state.StillSeconds = 0.0;
         } else {
             state.StillSeconds += safeDt;
@@ -820,17 +860,23 @@ inline TetherStep UpdateTether(TetherState& state, const TetherConfig& config, c
     const double roomRadius = RoomRadius(config.Area);
     const double centreDistance = DistanceXZ(linkT, config.CentreT);
     if (config.Mode == TetherMode::Glide && centreDistance > roomRadius) {
-        // Move the anchor by exactly the excess beyond r_room (translation only).
+        // Move the anchor by the excess beyond r_room (translation only), at most GlideMaxSpeedMps * dt.
         const double excess = centreDistance - roomRadius;
+        const double maxShift =
+            std::isfinite(config.GlideMaxSpeedMps) && config.GlideMaxSpeedMps > 0.0
+                ? config.GlideMaxSpeedMps * safeDt
+                : excess;
+        const double shift = std::min(excess, maxShift);
+        if (!(shift > 0.0)) return step;  // no time has passed: nothing moves
         const Vec3 outward{(linkT.X - config.CentreT.X) / centreDistance, 0.0,
                            (linkT.Z - config.CentreT.Z) / centreDistance};
-        const Vec3 shiftT = outward * excess;
+        const Vec3 shiftT = outward * shift;
         const Vec3 shiftW = TransformDirection(RotationY(rig.Yaw + kPi), shiftT * rig.Scale);
         step.NewRig.Anchor = {rig.Anchor.X + shiftW.X, rig.Anchor.Y, rig.Anchor.Z + shiftW.Z};
         step.Event = RigEvent::Glide;
         step.LinkT = {linkT.X - shiftT.X, linkT.Y, linkT.Z - shiftT.Z};
         step.HeadDistanceM = DistanceXZ(step.LinkT, headT);
-        step.AnchorSpeedMps = safeDt > 0.0 ? excess / safeDt : 0.0;
+        step.AnchorSpeedMps = safeDt > 0.0 ? shift / safeDt : 0.0;
         return step;
     }
 
@@ -862,9 +908,11 @@ struct FloorConfig {
     double SettleM = 0.005;            // a glide ends this close to its target
     double SwimHeadAboveWaterM = 0.45;
     double WaterValidRangeM = 1.5;
-    // A camera reading that repeats the last accepted surface (within this) stays valid however deep Link
-    // dives: the surface does not move, and without it a dive below 1.5 m would invalidate w and the
-    // low-passed fallback would follow Link down, so the dive rule could never fire.
+    // A camera reading that repeats (within this) the last reading the 1.5 m range test accepted stays
+    // valid however deep Link dives: the surface does not move, and without it a dive below 1.5 m would
+    // invalidate w and the low-passed fallback would follow Link down, so the dive rule could never fire.
+    // Only the range test re-anchors that reference, so a reading creeping 0.09 m per update cannot walk
+    // away from Link: it is accepted at most WaterValidRangeM + WaterStableM from where Link was.
     double WaterStableM = 0.1;
     double WaterLowPassTauS = 0.5;
     double DiveDepthM = 1.0;           // Link below w - 1 m ...
@@ -895,8 +943,9 @@ struct FloorState {
     bool HasWater = false;
     double WaterY = 0.0;  // last water height used
     bool HasCameraWater = false;
-    double CameraWaterY = 0.0;  // last accepted camera +0x15C reading
+    double CameraWaterY = 0.0;  // last camera +0x15C reading the range test accepted (the stable reference)
     double BelowSeconds = 0.0;
+    bool FromDive = false;      // the swim glide that continues a dive follow: never a blink
 };
 struct FloorStep {
     double AnchorY = 0.0;
@@ -922,6 +971,7 @@ inline double Approach(double current, double target, double dt, double tau) {
 // Hysteresis, then glide (tau) or blink; `follow` skips the hysteresis (dive).
 inline void MoveAnchorY(FloorState& state, FloorStep& step, double target, double dt, double tau, double hysteresis,
                         double blink, double settle, bool follow) {
+    if (!std::isfinite(target)) return;  // hold: a non-finite target must never reach a.y
     state.TargetY = target;
     const double delta = target - state.AnchorY;
     if (std::fabs(delta) >= blink) {
@@ -944,15 +994,25 @@ inline FloorStep UpdateFloor(FloorState& state, const FloorConfig& config, const
     FloorStep step;
     const double s = std::isfinite(input.Scale) && input.Scale > 0.0 ? input.Scale : kDefaultScale;
     const double dt = std::isfinite(input.Dt) && input.Dt > 0.0 ? input.Dt : 0.0;
+    const double seed =
+        std::isfinite(input.FloorY) ? input.FloorY : (std::isfinite(input.LinkY) ? input.LinkY : 0.0);
+    bool recovered = false;
     if (!state.Initialized) {
-        ResetFloor(state, std::isfinite(input.FloorY) ? input.FloorY : (std::isfinite(input.LinkY) ? input.LinkY : 0.0));
+        ResetFloor(state, seed);
+    } else if (!std::isfinite(state.AnchorY)) {
+        // A poisoned state (e.g. ResetFloor(NaN) by the caller) recovers onto the floor: a blink.
+        ResetFloor(state, seed);
+        recovered = true;
     }
+    if (!std::isfinite(state.TargetY)) state.TargetY = state.AnchorY;
     const double previous = state.AnchorY;
     const double hysteresis = config.HysteresisM * s;
     const double blink = config.BlinkThresholdM * s;
     const double settle = config.SettleM * s;
 
-    if (!std::isfinite(input.LinkY)) {
+    // Hold on a non-finite Link y or eye height (the swim and dive targets use the eye height).
+    if (!std::isfinite(input.LinkY) || !std::isfinite(input.EyeHeightM)) {
+        step.Blink = recovered;
         step.AnchorY = state.AnchorY;
         step.Mode = state.Mode;
         step.Gliding = state.Gliding;
@@ -965,6 +1025,7 @@ inline FloorStep UpdateFloor(FloorState& state, const FloorConfig& config, const
         state.BelowSeconds = 0.0;
         state.LowPassValid = false;
         state.HasCameraWater = false;
+        state.FromDive = false;
     } else if (state.Mode == FloorMode::Ground) {
         state.Mode = FloorMode::Swim;
         state.BelowSeconds = 0.0;
@@ -983,15 +1044,17 @@ inline FloorStep UpdateFloor(FloorState& state, const FloorConfig& config, const
         } else {
             state.LowPassY = Detail::Approach(state.LowPassY, input.LinkY, dt, config.WaterLowPassTauS);
         }
-        const bool waterValid =
-            std::isfinite(input.WaterY) &&
-            (std::fabs(input.WaterY - input.LinkY) <= config.WaterValidRangeM * s ||
-             (state.HasCameraWater && std::fabs(input.WaterY - state.CameraWaterY) <= config.WaterStableM * s));
-        if (waterValid) {
+        const bool waterFinite = std::isfinite(input.WaterY);
+        const bool inRange = waterFinite && std::fabs(input.WaterY - input.LinkY) <= config.WaterValidRangeM * s;
+        const bool stable = waterFinite && state.HasCameraWater &&
+                            std::fabs(input.WaterY - state.CameraWaterY) <= config.WaterStableM * s;
+        if (inRange) {
+            state.CameraWaterY = input.WaterY;  // only the range test moves the stable reference
+            state.HasCameraWater = true;
+        }
+        if (inRange || stable) {
             state.WaterY = input.WaterY;
             state.HasWater = true;
-            state.CameraWaterY = input.WaterY;
-            state.HasCameraWater = true;
         } else if (state.Mode == FloorMode::Swim) {
             state.WaterY = state.LowPassY;
             state.HasWater = true;
@@ -1004,15 +1067,24 @@ inline FloorStep UpdateFloor(FloorState& state, const FloorConfig& config, const
             } else {
                 state.BelowSeconds = 0.0;
             }
-            if (state.BelowSeconds >= config.DiveEnterSeconds) state.Mode = FloorMode::Dive;
+            if (state.BelowSeconds >= config.DiveEnterSeconds) {
+                state.Mode = FloorMode::Dive;
+                state.FromDive = false;
+            }
         } else if (input.LinkY >= water - config.DiveExitDepthM * s) {
             state.Mode = FloorMode::Swim;
             state.BelowSeconds = 0.0;
+            // The dive follow lags Link by about v * tau; a fast ascent (>= 3 m/s) would leave more than the
+            // 1.5 m blink threshold to the swim target. The swim glide that takes over continues the dive's
+            // motion under the vignette, so it never blinks (until it settles).
+            state.FromDive = state.Gliding;
         }
 
         if (state.Mode == FloorMode::Swim) {
             const double target = water + s * (config.SwimHeadAboveWaterM - input.EyeHeightM);
-            Detail::MoveAnchorY(state, step, target, dt, config.GlideTauS, hysteresis, blink, settle, false);
+            Detail::MoveAnchorY(state, step, target, dt, config.GlideTauS, hysteresis,
+                                state.FromDive ? std::numeric_limits<double>::infinity() : blink, settle, false);
+            if (!state.Gliding) state.FromDive = false;
         } else {
             // Continuous follow under the vignette: no hysteresis, never a blink.
             const double target = input.LinkY + s * (config.DiveHeadAboveLinkM - input.EyeHeightM);
@@ -1020,6 +1092,7 @@ inline FloorStep UpdateFloor(FloorState& state, const FloorConfig& config, const
                                 std::numeric_limits<double>::infinity(), settle, true);
         }
     }
+    step.Blink = step.Blink || recovered;
     step.AnchorY = state.AnchorY;
     step.Gliding = state.Gliding;
     step.Mode = state.Mode;
@@ -1047,7 +1120,11 @@ struct SnapTurnDetector {
 };
 
 // psi' = psi + delta pivoting on the head: a'.xz = (head_w - s RotY(psi' + pi) head_T).xz, a.y kept.
+// A non-finite head, angle or rig returns the rig unchanged (a lost tracking frame must not poison it).
 inline Rig ApplyYawTurn(const Rig& rig, const Vec3& headT, double deltaYaw) {
+    if (!IsFinite(headT) || !std::isfinite(deltaYaw) || !IsFinite(rig.Anchor) || !std::isfinite(rig.Yaw) ||
+        !std::isfinite(rig.Scale) || !std::isfinite(rig.SeatY))
+        return rig;
     const Vec3 headW = TrackingToWorld(rig, headT);
     Rig turned = rig;
     turned.Yaw = WrapAngle(rig.Yaw + deltaYaw);

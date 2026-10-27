@@ -1103,6 +1103,259 @@ void TestRobustness() {
     Report("robustness");
 }
 
+// Regressions from the breaker pass (each block is one reported failure, reproduced as reported).
+void TestRegressions() {
+    const double s = kDefaultScale;
+    const double dt = 1.0 / 30.0;
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    {  // Sky rows under a component-wise lerped WorldToView (the visual frame's non-rigid fallback):
+       // exact like the full chain (the transpose drifted 0.014 / 0.130 / 0.524 deg at 2 / 6 / 12 deg).
+        const Rows f = RowsFromTangents(kPortraitA, GameFovCentred(), -1.0);
+        const GameProjection g = DecomposeGameProjection(f);
+        const Vec3 camPos{120.0, 40.0, -300.0};
+        for (double stepDeg : {2.0, 6.0, 12.0, 30.0}) {
+            const Mat4 v1 = Translation(-camPos);
+            const Mat4 v2 = RotationY(DegreesToRadians(stepDeg)) * Translation(-camPos);
+            Mat4 lerped;
+            for (std::size_t r = 0; r < 4; ++r)
+                for (std::size_t c = 0; c < 4; ++c) lerped.M[r][c] = 0.5 * (v1.M[r][c] + v2.M[r][c]);
+            CHECK(AnalyzeView(lerped).OrthoError > 1e-4);  // genuinely anisotropic
+            const Mat4 mid = RotationY(DegreesToRadians(stepDeg * 0.5)) * Translation(-camPos);
+            const Mat4 midInverse = Inverse(mid);
+            Rows sky{};
+            CHECK(BuildSkyRows(f, mid, lerped, false, g.Tangents, &sky));
+            double worstDeg = 0.0;
+            for (int i = 0; i < 400; ++i) {
+                const double yaw = DegreesToRadians(-50.0 + 100.0 * (i % 20) / 19.0);
+                const double pitch = DegreesToRadians(-28.0 + 56.0 * (i / 20) / 19.0);
+                const Vec3 dir{std::sin(yaw) * std::cos(pitch) * 1000.0, std::sin(pitch) * 1000.0,
+                               -std::cos(yaw) * std::cos(pitch) * 1000.0};
+                const Vec3 v = TransformPoint(lerped, TransformPoint(midInverse, dir));
+                const Screen want = Ndc(f, dir), got = Ndc(sky, v);
+                worstDeg = std::max(worstDeg, RadiansToDegrees(std::hypot((got.X - want.X) * g.Tangents.TanUp,
+                                                                          (got.Y - want.Y) * g.Tangents.TanRight)));
+            }
+            CHECK_LE(worstDeg, 1e-4);
+        }
+    }
+    {  // A near-singular V_g (a collapsed camera axis) is refused by the sky rows as by the eye rows.
+        const Rows f = RowsFromTangents(kPortraitA, GameFovCentred(), -1.0);
+        const GameProjection g = DecomposeGameProjection(f);
+        Mat4 collapsed = Mat4::Identity();
+        collapsed.M[2][2] = 1e-12;
+        Rows out = f;
+        out[0][0] = 42.0F;
+        CHECK(!BuildEyeRows(f, Mat4::Identity(), collapsed, false, g.Tangents, &out));
+        CHECK(!BuildSkyRows(f, Mat4::Identity(), collapsed, false, g.Tangents, &out));
+        Mat4 chain = Mat4::Identity();
+        CHECK(!SkyChain(Mat4::Identity(), collapsed, false, &chain));
+        CHECK(!SkyChain(collapsed, Mat4::Identity(), false, &chain));
+        Mat4 projective = Mat4::Identity();
+        projective.M[3] = {0.0, 0.0, -1.0, 0.0};
+        CHECK(!BuildSkyRows(f, Mat4::Identity(), projective, false, g.Tangents, &out));
+        CHECK(out[0][0] == 42.0F);
+        // Rank 2 stays refused; a well-conditioned rigid camera still passes.
+        Mat4 rank2 = Mat4::Identity();
+        rank2.M[1] = {0.0, 0.0, 0.0, 0.0};
+        CHECK(!BuildSkyRows(f, Mat4::Identity(), rank2, false, g.Tangents, &out));
+        CHECK(BuildSkyRows(f, KokiriCamera(), KokiriCamera(), false, g.Tangents, &out));
+        CHECK_LE(RowsError(out, f), kRowTolerance);
+    }
+    {  // One non-finite eye height must not make a.y NaN for good.
+        FloorConfig config;
+        FloorState state;
+        ResetFloor(state, 0.0);
+        FloorInput in;
+        in.LinkY = 20.0;
+        in.FloorY = 20.0;
+        in.Dt = dt;
+        UpdateFloor(state, config, in);  // gliding up
+        FloorInput swim = in;
+        swim.Swimming = true;
+        swim.WaterY = 20.0;
+        swim.EyeHeightM = nan;
+        const FloorStep held = UpdateFloor(state, config, swim);
+        CHECK(std::isfinite(held.AnchorY) && std::isfinite(state.AnchorY) && std::isfinite(state.TargetY));
+        swim.EyeHeightM = 1.6;
+        for (int i = 0; i < 10; ++i) UpdateFloor(state, config, swim);  // a swim glide in flight
+        swim.EyeHeightM = std::numeric_limits<double>::infinity();
+        CHECK(std::isfinite(UpdateFloor(state, config, swim).AnchorY));
+        FloorInput land;
+        land.LinkY = 50.0;
+        land.FloorY = 50.0;
+        land.Dt = dt;
+        for (int i = 0; i < 300; ++i) UpdateFloor(state, config, land);
+        CHECK_NEAR(state.AnchorY, 50.0, 0.0);
+        // A state poisoned from outside recovers onto the floor, reported as a blink.
+        ResetFloor(state, nan);
+        const FloorStep recovered = UpdateFloor(state, config, land);
+        CHECK(recovered.Blink && recovered.AnchorY == 50.0);
+    }
+    {  // Climbing straight up (1 m/s) is not "still": no idle re-centre in the middle of a ladder.
+        TetherConfig config;
+        config.Area = {1.5, 1.5, true};
+        const Rig rig{};
+        const Vec3 headT{-1.0, 1.7, 0.0};
+        Vec3 link = TrackingToWorld(rig, {1.5, 0.0, 0.0});
+        TetherState state;
+        bool idle = false;
+        for (int frame = 0; frame < 90; ++frame) {
+            link.Y += s * dt;
+            idle |= UpdateTether(state, config, rig, link, 0.0, headT, dt).Event == RigEvent::Idle;
+        }
+        CHECK(!idle);
+        CHECK(!state.HasTravel);  // vertical motion gives no travel direction
+        // Falling straight down neither.
+        for (int frame = 0; frame < 30; ++frame) {
+            link.Y -= 6.0 * s * dt;
+            idle |= UpdateTether(state, config, rig, link, 0.0, headT, dt).Event == RigEvent::Idle;
+        }
+        CHECK(!idle);
+        // At the top, standing still: the idle re-centre after 0.75 s, as before.
+        int idleFrame = -1;
+        for (int frame = 0; frame < 40 && idleFrame < 0; ++frame)
+            if (UpdateTether(state, config, rig, link, 0.0, headT, dt).Event == RigEvent::Idle) idleFrame = frame;
+        CHECK(idleFrame >= 21 && idleFrame <= 23);
+    }
+    {  // Glide after a snap turn: the excess is worked off at GlideMaxSpeedMps, not in one frame.
+        for (int snaps : {1, 4}) {  // 45 deg (bounded room) and 180 deg (no bounds)
+            TetherConfig config;
+            config.Mode = TetherMode::Glide;
+            if (snaps == 1) config.Area = {1.5, 1.5, true};  // r_room 1.2
+            const double roomRadius = RoomRadius(config.Area);
+            Rig rig{};
+            const Vec3 headT{-1.5, 1.7, 0.0};
+            const Vec3 link = TrackingToWorld(rig, {1.0, 0.0, 0.0});
+            TetherState state;
+            CHECK(UpdateTether(state, config, rig, link, 0.0, headT, dt).Event == RigEvent::None);
+            for (int i = 0; i < snaps; ++i) rig = SnapTurn(rig, headT, 1);
+            CHECK(LengthXZ(WorldToTracking(rig, link)) > roomRadius + 0.5);
+            Vec3 previousT = WorldToTracking(rig, link);
+            int glides = 0;
+            for (int frame = 0; frame < 20; ++frame) {
+                const TetherStep step = UpdateTether(state, config, rig, link, 0.0, headT, dt);
+                CHECK(step.Event == RigEvent::Glide || step.Event == RigEvent::None);
+                if (step.Event == RigEvent::Glide) ++glides;
+                const Vec3 linkT = WorldToTracking(step.NewRig, link);
+                CHECK_LE(DistanceXZ(linkT, previousT), config.GlideMaxSpeedMps * dt + 1e-9);
+                CHECK_LE(step.AnchorSpeedMps, config.GlideMaxSpeedMps + 1e-9);
+                previousT = linkT;
+                rig = step.NewRig;
+            }
+            CHECK(glides >= 2);
+            CHECK_NEAR(LengthXZ(previousT), roomRadius, 1e-9);  // settled on the r_room circle
+        }
+    }
+    {  // A fast ascent out of a dive (3 and 4 m/s) never blinks the floor.
+        for (double v : {2.5, 3.0, 4.0}) {
+            FloorConfig config;
+            FloorState state;
+            ResetFloor(state, 0.0);
+            FloorInput in;
+            in.Swimming = true;
+            in.WaterY = 0.0;
+            in.EyeHeightM = 1.6;
+            in.Dt = dt;
+            bool blinked = false, dived = false;
+            double previous = state.AnchorY, worstStep = 0.0;
+            const auto run = [&](double linkY) {
+                in.LinkY = linkY;
+                const FloorStep step = UpdateFloor(state, config, in);
+                blinked |= step.Blink;
+                dived |= step.Mode == FloorMode::Dive;
+                worstStep = std::max(worstStep, std::fabs(step.AnchorY - previous));
+                previous = step.AnchorY;
+            };
+            for (int k = 0; k < 300; ++k) run(-0.2 * s - std::min(4.0, k * dt) * s);
+            for (int k = 0; k < 300; ++k) run(std::min(-0.2 * s, -4.2 * s + k * dt * v * s));
+            CHECK(dived && !blinked);
+            CHECK_LE(worstStep / s, 0.5);
+            CHECK(state.Mode == FloorMode::Swim);
+            CHECK_NEAR(state.AnchorY, 0.0 + s * (0.45 - 1.6), 0.0);
+            CHECK(!state.FromDive);
+        }
+        // An ordinary swim-surface change of more than 1.5 m (no dive) still blinks.
+        FloorState state;
+        ResetFloor(state, 0.0);
+        FloorInput in;
+        in.Swimming = true;
+        in.LinkY = 200.0;
+        in.WaterY = 200.0;
+        in.EyeHeightM = 1.6;
+        in.Dt = dt;
+        CHECK(UpdateFloor(state, FloorConfig{}, in).Blink);
+    }
+    {  // A camera water reading creeping 0.09 m per update cannot walk away from Link.
+        FloorConfig config;
+        FloorState state;
+        ResetFloor(state, 0.0);
+        FloorInput in;
+        in.Swimming = true;
+        in.LinkY = -0.2 * s;
+        in.WaterY = 0.0;
+        in.EyeHeightM = 1.6;
+        in.Dt = dt;
+        UpdateFloor(state, config, in);
+        double highest = state.WaterY;
+        for (int k = 1; k <= 200; ++k) {
+            in.WaterY = k * 0.09 * s;
+            UpdateFloor(state, config, in);
+            highest = std::max(highest, state.WaterY);
+        }
+        CHECK_LE(highest - in.LinkY, (config.WaterValidRangeM + config.WaterStableM) * s + 1e-9);
+        CHECK_LE(std::fabs(state.AnchorY - (in.LinkY + s * (0.45 - 1.6))), 0.05 * s);  // back on the fallback
+    }
+    {  // SnapTurn / ApplyYawTurn with a NaN head or angle leave the rig unchanged.
+        const Rig r{{25000.0, 120.0, -31000.0}, 1.234, 33.0, 0.35};
+        for (const Rig& turned : {SnapTurn(r, {nan, 1.0, 0.0}, 1), ApplyYawTurn(r, {0.0, 1.7, 0.0}, nan),
+                                  SnapTurn(r, {0.0, std::numeric_limits<double>::infinity(), 0.0}, -1)}) {
+            CHECK(turned.Anchor.X == r.Anchor.X && turned.Anchor.Y == r.Anchor.Y && turned.Anchor.Z == r.Anchor.Z);
+            CHECK(turned.Yaw == r.Yaw && turned.Scale == r.Scale && turned.SeatY == r.SeatY);
+        }
+    }
+    {  // SolvePlacement with NearCentreM <= 0 or NaN and the head exactly on c: the near-centre rule.
+        PlacementInput in;
+        in.LinkWorld = {kLinkKokiri.X, 4.0, kLinkKokiri.Z};
+        in.Head = HeadPose({0.0, 1.6, 0.0}, -90.0);  // looks along T +X
+        for (double near : {0.0, -1.0, nan}) {
+            PlacementConfig c;
+            c.NearCentreM = near;
+            const PlacementResult r = SolvePlacement(in, c);
+            CHECK(r.Valid && r.NearCentre && IsFinite(r.NewRig.Anchor));
+            CHECK_NEAR(r.LinkT.X, 1.0, 1e-12);
+            CHECK_LE(Length(TrackingToWorld(r.NewRig, r.LinkT) - in.LinkWorld), 1e-9);
+        }
+        PlacementConfig bad;
+        bad.NearCentreAheadM = nan;  // a non-finite distance is caught by the result check
+        CHECK(!SolvePlacement(in, bad).Valid);
+    }
+    {  // HorizontalForward is continuous through the near-vertical gaze with the head rolled.
+        const auto q = [](double yaw, double pitch, double roll) {
+            return QuatFromAxisAngle({0.0, 1.0, 0.0}, yaw) * QuatFromAxisAngle({1.0, 0.0, 0.0}, pitch) *
+                   QuatFromAxisAngle({0.0, 0.0, 1.0}, roll);
+        };
+        for (double roll : {0.0, 1.0, -0.6}) {
+            double worst = 0.0;
+            double last = YawOf(HorizontalForward(q(0.4, -1.40, roll)));
+            for (double pitch = -1.40; pitch >= -kPi / 2.0; pitch -= 2e-5) {
+                const double yaw = YawOf(HorizontalForward(q(0.4, pitch, roll)));
+                worst = std::max(worst, std::fabs(WrapAngle(yaw - last)));
+                last = yaw;
+            }
+            CHECK_LE(worst, 2e-3);
+            // Straight down: square to the head's right vector (defined however the head is rolled).
+            const Quat down = q(0.4, -kPi / 2.0, roll);
+            CHECK_NEAR(Dot(HorizontalForward(down), Rotate(down, {1.0, 0.0, 0.0})), 0.0, 1e-9);
+        }
+        // Away from vertical the heading is the gaze's own, roll or not; unrolled it is the yaw throughout.
+        const Quat tilted = q(0.4, -1.2, 1.0);
+        CHECK_LE(Length(HorizontalForward(tilted) - NormalizedXZ(Rotate(tilted, {0.0, 0.0, -1.0}), {})), 1e-12);
+        for (double pitch : {-1.5707, -1.5, -1.0, 0.0, 1.0, 1.5707})
+            CHECK_NEAR(WrapAngle(YawOf(HorizontalForward(q(0.4, pitch, 0.0))) - (0.4 + kPi)), 0.0, 1e-9);
+    }
+    Report("regressions");
+}
+
 } // namespace
 
 int main() {
@@ -1117,6 +1370,7 @@ int main() {
     TestFloor();
     TestSeated();
     TestRobustness();
+    TestRegressions();
     std::printf("oot3d_xr_math_tests: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }
