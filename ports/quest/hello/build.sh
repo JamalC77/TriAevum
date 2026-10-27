@@ -9,11 +9,13 @@ set -euo pipefail
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd -- "$here/../../.." && pwd)"
 sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:?Set ANDROID_HOME}}"
-ndk="${ANDROID_NDK_HOME:-$sdk/ndk/29.0.14206865}"
+# NDK r29 exactly (runner images export ANDROID_NDK_HOME for an older one).
+ndk="${TRIAEVUM_ANDROID_NDK:-$sdk/ndk/29.0.14206865}"
 build="${TRIAEVUM_HELLO_BUILD:-$root/build/quest-hello}"
 dist="${TRIAEVUM_HELLO_DIST:-$root/dist}"
 gradle="${GRADLE:-gradle}"
 test -f "$ndk/build/cmake/android.toolchain.cmake"
+grep -q '^Pkg.Revision *= *29.0.14206865' "$ndk/source.properties" || { echo "need NDK 29.0.14206865 at $ndk" >&2; exit 1; }
 
 cmake -S "$here/native" -B "$build/native" -G Ninja \
   "-DCMAKE_TOOLCHAIN_FILE=$ndk/build/cmake/android.toolchain.cmake" \

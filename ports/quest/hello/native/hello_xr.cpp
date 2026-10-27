@@ -632,13 +632,15 @@ bool create_vulkan(App& a) {
     qci.queueFamilyIndex = a.family;
     qci.queueCount = a.queueCount;
     qci.pQueuePriorities = prio;
-    VkPhysicalDeviceVulkan13Features e13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-    e13.dynamicRendering = VK_TRUE;
-    VkPhysicalDeviceVulkan11Features e11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
-    e11.multiview = VK_TRUE;
-    e11.pNext = &e13;
+    // Per-feature structs rather than VkPhysicalDeviceVulkan1xFeatures, which
+    // may not be chained beside the feature structs a runtime adds.
+    VkPhysicalDeviceDynamicRenderingFeatures eDyn{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES};
+    eDyn.dynamicRendering = VK_TRUE;
+    VkPhysicalDeviceMultiviewFeatures eMv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES};
+    eMv.multiview = VK_TRUE;
+    eMv.pNext = &eDyn;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-    dci.pNext = &e11;
+    dci.pNext = &eMv;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
     XrVulkanDeviceCreateInfoKHR xdci{XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR};
