@@ -192,6 +192,14 @@ void MovementStick() {
         CHECK(PickMoveStick(NAN, 0.0F, true, 0.0F, 0.6F).Source == StickSource::Right);
         CHECK(PickMoveStick(0.6F, 0.0F, true, INFINITY, 0.0F).Source == StickSource::Left);
     }
+    {  // W2's policy (right stick armed for snap turn): it moves Link only while the left is inactive
+        constexpr auto kInactive = RightStickMove::WhenLeftInactive;
+        const auto flick = PickMoveStick(0.0F, 0.0F, true, 0.9F, 0.0F, kInactive);
+        CHECK(flick.Source == StickSource::None && Near(flick.X, 0.0F));
+        CHECK(PickMoveStick(0.2F, 0.6F, true, 0.9F, 0.0F, kInactive).Source == StickSource::Left);
+        const auto oneHand = PickMoveStick(0.9F, 0.0F, false, -0.5F, 0.5F, kInactive);
+        CHECK(oneHand.Source == StickSource::Right && Near(oneHand.X, -0.5F) && Near(oneHand.Y, 0.5F));
+    }
     CHECK(StickIdle(0.1F, 0.1F) && !StickIdle(0.2F, 0.0F) && StickIdle(NAN, 1.0F));
     {  // the log tracker: changes only, idle is no change
         StickSourceTracker tracker;

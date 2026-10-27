@@ -44,6 +44,18 @@ constexpr uint32_t kItems = kSave + 0x8CU;
 constexpr uint32_t kAmmo = kSave + 0xA6U;
 constexpr uint32_t kOwnedEquipment = kSave + 0xB6U;
 constexpr uint32_t kUpgrades = kSave + 0xB8U;
+// The inventory cache, one item id per inventory slot, at +0x1370
+// (guest_ui_layout.h save_context::kCachedInventoryItemIds, read by
+// ui_state_adapter.cpp). The game keeps it equal to the live item when it
+// writes one (ui_pause_items_semantics.cpp, 0x00446938: "Keep the cache byte
+// identical to the live Bow item"), so the loadout writes both.
+constexpr uint32_t kCachedItems = kSave + 0x1370U;
+// The child Items page grid, 24 cells each naming an inventory slot, at
+// +0x138A (guest_ui_layout.h save_context::kChildItemMenuSlots, 24 bytes up to
+// kAdultItemMenuSlots 0x13A2; ui_inventory_grid.h kOot3dItemMenuSlotCount).
+// Read only: the loadout logs whether a cell shows each item's slot.
+constexpr uint32_t kChildItemMenuSlots = kSave + 0x138AU;
+constexpr uint32_t kItemMenuCells = 0x13A2U - 0x138AU;
 // code.bin's item -> inventory slot table (gItemSlots), read by the TopScreen
 // d-pad and item code at 0x0053CC44 + item. Its values for these items are
 // pinned in ui_inventory_content.cpp kItemToInventorySlot; the loadout checks
@@ -279,6 +291,17 @@ std::vector<DevLoadoutField> PlanDevLoadout(DevWarpGuest &guest, const DevLoadou
       if (!slot.has_value()) continue;
       const std::string name = item.Name;
       plan.Set("item_" + name, kItems + *slot, 1U, item.Id);
+      plan.Set("cache_" + name, kCachedItems + *slot, 1U, item.Id);
+      bool inGrid = false;
+      for (uint32_t cell = 0; cell < kItemMenuCells && !inGrid; ++cell) {
+        uint8_t mapped = kNone;
+        inGrid = ReadValue(guest, kChildItemMenuSlots + cell, mapped) && mapped == *slot;
+      }
+      if (!inGrid)
+        std::fprintf(stderr,
+                     "TRIAEVUM_DEV_LOADOUT note item=%s slot=%u grid=absent (no child Items page cell names this "
+                     "slot; the item works from its button but the Items page may not show it)\n",
+                     item.Name, *slot);
       if (item.Bag != nullptr) {
         uint32_t upgrades = plan.Current(kUpgrades, 4U);
         uint32_t level = (upgrades & item.Bag->Mask) >> item.Bag->Shift;
@@ -328,13 +351,28 @@ std::vector<DevLoadoutField> PlanDevLoadout(DevWarpGuest &guest, const DevLoadou
   return std::move(plan.Fields);
 }
 
-bool DevLoadoutRuntime::PlayerRefreshEligible(DevWarpGuest &guest, uint32_t playState, uint32_t player) const {
+bool DevLoadoutRuntime::PlayReady(DevWarpGuest &guest, uint32_t playState) {
+  // The action consumer's play gate without its player checks: no 3DS pause
+  // menu, PlayState in normal play. The SaveContext writes wait for it too, so
+  // they never land under the pause menu's cached state (its own writes end in
+  // SyncPauseInventory) or a scene's intro.
   uint32_t pauseState = 0;
-  uint8_t stateType = 0, stateSubtype = 0, cutsceneAction = 0, heldItemAction = 0, itemAction = 0;
-  uint32_t heldActor = 0;
-  return ReadValue(guest, kPauseState, pauseState) && pauseState == 2U &&
+  uint8_t stateType = 0, stateSubtype = 0;
+  return playState != 0U && ReadValue(guest, kPauseState, pauseState) && pauseState == 2U &&
          ReadValue(guest, playState + kPlayStateType, stateType) && stateType == 3U &&
-         ReadValue(guest, playState + kPlayStateSubtype, stateSubtype) && stateSubtype == 2U &&
+         ReadValue(guest, playState + kPlayStateSubtype, stateSubtype) && stateSubtype == 2U;
+}
+
+bool DevLoadoutRuntime::PlayerRefreshEligible(DevWarpGuest &guest, uint32_t playState, uint32_t player) const {
+  // ReadActionState also requires adult Link (age == 0) before it offers the
+  // equipment action; that check is dropped on purpose here. The loadout's
+  // gear is child gear, so the refresh runs on child Link, a path the
+  // TopScreen action never takes: TRIAEVUM_DEV_LOADOUT refresh=ok plus the
+  // sword and shield showing (and B swinging) without a scene change is the
+  // on-device check.
+  uint8_t cutsceneAction = 0, heldItemAction = 0, itemAction = 0;
+  uint32_t heldActor = 0;
+  return PlayReady(guest, playState) &&
          ReadValue(guest, player + kPlayerHeldActor, heldActor) && heldActor == 0U &&
          ReadValue(guest, player + kPlayerCutsceneAction, cutsceneAction) && cutsceneAction == 0U &&
          ReadValue(guest, player + kPlayerHeldItemAction, heldItemAction) &&
@@ -410,7 +448,7 @@ void DevLoadoutRuntime::Advance(DevWarpGuest &guest, uint32_t playState, const D
     }
   }
 
-  if (mDue == nullptr || !inPlay || health <= 0 || warping) {
+  if (mDue == nullptr || !inPlay || health <= 0 || warping || !PlayReady(guest, playState)) {
     mSettledFrames = 0;
     return;
   }

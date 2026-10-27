@@ -99,6 +99,10 @@ class StickChords {
 // right stick when the left one is idle or its controller is not active; with both pushed, the larger
 // deflection wins (a tie keeps the left). kStickIdle is the radius under which a stick counts as idle
 // (the game's own dead zone is larger, so idle drift never moves Link).
+// RightStickMove (inworld-spec §7): WhenLeftIdle is W1's policy (the right stick has no other job in
+// world mode). Once the right stick has one (W2's snap turn and D-pad flicks), its caller passes
+// WhenLeftInactive while that job is armed: the right stick then moves Link only while the left
+// controller is not active (Jamal's one-controller case), so a flick never both turns and walks.
 enum class StickSource : uint8_t { None, Left, Right };
 
 inline const char* StickSourceName(StickSource source) {
@@ -121,10 +125,14 @@ inline bool StickIdle(float x, float y) {
     return std::hypot(x, y) <= kStickIdle;
 }
 
-inline MoveStick PickMoveStick(float lx, float ly, bool leftActive, float rx, float ry) {
+enum class RightStickMove : uint8_t { WhenLeftIdle, WhenLeftInactive };
+
+inline MoveStick PickMoveStick(float lx, float ly, bool leftActive, float rx, float ry,
+                               RightStickMove policy = RightStickMove::WhenLeftIdle) {
     if (!std::isfinite(lx) || !std::isfinite(ly)) lx = ly = 0.0F;
     if (!std::isfinite(rx) || !std::isfinite(ry)) rx = ry = 0.0F;
     if (!leftActive) lx = ly = 0.0F;
+    if (leftActive && policy == RightStickMove::WhenLeftInactive) rx = ry = 0.0F;
     const float left = std::hypot(lx, ly), right = std::hypot(rx, ry);
     if (left <= kStickIdle && right <= kStickIdle) return {lx, ly, StickSource::None};
     if (right > left) return {rx, ry, StickSource::Right};

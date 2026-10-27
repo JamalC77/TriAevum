@@ -74,6 +74,8 @@ FakeGuest ChildGame() {
   for (uint32_t slot = 0; slot < 4U; ++slot) guest.Put<uint8_t>(kSave + 0x85U + slot, 0xFF);
   guest.Put<uint16_t>(kSave + 0x8AU, 0x1100);  // Kokiri tunic and boots equipped
   for (uint32_t slot = 0; slot < 26U; ++slot) guest.Put<uint8_t>(kSave + 0x8CU + slot, 0xFF);
+  for (uint32_t slot = 0; slot < 26U; ++slot) guest.Put<uint8_t>(kSave + 0x1370U + slot, 0xFF);  // cache
+  for (uint32_t cell = 0; cell < 24U; ++cell) guest.Put<uint8_t>(kSave + 0x138AU + cell, static_cast<uint8_t>(cell));
   guest.Put<uint16_t>(kSave + 0xB6U, 0x1100);  // owned: Kokiri tunic and boots
   guest.Put<uint32_t>(kSave + 0xB8U, 0x00001000U);  // something else in the upgrades (wallet 1)
   const std::array<uint8_t, 16> slots{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
@@ -140,6 +142,11 @@ void ChildFields() {
   Require(guest.Get<uint8_t>(kSave + 0x8CU + 0U) == 0x00U && guest.Get<uint8_t>(kSave + 0x8CU + 1U) == 0x01U &&
               guest.Get<uint8_t>(kSave + 0x8CU + 6U) == 0x06U && guest.Get<uint8_t>(kSave + 0x8CU + 2U) == 0xFFU,
           "items in slots 0, 1, 6 only");
+  Require(guest.Get<uint8_t>(kSave + 0x1370U + 0U) == 0x00U && guest.Get<uint8_t>(kSave + 0x1370U + 1U) == 0x01U &&
+              guest.Get<uint8_t>(kSave + 0x1370U + 6U) == 0x06U && guest.Get<uint8_t>(kSave + 0x1370U + 2U) == 0xFFU,
+          "the inventory cache matches the live items");
+  for (uint32_t cell = 0; cell < 24U; ++cell)
+    Require(guest.Get<uint8_t>(kSave + 0x138AU + cell) == cell, "the Items page grid is only read");
   Require(guest.Get<int8_t>(kSave + 0xA6U + 0U) == 10 && guest.Get<int8_t>(kSave + 0xA6U + 1U) == 20 &&
               guest.Get<int8_t>(kSave + 0xA6U + 6U) == 30,
           "ammo full at the first capacities (sticks 10, nuts 20, seeds 30)");
@@ -212,14 +219,22 @@ void WhenItApplies() {
   Run(runtime, guest, InPlay(DevWarpPhase::Requested), frame, 50);
   Require(runtime.Applications() == 0U, "deferred while a developer warp is on its way");
   guest.Put<uint32_t>(kPlay + 0x20ACU, kPlayer + 0x1000U);  // the player of the new scene
-  // Not ready (PlayState subtype != 2, as in a text box): the refresh waits.
+  // Arrived, but PlayState not in normal play (subtype != 2, as in a text box): no writes yet.
   guest.Put<uint8_t>(kPlay + 0x101U, 1U);
-  Run(runtime, guest, InPlay(DevWarpPhase::Arrived), frame, 20);
+  Run(runtime, guest, InPlay(DevWarpPhase::Arrived), frame, 40);
+  Require(runtime.Applications() == 0U && guest.Get<uint8_t>(kSave + 0x80U) == 0xFFU,
+          "the SaveContext writes wait for normal play");
+  guest.Put<uint8_t>(kPlay + 0x101U, 2U);
+  // Play is ready but the player is not (holding an actor): applied, the refresh waits.
+  guest.Put<uint32_t>(kPlayer + 0x1000U + 0x1224U, 0x08300000U);
+  Run(runtime, guest, InPlay(DevWarpPhase::Arrived), frame, 14);
+  Require(runtime.Applications() == 0U, "15 frames of normal play first");
+  Run(runtime, guest, InPlay(DevWarpPhase::Arrived), frame, 1);
   Require(runtime.Applications() == 1U, "applied after the boot warp arrived");
   Require(guest.Get<uint8_t>(kSave + 0x80U) == 0x3BU, "the sword is on B");
   Run(runtime, guest, InPlay(DevWarpPhase::Arrived), frame, 30);
   Require(guest.Refreshes.empty(), "the refresh waits for a ready player");
-  guest.Put<uint8_t>(kPlay + 0x101U, 2U);
+  guest.Put<uint32_t>(kPlayer + 0x1000U + 0x1224U, 0U);
   Run(runtime, guest, InPlay(DevWarpPhase::Arrived), frame, 2);
   Require(guest.Refreshes.size() == 1U && guest.Refreshes[0].second == kPlayer + 0x1000U, "then refreshes");
 
@@ -242,6 +257,27 @@ void WhenItApplies() {
   guest.Put<int16_t>(kSave + 0x44U, 40);
   Run(runtime, guest, InPlay(DevWarpPhase::Arrived), frame, 60);
   Require(runtime.Applications() == 3U && guest.Get<int16_t>(kSave + 0x44U) == 40, "damage alone changes nothing");
+}
+
+void PauseMenuDefers() {
+  FakeGuest guest = ChildGame();
+  guest.Put<uint32_t>(0x0050AF68U, 6U);  // the 3DS pause menu is up
+  DevLoadoutSpec spec;
+  spec.Sword = spec.Nuts = true;
+  DevLoadoutRuntime runtime(spec);
+  uint64_t frame = 0;
+  Run(runtime, guest, InPlay(), frame, 60);
+  Require(runtime.Applications() == 0U && guest.Get<uint8_t>(kSave + 0x80U) == 0xFFU,
+          "nothing written under the pause menu");
+  guest.Put<uint32_t>(0x0050AF68U, 2U);
+  Run(runtime, guest, InPlay(), frame, 8);
+  guest.Put<uint32_t>(0x0050AF68U, 6U);  // opened again before 15 frames: the count restarts
+  Run(runtime, guest, InPlay(), frame, 3);
+  guest.Put<uint32_t>(0x0050AF68U, 2U);
+  Run(runtime, guest, InPlay(), frame, 14);
+  Require(runtime.Applications() == 0U, "the settle count restarts after the pause menu");
+  Run(runtime, guest, InPlay(), frame, 1);
+  Require(runtime.Applications() == 1U, "applied after 15 frames with the pause menu closed");
 }
 
 void StartWithoutWarp() {
@@ -272,6 +308,7 @@ int main() {
     AdultAndSlotTable();
     WhenItApplies();
     StartWithoutWarp();
+    PauseMenuDefers();
   } catch (const std::exception &exception) {
     std::cerr << "oot3d_dev_loadout_tests FAILED after " << gChecks << " checks: " << exception.what() << '\n';
     return 1;

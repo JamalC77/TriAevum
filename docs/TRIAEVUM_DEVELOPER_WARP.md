@@ -119,15 +119,33 @@ bag fills to that bag; a button the loadout does not use that shows an item it
 placed elsewhere is cleared. The gear is child gear: on adult Link only
 `hearts:N` applies (`child_gear=skipped_adult`).
 
-It is applied after 15 guest frames of stable play (not while a developer warp
-is on its way): once gameplay starts, again whenever a developer warp arrives
+Each item is written to its inventory slot and to the inventory cache beside it
+(SaveContext `+0x1370`, which the game keeps equal to the live item when it
+writes one); the child Items page grid (`+0x138A`) is only read, and an item
+whose slot no grid cell names logs `note item= slot= grid=absent`.
+
+It is applied after 15 guest frames of normal play (pause state 2, PlayState
+3/2, so never under the 3DS pause menu or during a scene's intro; not while a
+developer warp is on its way): once gameplay starts, again whenever a developer warp arrives
 (the `TRIAEVUM_DEV_WARP` boot warp, F1 and lab warps), and again when Link is
 back in play after his health reached zero (game over and continue, a fairy).
 Then the live player re-reads its equipment with the TopScreen equipment
 action's refresh (`Player+0x172C` cleared, `Player_SetEquipmentData`
 `0x0034913C(play, player)`, `Player+0x1714` bit 3), once it passes that action's
 gate (pause state 2, PlayState 3/2, nothing held, no cutscene action); a player
-replaced by a scene load reads the SaveContext itself.
+replaced by a scene load reads the SaveContext itself. That action only offers
+the refresh to adult Link; the loadout calls it on child Link on purpose (the
+gear is child gear), a path the game's own action never takes, so on the
+headset check `refresh=ok` and that the sword and shield show and B swings
+without a scene change.
+
+Known gaps: the N64 decomp keeps a "swordless" flag in the info table that the
+pause menu clears when a sword is equipped; its OoT3D location is not
+established from source here, so the loadout does not write it (if B stays
+empty or greys out after `refresh=ok`, this flag is the suspect). On the Quest with
+only the right Touch controller, Y (nuts) and X (sticks) are left-controller
+buttons and cannot be pressed; the sword (B), shield (right grip, R) and
+slingshot (right trigger, I/ZR) can.
 
 Every offset is cited in `oot3d_dev_loadout.cpp`: `guest_ui_layout.h`
 (SaveContext and `ItemEquips`/`Inventory` layouts), `ui_inventory_content.cpp`

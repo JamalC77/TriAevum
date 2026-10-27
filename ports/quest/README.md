@@ -114,9 +114,10 @@ TRIAEVUM_XR_VIEW=world
 - The left stick moves Link relative to that game camera. While the world shows, the right stick moves
   him the same way whenever the left stick is idle or the left controller is off (one-handed play);
   with both pushed the larger deflection wins (`TRIAEVUM_XR_INPUT stick_source=left|right` on each
-  change). It is never the game's C-stick there. The in-game menu then opens with a deliberate hold:
-  right stick click held ~0.7 s with the right stick centred (short buzz, right hand); a click while
-  steering or a short click does nothing. On the screen (menus, cinema) a right stick click tap is
+  change). It is never the game's C-stick there. (When W2 gives the right stick snap turns, it moves
+  Link only while the left controller is off: `RightStickMove::WhenLeftInactive`, inworld-spec §7.)
+  The in-game menu then opens with a deliberate hold: right stick click held ~0.7 s with the right
+  stick centred (short buzz, right hand); a click while steering or a short click does nothing. On the screen (menus, cinema) a right stick click tap is
   the in-game menu as before. If Link runs past the leash (default the placement distance +
   2.5 m, 4.3 m; never inside the placement distance), a short blink puts him the placement distance
   ahead of you along his run (about one blink per 0.7 s of running, as in W1). The play-area rule
@@ -169,7 +170,11 @@ TRIAEVUM_XR_VIEW=world
 
 Developer builds: `TRIAEVUM_DEV_LOADOUT=sword,shield,slingshot,nuts,sticks,hearts:6` (or `full_child`)
 starts Link with gear, applied at gameplay start, after a `TRIAEVUM_DEV_WARP` arrival and after a
-continue (vocabulary and log lines: `docs/TRIAEVUM_DEVELOPER_WARP.md`, "Starting loadout").
+continue (vocabulary and log lines: `docs/TRIAEVUM_DEVELOPER_WARP.md`, "Starting loadout"). With only
+the right Touch controller awake, Start, Select, X and Y (the loadout's sticks and nuts) and the
+recenter chord are out of reach (they are left-controller inputs): wake or pair the left controller
+(a press on any of its buttons) for those; B (sword), A, the right grip (shield) and the right
+trigger (slingshot) work one-handed.
 
 Developer builds (`TRIAEVUM_DEV_LAB`): the `capture` op takes an optional `"view"`:
 

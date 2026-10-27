@@ -81,6 +81,7 @@ class DevLoadoutRuntime {
 
  private:
   bool Apply(DevWarpGuest &guest, bool child, const char *reason, uint64_t guestFrame);
+  static bool PlayReady(DevWarpGuest &guest, uint32_t playState);
   bool PlayerRefreshEligible(DevWarpGuest &guest, uint32_t playState, uint32_t player) const;
 
   DevLoadoutSpec mSpec;
