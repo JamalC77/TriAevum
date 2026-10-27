@@ -61,9 +61,10 @@ them.
 | Hold left stick click + press ≡ | Open/close the F1 settings window (short buzz, left hand) |
 
 In the F1 window: left stick or its directions move, A selects, B goes back, grips switch tabs,
-triggers are L2/R2. Bluetooth gamepads keep working through SDL alongside the Touch controllers
-(with a pad connected, use the pad for the F1 window). The system's own recenter (hold the Oculus
-button) also re-places the screen.
+triggers are L2/R2. A Bluetooth gamepad is read through SDL alongside the Touch controllers (both
+are ORed; with a pad connected, use the pad for the F1 window). If it does nothing, see
+"Bluetooth pad diagnostics" below. The system's own recenter (hold the Oculus button) also re-places
+the screen.
 
 ## Launch mode and options
 
@@ -80,7 +81,8 @@ button) also re-places the screen.
 | `TRIAEVUM_XR_SPLIT_FEATURES=0` | try the `VkPhysicalDeviceVulkan12Features` chain first (default: per-feature structs) |
 | `TRIAEVUM_XR_RUN_UNFOCUSED=1` | keep the game and renderer running whatever the session state (system menu, headset off); for automated runs, see below |
 | `TRIAEVUM_XR_RELEASE_WAIT=1` | wait for each copy before releasing the swapchain image (diagnostics) |
-| `TRIAEVUM_XR_INPUT_LOG=1` | log Touch button edges |
+| `TRIAEVUM_XR_INPUT_LOG=1` | log Touch button edges, and the Bluetooth pad's raw SDL events, poll edges and Java key events (`TRIAEVUM_PAD`, below) |
+| `TRIAEVUM_PAD_LOG` | Bluetooth pad diagnostics: on by default on Android (devices, hot-plug, selection); `2` adds the raw input lines like `TRIAEVUM_XR_INPUT_LOG=1`; `0` turns them off |
 
 In immersive mode the game only advances while the session is FOCUSED (headset on and awake). With
 the headset off or on a desk, `TRIAEVUM_DEV_LAB` commands (including its quit), `--frames` limits and
@@ -104,14 +106,26 @@ TRIAEVUM_XR_VIEW=world
 
 - Gameplay shows the world at life size (33 game units per metre) around you, in stereo, with your
   real head motion (6DoF) and a level horizon. When the world first appears (and after every
-  recenter, door or scene change), Link stands at the centre of your play area (STAGE) facing away
-  from you; walk around him. The game camera itself is still the game's (mode R is W2), so things
-  behind that unseen camera can be missing and billboards face it.
+  recenter, door, scene change or return from the screen), Link stands 1.8 m ahead of you
+  (`TRIAEVUM_XR_PLACE_M`) facing away from you: along your line to the centre of the play area
+  (STAGE), or along your gaze when you stand within 0.6 m of it. With a small (stationary) boundary he
+  stands outside it, which is intended. The game camera itself is still the game's (mode R is W2), so
+  things behind that unseen camera can be missing and billboards face it.
 - The left stick moves Link relative to that game camera; the right stick does nothing while the world
-  shows (it becomes snap turn in W2). If Link runs more than 3.5 m from you (or 2 m past the play
-  area), a short blink puts him 1 m ahead of you along his run; standing still far from the centre
-  re-centres him with a blink. Holding both stick clicks for ~1 s re-places the world around Link
-  (60 ms buzz on both hands); in world mode it no longer moves the screen.
+  shows (it becomes snap turn in W2). If Link runs past the leash (default the placement distance +
+  2.5 m, 4.3 m; never inside the placement distance), a short blink puts him the placement distance
+  ahead of you along his run (about one blink per 0.7 s of running, as in W1). The play-area rule
+  (Link more than 2 m past the bounds) never fires before Link could be a leash away from the centre,
+  so a 1 x 1 m boundary does not blink him early. Standing still far from the centre re-centres him
+  with a blink only when the centre is at least the placement distance from you (never with a
+  stationary boundary). Holding both stick clicks for ~1 s re-places the world around Link (60 ms
+  buzz on both hands); in world mode it no longer moves the screen.
+- The HUD (hearts, magic, rupees, the B/X/Y/ZL/ZR rings, the D-pad items) floats on a transparent
+  panel 2.2 m wide, 2.5 m away and 8 degrees below eye level, so it sits in the periphery around
+  Link. It moves with you and stays put while you look around; once you turn more than 35 degrees
+  away it swings back in front of you smoothly (it also snaps in front of you whenever the world
+  appears and after a recenter). It fades with the world and is not drawn over the screen (the screen
+  shows the game's own HUD). `TRIAEVUM_XR_HUD=0` turns it off.
 - Menus, pause, text boxes, F1, cutscenes, first person, crawl spaces, fixed-camera rooms and Epona
   fade (150 ms through black) to the screen of the Q3 mode, placed again in front of you each time;
   doors and scene changes go black, then place the world behind Link again.
@@ -133,7 +147,12 @@ TRIAEVUM_XR_VIEW=world
 | `TRIAEVUM_XR_VIEW` | `world` turns the mode on (`TRIAEVUM_XR_WORLD=1` too); anything else: the screen |
 | `TRIAEVUM_XR_EYE_WIDTH`, `TRIAEVUM_XR_EYE_HEIGHT` | eye image extent, default 1024x1104 (the log shows the runtime's recommended size) |
 | `TRIAEVUM_XR_WORLD_SCALE` | game units per metre, 25-45, default 33 |
-| `TRIAEVUM_XR_LEASH_M` | leash before a blink, default 3.5 m |
+| `TRIAEVUM_XR_PLACE_M` | head-to-Link distance of every placement, recenter, door, return from the screen, blink landing (and the minimum for an idle re-centre), 0.8-4.0 m, default 1.8 m (W1: 1.0 m) |
+| `TRIAEVUM_XR_LEASH_M` | leash before a blink, 1-10 m, default `TRIAEVUM_XR_PLACE_M` + 2.5 m (4.3 m); raised to the placement distance + 0.5 m if set below it |
+| `TRIAEVUM_XR_HUD=0` | no HUD quad (default on) |
+| `TRIAEVUM_XR_HUD_WIDTH_M` | HUD quad width, 0.3-8 m, default 2.2 m (height from the 1280x720 panel: 1.24 m) |
+| `TRIAEVUM_XR_HUD_DISTANCE_M` | HUD distance from the head, 0.5-10 m, default 2.5 m |
+| `TRIAEVUM_XR_HUD_PITCH_DEG`, `TRIAEVUM_XR_HUD_FOLLOW_DEG` | HUD centre below the horizon (default -8) and the head turn before it follows (default 35) |
 | `TRIAEVUM_XR_NS1_NATIVE=0` | the canonical replay follows the eye size instead of the native 400x240 |
 | `TRIAEVUM_XR_WORLD_SPACE=local_floor` | skip STAGE (default: STAGE with bounds >= 1x1 m, else LOCAL_FLOOR, else LOCAL) |
 | `TRIAEVUM_XR_SKY_PCS` | sky scope PCs (comma list); default: every atmosphere scope but precipitation and kankyo effects, when camera-centred |
@@ -150,9 +169,12 @@ Developer builds (`TRIAEVUM_DEV_LAB`): the `capture` op takes an optional `"view
 ```
 
 `left`/`right` write the eye image (eye extent) of the frame's eye pair, `panel` the panel/HUD image
-(the cinema picture, or in a world frame the HUD overlays over the black the frame-start clear left
-there; it is not shown in the headset before W4); without `view` a frame that drew a pair gives the
-left eye, otherwise the panel. An eye asked for in a frame that drew no pair (Cinema/Black, a failed
+(the cinema picture, or in a world frame the HUD quad's image); without `view` a frame that drew a
+pair gives the left eye, otherwise the panel. In a world frame the panel is the TopScreen HUD and
+ImGui over transparent with premultiplied alpha: the BMP (24-bit, no alpha) shows its colour, which is
+the HUD composited over black, and a second file `<path>.alpha.bmp` holds the alpha as grey (white =
+opaque, black = transparent), with `TRIAEVUM_XR_CAPTURE alpha path= pixels= covered= opaque=
+mean_alpha=` in the log (most of the panel must be `alpha 0`; `covered` is the HUD's footprint). An eye asked for in a frame that drew no pair (Cinema/Black, a failed
 pose prediction, no presented sample) falls back to the panel, since its eye images belong to an
 older frame (`TRIAEVUM_XR_CAPTURE view=panel requested=left eyes_drawn=0`). `--screenshot` captures
 the left eye of frames that drew a pair.
@@ -177,11 +199,63 @@ In-world log lines (tag `TriAevumXR` and `native-stderr.log`):
 | `TRIAEVUM_XR_VIEW effects_forced_off=` / `TRIAEVUM_XR_FOV multiplier=1 setting=` | camera-dependent effects and the FOV multiplier the mode overrides |
 | `TRIAEVUM_XR_FLAGS reason=edge flags1= flags2= setting=` | player flag and camera setting edges (decomp numbering check) |
 | `TRIAEVUM_XR_CAPTURE view= requested= world_frame= eyes_drawn= w= h= path=` | a capture |
+| `TRIAEVUM_XR_CAPTURE alpha path=<path>.alpha.bmp pixels= covered= opaque= mean_alpha=` | the HUD panel's alpha of a world-frame `panel` capture |
+| `TRIAEVUM_XR_WORLD_SESSION scale= place_m= leash_m=` | the rig's knobs in use |
+| `TRIAEVUM_XR_HUD select enabled=`, `TRIAEVUM_XR_SWAPCHAIN hud=1280x720 ... alpha=premultiplied` (or `hud=off`), `TRIAEVUM_XR_HUD config width_m= height_m= distance_m= pitch_deg= follow_deg=` | the HUD quad's setup |
+| `TRIAEVUM_XR_HUD first_copy`, `TRIAEVUM_XR_HUD event=place reason=enter\|recenter\|follow yaw_deg= pos=` | the first HUD image; the quad snapped in front of the head (entering the world, a recenter) or began to follow a head turn (follows logged at most once a second) |
+| `TRIAEVUM_XR_HUD enabled= placed= published= copies= skips= shown_frames= released= yaw_deg= following=` | every 5 s: `published` ~150 (one HUD per pair), `copies` ~= the pairs shown, `skips` ~0 (a HUD image not ready: the last HUD stays), `shown_frames` ~450 at 90 Hz while the world shows, `placed` = snaps and follows in the window |
+
+How the HUD gets its alpha: the frame-start clear leaves the world frame's panel at (0, 0, 0, 0);
+nothing scans out to it; the TopScreen HUD draws with colour `SRC_ALPHA, ONE_MINUS_SRC_ALPHA` and (in
+world mode) alpha `ONE, ONE_MINUS_SRC_ALPHA`, as ImGui's pipeline does, so the panel holds
+premultiplied colour with the coverage in alpha. The pair carries it (`PublishStereo(..., panelValid)`),
+the XR thread copies it with the eyes in one submit into the HUD swapchain (sRGB like the others, the
+encoded bytes unchanged), and the quad uses `XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT`
+without the unpremultiplied bit. Premultiplication happens in the sRGB-encoded space: exact for
+opaque and transparent pixels and for dark translucent fills; antialiased edges of bright elements
+come out slightly thinner than a linear-space blend would make them.
 
 On a PC (no headset), `TRIAEVUM_XR_PREVIEW=left|right` shows one eye in the desktop window
 (`TRIAEVUM_XR_PREVIEW_HEAD=identity` (default, must equal the mono picture), `sweep90`, `sweep180`, or
 `yaw,x,y,z` relative to the game camera); `oot3d_xr_world_logic_tests` and `oot3d_xr_math_tests` run
 the pure parts anywhere.
+
+## Bluetooth pad diagnostics
+
+The pad path: Android delivers the pad's key and motion events to the immersive activity's window
+(the 2D panel never gets them: the Horizon shell takes them); SDL's Java side turns them into SDL
+joystick events for a joystick its native side added (`SDLControllerManager.pollInputDevices`, polled
+every 3 s and on the first press of an unknown device); the device manager
+(`Ship::ConnectedPhysicalDeviceManager`) opens every SDL game controller at start and on each
+`SDL_CONTROLLERDEVICEADDED`; `PollNativeA32Input` reads the port-0 pad it selects, if Controls
+enables the controller, ORed with the Touch controllers. On Android the selection ranks pads with both
+sticks first (SDL's automatic Android mapping also makes TV remotes and D-pad-only devices game
+controllers, and the lowest instance used to win); a preferred controller set in Controls still wins.
+
+Every step logs `TRIAEVUM_PAD` lines (logcat tag `TriAevumPad`, native lines also in
+`native-stderr.log`), on by default on Android. For a test, add `TRIAEVUM_XR_INPUT_LOG=1` to
+`triaevum-env.txt` (raw events and edges), start VR with the pad on, press A and B and move the left
+stick, then read:
+
+```powershell
+& $ADB logcat -d -s TriAevumPad
+& $ADB shell cat /sdcard/Android/data/org.triaevum.quest/files/logs/native-stderr.log | Select-String TRIAEVUM_PAD
+```
+
+| Line | What it decides |
+|---|---|
+| `TRIAEVUM_PAD java device reason=create\|added\|changed id= name="Xbox Wireless Controller" vendor=0x045E product=0x0B13 sources= gamepad= joystick= virtual= external= enabled= sdl_joystick=` | Android lists the pad for the app and SDL's Java side takes it for a joystick (`sdl_joystick=1`); absent or `enabled=0`: the system does not offer it to the app |
+| `TRIAEVUM_PAD java key action=down code=KEYCODE_BUTTON_A device= source= handled= focus_view=` (input log) | the window receives the press and SDL's handler took it (`handled=1`); no such line while pressing: the events never reach the activity (routing, focus: `TRIAEVUM_PAD java window_focus=`) |
+| `TRIAEVUM_PAD startup sdl=2.32.10 init_joystick= init_gamecontroller= hint_hidapi= env_hidapi= ...` | SDL's subsystems and the HIDAPI hint/env actually in effect |
+| `TRIAEVUM_PAD event=joy_added\|controller_added\|joy_removed\|controller_removed\|controller_remapped` | SDL's hot-plug events as posted |
+| `TRIAEVUM_PAD devices reason=startup\|device_event\|selection\|status joysticks= port0_pads=` then `TRIAEVUM_PAD joystick index= instance= name= guid= vendor= product= ... is_game_controller= has_mapping= virtual= opened_port0= full_gamepad=` | what SDL's native side knows: `joysticks=0` while Java says `sdl_joystick=1` = SDL never added it; `is_game_controller=0` = no mapping; `opened_port0=0` = the device manager did not open it |
+| `TRIAEVUM_PAD opened instance= name= attached= axes= buttons= hats= full_gamepad=` | the pads the device manager holds |
+| `TRIAEVUM_PAD port0 result= selected_instance= selected_name= controller_enabled= preferred_guid= preferred_serial= host_gui= touch_active=` | `result=selected` with the pad's name is the healthy case; `no_sdl_joysticks`, `none_opened`, `preferred_absent` (Controls names a controller that is not connected: choose Automatic), `none_selected`, `disabled_in_controls` (enable the controller in Controls) name the broken step; `selected` with another device's name = the wrong device won |
+| `TRIAEVUM_PAD raw controller_button instance= button=a down=1`, `raw joy_button`, `raw joy_hat`, `raw joy_axis`, `raw controller_axis` (input log) | SDL turned the press into joystick events (any thread) |
+| `TRIAEVUM_PAD raw key scancode=40 name="Return" down=1` (input log) | the press reached SDL but it had no opened joystick for the device, so it became a key (A = Return, B = Escape, D-pad = arrows) |
+| `TRIAEVUM_PAD poll buttons=0x... pressed= released= instance= enabled= host_gui=` (input log) | the selected pad's buttons as the game's input poll reads them (bit i = SDL button i, 24-27 left stick, 30/31 triggers); edges here but no reaction in game = the Controls bindings |
+
+The device table repeats every 30 s and after every hot-plug or selection change.
 
 ## Title pairing
 
@@ -239,7 +313,7 @@ canonical paths and the allowed roots.
 Logs:
 
 ```powershell
-& $ADB logcat -s TriAevumXR TriAevum SDL SDL/APP DEBUG AndroidRuntime
+& $ADB logcat -s TriAevumXR TriAevum TriAevumPad SDL SDL/APP DEBUG AndroidRuntime
 & $ADB shell cat /sdcard/Android/data/org.triaevum.quest/files/logs/native-stderr.log
 & $ADB shell cat /sdcard/Android/data/org.triaevum.quest/files/data/runtime-state.json
 & $ADB shell cat /sdcard/Android/data/org.triaevum.quest/files/logs/xr-start-failed.txt
