@@ -59,10 +59,18 @@ std::unique_ptr<XrWorldSession> XrWorldSession::Create() {
     if (!TriAevumQuestXr::Requested() || !TriAevumQuestXr::WorldRequested()) return nullptr;
     auto session = std::unique_ptr<XrWorldSession>(new XrWorldSession());
     session->mScale = EnvNumber("TRIAEVUM_XR_WORLD_SCALE", M::kDefaultScale, 25.0, 45.0);
-    session->mTether.LeashM = EnvNumber("TRIAEVUM_XR_LEASH_M", M::kDefaultLeashM, 1.0, 10.0);
+    // Head to Link at every placement, recenter, door, Cinema exit, blink landing (§5.2, §5.3).
+    session->mPlaceM = M::ClampPlaceDistanceM(EnvNumber("TRIAEVUM_XR_PLACE_M", M::kDefaultPlaceDistanceM,
+                                                        M::kMinPlaceDistanceM, M::kMaxPlaceDistanceM));
+    session->mTether.PlaceDistanceM = session->mPlaceM;
+    // The leash keeps W1's running room past the landing point unless set; never inside the landing.
+    session->mTether.LeashM =
+        std::max(EnvNumber("TRIAEVUM_XR_LEASH_M", M::DefaultLeashForPlaceM(session->mPlaceM, false), 1.0, 10.0),
+                 session->mPlaceM + M::kLeashMarginM);
     session->mTether.Mode = M::TetherMode::Leash;
-    XrWorldLog("TRIAEVUM_XR_WORLD_SESSION scale=%.1f leash_m=%.2f camera=native ui_cinema=%d force_world=%d",
-               session->mScale, session->mTether.LeashM, EnvIs("TRIAEVUM_XR_UI_CINEMA", "0") ? 0 : 1,
+    XrWorldLog("TRIAEVUM_XR_WORLD_SESSION scale=%.1f place_m=%.2f leash_m=%.2f camera=native ui_cinema=%d "
+               "force_world=%d",
+               session->mScale, session->mPlaceM, session->mTether.LeashM, EnvIs("TRIAEVUM_XR_UI_CINEMA", "0") ? 0 : 1,
                EnvIs("TRIAEVUM_XR_FORCE_WORLD", "1") ? 1 : 0);
     return session;
 #else
@@ -201,6 +209,7 @@ void XrWorldSession::Place(const XrGuestSnapshot& snapshot, const char* reason, 
     M::PlacementConfig config;
     config.Scale = mScale;
     config.SeatY = mSeatY;
+    config.PlaceDistanceM = mPlaceM;
     M::PlacementInput input;
     input.LinkWorld = LinkVrWorld(snapshot, true);
     input.LinkFacingYaw = M::YawToVrWorld(M::BinAngleToRadians(snapshot.ShapeYaw), mState.Mirrored);

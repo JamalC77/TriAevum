@@ -103,6 +103,7 @@ class XrWorldSession {
     XrMath::Vec3 mCentre;      // c in T
     bool mCentreSet = false;   // unbounded spaces: the head at the first placement
     double mScale = XrMath::kDefaultScale;
+    double mPlaceM = XrMath::kDefaultPlaceDistanceM;  // TRIAEVUM_XR_PLACE_M: head to Link at placements
     double mSeatY = 0.0;       // LOCAL: the floor 1.65 m below the origin
     double mEyeHeightM = 1.6;  // the head over the virtual floor at the last placement
     bool mBounded = false;

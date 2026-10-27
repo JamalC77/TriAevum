@@ -503,30 +503,68 @@ void TestPlacement() {
         CHECK_NEAR(DistanceXZ(r.LinkT, in.Head.Position), r.DistanceM, 1e-12);
     };
 
-    {  // Jamal 1.5 m behind the centre: Link at c, 1.5 m ahead.
+    CHECK_NEAR(config.PlaceDistanceM, 1.8, 0.0);  // TRIAEVUM_XR_PLACE_M's default
+    {  // Jamal 1.5 m behind the centre: Link 1.8 m ahead along the line to c (0.3 m past it).
         input.Head = HeadPose({0.0, 1.7, 1.5}, 0.0);
         const PlacementResult r = SolvePlacement(input, config);
         checkPlaced(r, input);
-        CHECK_LE(LengthXZ(r.LinkT), 1e-12);
-        CHECK_NEAR(r.DistanceM, 1.5, 1e-12);
+        CHECK_NEAR(r.LinkT.X, 0.0, 1e-12);
+        CHECK_NEAR(r.LinkT.Z, -0.3, 1e-12);
+        CHECK_NEAR(r.DistanceM, 1.8, 1e-12);
         CHECK(!r.NearCentre);
         CHECK_NEAR(r.NewRig.Yaw, linkYaw, 1e-12);  // facing T -Z: psi is Link's yaw
+        PlacementConfig atCentre = config;  // a distance equal to Jamal's to c puts Link on c
+        atCentre.PlaceDistanceM = 1.5;
+        const PlacementResult c = SolvePlacement(input, atCentre);
+        checkPlaced(c, input);
+        CHECK_LE(LengthXZ(c.LinkT), 1e-12);
     }
-    {  // 2.5 m away: d0 capped at 2 m, Link 2 m ahead along the line to c.
+    {  // 2.5 m away: Link 1.8 m ahead along the line to c, short of it.
         input.Head = HeadPose({2.5, 1.7, 0.0}, 45.0);
         const PlacementResult r = SolvePlacement(input, config);
         checkPlaced(r, input);
-        CHECK_NEAR(r.DistanceM, 2.0, 1e-12);
-        CHECK_NEAR(r.LinkT.X, 0.5, 1e-12);
+        CHECK_NEAR(r.DistanceM, 1.8, 1e-12);
+        CHECK_NEAR(r.LinkT.X, 0.7, 1e-12);
         CHECK_NEAR(r.FacingT.X, -1.0, 1e-12);
     }
-    {  // within 0.6 m of c: Link 1.0 m ahead of the horizontal gaze (yaw -90 deg looks along T +X).
+    {  // within 0.6 m of c: Link 1.8 m ahead of the horizontal gaze (yaw -90 deg looks along T +X).
         input.Head = HeadPose({0.2, 1.7, 0.1}, -90.0, -30.0);
         const PlacementResult r = SolvePlacement(input, config);
         checkPlaced(r, input);
         CHECK(r.NearCentre);
-        CHECK_NEAR(r.LinkT.X, 1.2, 1e-12);
+        CHECK_NEAR(r.LinkT.X, 2.0, 1e-12);
         CHECK_NEAR(r.LinkT.Z, 0.1, 1e-12);
+        CHECK_NEAR(r.DistanceM, 1.8, 1e-12);
+    }
+    {  // the knob: every distance in [0.8, 4.0] m is the head-to-Link distance; values outside are clamped
+        CHECK_NEAR(ClampPlaceDistanceM(0.5), kMinPlaceDistanceM, 0.0);
+        CHECK_NEAR(ClampPlaceDistanceM(9.0), kMaxPlaceDistanceM, 0.0);
+        CHECK_NEAR(ClampPlaceDistanceM(2.2), 2.2, 0.0);
+        CHECK_NEAR(ClampPlaceDistanceM(std::numeric_limits<double>::quiet_NaN()), kDefaultPlaceDistanceM, 0.0);
+        CHECK_NEAR(ClampPlaceDistanceM(std::numeric_limits<double>::infinity()), kDefaultPlaceDistanceM, 0.0);
+        for (double d : {0.8, 1.0, 2.5, 4.0}) {
+            PlacementConfig c = config;
+            c.PlaceDistanceM = d;
+            input.Head = HeadPose({0.1, 1.7, -0.2}, 35.0);
+            const PlacementResult r = SolvePlacement(input, c);
+            checkPlaced(r, input);
+            CHECK_NEAR(r.DistanceM, d, 1e-12);
+        }
+    }
+    {  // Jamal's stationary boundary (1.09 x 1.09 m): wherever he stands in it and however he looks,
+       // Link lands 1.8 m away (outside the boundary is fine), never on top of him.
+        Rng rng;
+        const PlayArea area{0.545, 0.545, true};
+        int outside = 0;
+        for (int i = 0; i < 2000; ++i) {
+            input.Head = HeadPose({rng.Range(-0.545, 0.545), rng.Range(1.0, 1.9), rng.Range(-0.545, 0.545)},
+                                  rng.Range(-180.0, 180.0), rng.Range(-80.0, 80.0));
+            const PlacementResult r = SolvePlacement(input, config);
+            checkPlaced(r, input);
+            CHECK_NEAR(DistanceXZ(r.LinkT, input.Head.Position), 1.8, 1e-9);
+            if (OutsideDistance(area, r.LinkT, {}) > 0.0) ++outside;
+        }
+        CHECK(outside == 2000);
     }
     {  // probes shorten d0, never below 0.7 m
         input.Head = HeadPose({0.0, 1.7, 1.5}, 0.0);
@@ -548,12 +586,14 @@ void TestPlacement() {
         input.Head = HeadPose({0.0, 1.7, 0.0}, 30.0, 90.0);  // straight up
         CHECK_LE(Length(SolvePlacement(input, config).FacingT - expected), 1e-9);
     }
-    {  // no bounds: c is the head at the first placement (here away from the T origin)
+    {  // no bounds: c is the head at the first placement (here away from the T origin); Link along the
+       // line to it, 1.8 m from the head (0.3 m past c)
         input.CentreT = {1.0, 0.0, -2.0};
         input.Head = HeadPose({1.0, 1.7, -0.5}, 0.0);
         const PlacementResult r = SolvePlacement(input, config);
         checkPlaced(r, input);
-        CHECK_LE(DistanceXZ(r.LinkT, input.CentreT), 1e-12);
+        CHECK_NEAR(DistanceXZ(r.LinkT, input.CentreT), 0.3, 1e-12);
+        CHECK_NEAR(r.LinkT.Z, -2.3, 1e-12);
         input.CentreT = {};
     }
     {  // mirrored frame: Link goes in through M, comes back out through M
@@ -574,44 +614,66 @@ void TestPlacement() {
         bad = input;
         bad.Head.Position.Z = std::numeric_limits<double>::infinity();
         CHECK(!SolvePlacement(bad, config).Valid);
+        // A distance that is not positive would put Link on Jamal: invalid, never a placement.
+        for (double d : {0.0, -1.0, std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity()}) {
+            PlacementConfig c = config;
+            c.PlaceDistanceM = d;
+            CHECK(!SolvePlacement(input, c).Valid);
+        }
     }
     Report("placement");
 }
 
-// Places Link at c with Jamal 1 m behind, standing, for the tether tests.
+// Places Link on c (the placement distance set to Jamal's distance to c), standing, for the tether tests.
 Rig PlacedRig(const Vec3& linkWorld, double linkYaw, const Vec3& headT) {
     PlacementInput input;
     input.LinkWorld = linkWorld;
     input.LinkFacingYaw = linkYaw;
     input.Head = HeadPose(headT, 0.0);
-    return SolvePlacement(input, PlacementConfig{}).NewRig;
+    PlacementConfig config;
+    config.PlaceDistanceM = LengthXZ(headT);
+    const PlacementResult result = SolvePlacement(input, config);
+    CHECK(result.Valid && LengthXZ(result.LinkT) < 1e-9);
+    return result.NewRig;
 }
 
 void TestTether() {
     const double s = kDefaultScale;
     const double dt = 1.0 / 30.0;
-    {  // Leash: Link runs straight away at 3.6 m/s; a blink exactly when he passes 3.5 m, landing 1.0 m ahead.
+    // Leash: Link runs straight away at 3.6 m/s from c, Jamal 1 m behind it; a blink exactly when he
+    // passes the leash, landing the placement distance ahead.
+    const auto runLeash = [&](double place, double leash, int* firstBlink, int* blinks, int* spacing) {
         const Vec3 headT{0.0, 1.7, 1.0};
         const double linkYaw = DegreesToRadians(70.0);
         Rig rig = PlacedRig(kLinkKokiri, linkYaw, headT);
         const double placedYaw = rig.Yaw, placedY = rig.Anchor.Y;
         TetherConfig config;
+        config.PlaceDistanceM = place;
+        config.LeashM = leash;
+        CHECK_NEAR(EffectiveLeashM(config), leash, 0.0);
         TetherState state;
         Vec3 link = kLinkKokiri;
         const Vec3 run = YawDirection(linkYaw) * (3.6 * s * dt);
-        int blinks = 0;
-        int firstBlink = -1;
+        *blinks = 0;
+        *firstBlink = *spacing = -1;
+        int lastBlink = -1;
         for (int frame = 0; frame < 300; ++frame) {
             link = link + run;
             const double before = DistanceXZ(WorldToTracking(rig, link), headT);
             const TetherStep step = UpdateTether(state, config, rig, link, linkYaw, headT, dt);
-            CHECK((step.Event == RigEvent::Blink) == (before > config.LeashM));
+            CHECK((step.Event == RigEvent::Blink) == (before > leash));
             CHECK(step.Event == RigEvent::None || step.Event == RigEvent::Blink);
             if (step.Event == RigEvent::Blink) {
-                ++blinks;
-                if (firstBlink < 0) firstBlink = frame;
+                ++*blinks;
+                if (*firstBlink < 0) *firstBlink = frame;
+                if (lastBlink >= 0) {
+                    CHECK(*spacing < 0 || *spacing == frame - lastBlink);
+                    *spacing = frame - lastBlink;
+                }
+                lastBlink = frame;
                 const Vec3 linkT = WorldToTracking(step.NewRig, link);
-                CHECK_NEAR(DistanceXZ(linkT, headT), 1.0, 1e-9);
+                CHECK_NEAR(DistanceXZ(linkT, headT), place, 1e-9);
+                CHECK_NEAR(step.HeadDistanceM, place, 1e-9);
                 CHECK_LE(Length(linkT - step.LinkT), 1e-9);
                 // Along Link's travel direction (in T), psi and a.y unchanged.
                 const Vec3 travelT = NormalizedXZ(WorldDirectionToTracking(rig, run), {});
@@ -621,9 +683,36 @@ void TestTether() {
             }
             rig = step.NewRig;
         }
-        // From 1.0 m to 3.5 m at 3.6 m/s: a blink every ~0.69 s (first one from 1.0 m behind c too).
-        CHECK(firstBlink >= 20 && firstBlink <= 22);
-        CHECK(blinks >= 13 && blinks <= 15);
+    };
+    {  // W1: landing 1.0 m, leash 3.5 m: from 1.0 m to 3.5 m at 3.6 m/s, a blink every 21 updates (0.7 s).
+        int first = 0, blinks = 0, spacing = 0;
+        runLeash(1.0, 3.5, &first, &blinks, &spacing);
+        CHECK(first == 20 && spacing == 21 && blinks == 14);
+    }
+    {  // The default: landing 1.8 m, leash DefaultLeashForPlaceM = 4.3 m: the same 21-update cadence; the
+       // first blink later (from 1.0 m behind c to 4.3 m).
+        CHECK_NEAR(DefaultLeashForPlaceM(kDefaultPlaceDistanceM, false), 4.3, 1e-12);
+        int first = 0, blinks = 0, spacing = 0;
+        runLeash(kDefaultPlaceDistanceM, DefaultLeashForPlaceM(kDefaultPlaceDistanceM, false), &first, &blinks,
+                 &spacing);
+        CHECK(first == 27 && spacing == 21 && blinks == 13);
+    }
+    {  // A leash set inside the landing distance is raised past it: no blink storm.
+        TetherConfig config;
+        config.PlaceDistanceM = 3.0;
+        config.LeashM = 1.5;
+        CHECK_NEAR(EffectiveLeashM(config), 3.5, 1e-12);
+        const Vec3 headT{0.0, 1.7, 1.0};
+        Rig rig = PlacedRig(kLinkKokiri, 0.0, headT);
+        TetherState state;
+        const Vec3 link = TrackingToWorld(rig, {0.0, 0.0, -2.9});  // 3.9 m from the head: one blink
+        const TetherStep blink = UpdateTether(state, config, rig, link, 0.0, headT, dt);
+        CHECK(blink.Event == RigEvent::Blink);
+        rig = blink.NewRig;
+        int events = 0;
+        for (int frame = 0; frame < 30; ++frame)
+            events += UpdateTether(state, config, rig, link, 0.0, headT, dt).Event != RigEvent::None ? 1 : 0;
+        CHECK(events == 0);
     }
     {  // No blink inside the leash: Link and Jamal wander, Link always moving, within 3.4 m (unbounded room).
         Vec3 headT{0.0, 1.7, 0.8};
@@ -652,28 +741,62 @@ void TestTether() {
         CHECK_LE(Length(rig.Anchor - placed.Anchor), 0.0);
         CHECK(rig.Yaw == placed.Yaw);
     }
-    {  // Play area: Link more than 2 m outside the bounds (inside the leash) blinks; Jamal's own excursion counts.
+    {  // Play area (4 x 4 m, W1 landing): Link more than 2 m outside the bounds (inside the leash) blinks;
+       // Jamal's own excursion counts.
         const Vec3 headT{0.9, 1.7, 0.0};
         const Rig rig = PlacedRig(kLinkKokiri, 0.0, {0.0, 1.7, 1.0});
         TetherConfig config;
-        config.Area = {1.0, 1.0, true};
+        config.PlaceDistanceM = 1.0;
+        config.Area = {2.0, 2.0, true};
+        CHECK_NEAR(OutsideLimitM(config), 2.0, 0.0);
         const auto linkAtT = [&](double x) { return TrackingToWorld(rig, {x, 0.0, 0.0}); };
         TetherState state;
-        CHECK(UpdateTether(state, config, rig, linkAtT(2.9), 0.0, headT, dt).Event == RigEvent::None);
+        CHECK(UpdateTether(state, config, rig, linkAtT(3.9), 0.0, headT, dt).Event == RigEvent::None);
         TetherState state2;
-        const TetherStep out = UpdateTether(state2, config, rig, linkAtT(3.1), 0.0, headT, dt);
+        const TetherStep out = UpdateTether(state2, config, rig, linkAtT(4.1), 0.0, headT, dt);
         CHECK(out.Event == RigEvent::Blink);
         CHECK_NEAR(out.HeadDistanceM, 1.0, 1e-9);
         TetherState state3;
-        CHECK(UpdateTether(state3, config, rig, linkAtT(3.4), 0.0, {1.5, 1.7, 0.0}, dt).Event == RigEvent::None);
-        CHECK_NEAR(RoomRadius(config.Area), 0.7, 1e-12);
+        CHECK(UpdateTether(state3, config, rig, linkAtT(4.4), 0.0, {2.5, 1.7, 0.0}, dt).Event == RigEvent::None);
+        CHECK_NEAR(RoomRadius({1.0, 1.0, true}), 0.7, 1e-12);
         CHECK_NEAR(RoomRadius({0.5, 3.0, true}), 0.6, 1e-12);
         CHECK_NEAR(RoomRadius({}), 1.0, 1e-12);
+        // The rule never fires inside the landing distance (else a blink near a wall would repeat).
+        config.PlaceDistanceM = 3.0;
+        CHECK_NEAR(OutsideLimitM(config), 3.5, 1e-12);
     }
-    {  // Idle re-centre: Link still 0.75 s, beyond 0.7 r_room from c, Jamal off c -> Link back to c.
+    {  // Jamal's stationary boundary (1.09 x 1.09 m), default distances: Link placed 1.8 m ahead stands
+       // outside it and wanders up to the leash without a blink; the play-area rule waits for the leash.
+        const Vec3 headT{0.05, 1.7, 0.1};
+        const Rig rig = PlacedRig(kLinkKokiri, 0.0, {0.0, 1.7, 1.0});
+        TetherConfig config;
+        config.LeashM = DefaultLeashForPlaceM(kDefaultPlaceDistanceM, false);
+        config.Area = {0.545, 0.545, true};
+        CHECK_NEAR(OutsideLimitM(config), 4.3 - 0.545, 1e-12);
+        int events = 0;
+        for (double heading = 0.0; heading < 2.0 * kPi; heading += 0.05) {
+            for (double d : {1.8, 3.0, 4.2}) {
+                TetherState state;
+                const Vec3 t = headT + YawDirection(heading) * d;
+                const TetherStep step =
+                    UpdateTether(state, config, rig, TrackingToWorld(rig, {t.X, 0.0, t.Z}), 0.0, headT, dt);
+                events += step.Event != RigEvent::None ? 1 : 0;
+            }
+            TetherState state;
+            const Vec3 far = headT + YawDirection(heading) * 4.35;
+            const TetherStep blink =
+                UpdateTether(state, config, rig, TrackingToWorld(rig, {far.X, 0.0, far.Z}), heading, headT, dt);
+            CHECK(blink.Event == RigEvent::Blink);
+            CHECK_NEAR(blink.HeadDistanceM, 1.8, 1e-9);
+        }
+        CHECK(events == 0);
+    }
+    {  // Idle re-centre: Link still 0.75 s, beyond 0.7 r_room from c, Jamal at least the placement
+       // distance (here 0.9 m) off c -> Link back to c.
         const Vec3 headT{-0.8, 1.7, 0.5};
         const Rig rig = PlacedRig(kLinkKokiri, 0.4, {0.0, 1.7, 1.0});
         TetherConfig config;
+        config.PlaceDistanceM = 0.9;
         config.Area = {1.5, 1.5, true};  // r_room 1.2, threshold 0.84
         const Vec3 link = TrackingToWorld(rig, {1.0, 0.0, 0.0});
         TetherState state;
@@ -698,6 +821,29 @@ void TestTether() {
         for (int frame = 0; frame < 90; ++frame)
             fired |= UpdateTether(onCentre, config, rig, link, 0.4, {0.2, 1.7, 0.1}, dt).Event != RigEvent::None;
         CHECK(!fired);
+        // The default 1.8 m: c is only 0.94 m from Jamal, closer than a placement -> no re-centre.
+        config.PlaceDistanceM = kDefaultPlaceDistanceM;
+        TetherState nearC;
+        fired = false;
+        for (int frame = 0; frame < 90; ++frame)
+            fired |= UpdateTether(nearC, config, rig, link, 0.4, headT, dt).Event != RigEvent::None;
+        CHECK(!fired);
+        // A large room with Jamal 1.92 m off c: Link back to c, 1.92 m from him.
+        config.Area = {2.5, 2.5, true};  // r_room 2.2, threshold 1.54
+        config.LeashM = DefaultLeashForPlaceM(kDefaultPlaceDistanceM, false);  // Link 3.7 m from Jamal
+        const Vec3 farHead{-1.9, 1.7, 0.3};
+        const Vec3 farLink = TrackingToWorld(rig, {1.8, 0.0, 0.0});
+        TetherState large;
+        int largeIdle = -1;
+        for (int frame = 0; frame < 60; ++frame) {
+            const TetherStep step = UpdateTether(large, config, rig, farLink, 0.4, farHead, dt);
+            if (step.Event == RigEvent::Idle && largeIdle < 0) {
+                largeIdle = frame;
+                CHECK_LE(LengthXZ(WorldToTracking(step.NewRig, farLink)), 1e-9);
+                CHECK(step.HeadDistanceM >= kDefaultPlaceDistanceM);
+            }
+        }
+        CHECK(largeIdle == 23);
     }
     {  // Glide: the anchor takes exactly the excess beyond r_room; Link stays on the r_room circle.
         const Vec3 headT{0.0, 1.7, 1.0};
@@ -705,6 +851,7 @@ void TestTether() {
         const double yaw = rig.Yaw;
         TetherConfig config;
         config.Mode = TetherMode::Glide;  // unbounded: r_room = 1.0 m
+        config.PlaceDistanceM = 1.0;      // the radius is max(r_room, placement distance)
         TetherState state;
         const Vec3 direction = TrackingDirectionToWorld(rig, {1.0, 0.0, 0.0});
         Vec3 link = kLinkKokiri;
@@ -912,9 +1059,15 @@ void TestSeated() {
     PlacementInput input;
     input.LinkWorld = {kLinkKokiri.X, 18.0, kLinkKokiri.Z};
     input.LinkFacingYaw = 1.1;
-    input.Head = HeadPose({0.05, 1.15, 0.1}, 15.0);  // seated near c: Link 1 m ahead of the gaze
+    input.Head = HeadPose({0.05, 1.15, 0.1}, 15.0);  // seated near c: Link 1.8 m ahead of the gaze
     const PlacementResult r = SolvePlacement(input, config);
     CHECK(r.Valid && r.NearCentre);
+    CHECK_NEAR(r.DistanceM, 1.8, 1e-12);
+    CHECK_NEAR(DefaultLeashForPlaceM(1.8, true), 3.3, 1e-12);
+    CHECK_NEAR(DefaultLeashForPlaceM(1.0, true), 2.5, 1e-12);
+    CHECK_NEAR(DefaultLeashForPlaceM(1.0, false), 3.5, 1e-12);
+    CHECK_NEAR(DefaultLeashForPlaceM(0.1, false), 3.3, 1e-12);  // clamped to 0.8 m
+    CHECK_NEAR(DefaultLeashForPlaceM(std::numeric_limits<double>::quiet_NaN(), false), 4.3, 1e-12);
     CHECK_NEAR(r.LinkT.Y, -0.45, 1e-12);
     CHECK_LE(Length(TrackingToWorld(r.NewRig, r.LinkT) - input.LinkWorld), 1e-9);
     // The seated eye sits at the standing eye height above Link's floor.
@@ -1193,6 +1346,7 @@ void TestRegressions() {
     }
     {  // Climbing straight up (1 m/s) is not "still": no idle re-centre in the middle of a ladder.
         TetherConfig config;
+        config.PlaceDistanceM = 1.0;  // Jamal 1.0 m off c: a re-centre at the top is allowed
         config.Area = {1.5, 1.5, true};
         const Rig rig{};
         const Vec3 headT{-1.0, 1.7, 0.0};
@@ -1221,6 +1375,7 @@ void TestRegressions() {
         for (int snaps : {1, 4}) {  // 45 deg (bounded room) and 180 deg (no bounds)
             TetherConfig config;
             config.Mode = TetherMode::Glide;
+            config.PlaceDistanceM = 1.0;  // the radius is max(r_room, placement distance)
             if (snaps == 1) config.Area = {1.5, 1.5, true};  // r_room 1.2
             const double roomRadius = RoomRadius(config.Area);
             Rig rig{};
@@ -1322,11 +1477,11 @@ void TestRegressions() {
             c.NearCentreM = near;
             const PlacementResult r = SolvePlacement(in, c);
             CHECK(r.Valid && r.NearCentre && IsFinite(r.NewRig.Anchor));
-            CHECK_NEAR(r.LinkT.X, 1.0, 1e-12);
+            CHECK_NEAR(r.LinkT.X, 1.8, 1e-12);
             CHECK_LE(Length(TrackingToWorld(r.NewRig, r.LinkT) - in.LinkWorld), 1e-9);
         }
         PlacementConfig bad;
-        bad.NearCentreAheadM = nan;  // a non-finite distance is caught by the result check
+        bad.PlaceDistanceM = nan;  // a non-finite distance is caught by the result check
         CHECK(!SolvePlacement(in, bad).Valid);
     }
     {  // HorizontalForward is continuous through the near-vertical gaze with the head rolled.

@@ -36,8 +36,14 @@ namespace Oot3dNativeGame::XrMath {
 inline constexpr double kPi = 3.14159265358979323846;
 inline constexpr double kDefaultScale = 33.0;           // game units per metre (§5.1)
 inline constexpr double kStandingEyeHeightM = 1.60;     // seated reference eye height (§5.6)
-inline constexpr double kDefaultLeashM = 3.5;           // §5.3
+inline constexpr double kDefaultLeashM = 3.5;           // §5.3, with W1's 1.0 m landing distance
 inline constexpr double kSeatedLeashM = 2.5;            // §5.6
+// The head-to-Link distance of every placement, blink landing and idle re-centre (TRIAEVUM_XR_PLACE_M).
+inline constexpr double kDefaultPlaceDistanceM = 1.8;
+inline constexpr double kMinPlaceDistanceM = 0.8;
+inline constexpr double kMaxPlaceDistanceM = 4.0;
+inline constexpr double kW1PlaceDistanceM = 1.0;        // the distance the W1 leash defaults were chosen for
+inline constexpr double kLeashMarginM = 0.5;            // the leash always lies this far past the landing
 inline constexpr double kDefaultSnapDegrees = 45.0;     // §5.5
 inline constexpr double kOffAxisTolerance = 1e-3;       // §2.2: off-axis terms above this fraction of the scale
 inline constexpr double kHomogeneousTolerance = 1e-3;   // f3's x/y/w terms relative to |C|
@@ -678,17 +684,27 @@ inline Vec3 AnchorForLink(const Rig& rig, const Vec3& linkWorld, const Vec3& lin
 // ---------------------------------------------------------------------------------------------------
 // Placement and recenter (§5.2, §4.4)
 //
-// Link goes to the STAGE centre c with psi chosen so he faces away from Jamal (Jamal behind him), Link's
-// floor at the real floor. Wanted behind-distance d0 = Jamal's horizontal distance to c, capped at 2 m
-// (Link is then placed d0 ahead along the line to c); within 0.6 m of c, Link goes 1.0 m ahead of his
-// horizontal gaze. A probe distance (W2, §4.4) shortens d0 (never below 0.7 m).
+// Link goes PlaceDistanceM (TRIAEVUM_XR_PLACE_M, default 1.8 m) ahead of Jamal's head, horizontally, with
+// psi chosen so he faces away from Jamal (Jamal behind him), Link's floor at the real floor. The direction
+// is the line from the head through the STAGE centre c (Link lands on, short of or past c); within 0.6 m
+// of c it is the horizontal gaze. A small boundary (a stationary 1 x 1 m one) therefore has Link standing
+// outside it, which is intended: he is never placed on top of Jamal. A probe distance (W2, §4.4) shortens
+// the distance (never below 0.7 m).
+//
+// W1 (before the knob): Link at c with d0 = Jamal's distance to c capped at 2 m, 1.0 m ahead of the gaze
+// near c; Jamal found 1.0 m too close.
+
+// The knob's value: clamped to [0.8, 4.0] m; non-finite -> the default.
+inline double ClampPlaceDistanceM(double value) {
+    if (!std::isfinite(value)) return kDefaultPlaceDistanceM;
+    return std::clamp(value, kMinPlaceDistanceM, kMaxPlaceDistanceM);
+}
 
 struct PlacementConfig {
     double Scale = kDefaultScale;
     double SeatY = 0.0;
     double NearCentreM = 0.6;
-    double MaxBehindM = 2.0;
-    double NearCentreAheadM = 1.0;
+    double PlaceDistanceM = kDefaultPlaceDistanceM;
     double MinProbeM = 0.7;
 };
 struct PlacementInput {
@@ -716,17 +732,16 @@ inline PlacementResult SolvePlacement(const PlacementInput& input, const Placeme
     const Vec3 toCentre{input.CentreT.X - head.X, 0.0, input.CentreT.Z - head.Z};
     const double centreDistance = LengthXZ(toCentre);
     Vec3 direction;
-    double distance;
     // The near-centre rule also covers a head too close to c to give a direction, whatever NearCentreM
     // says (0, negative or NaN would otherwise divide by a zero distance).
     if (centreDistance < config.NearCentreM || !(centreDistance > 1e-6)) {
         result.NearCentre = true;
         direction = HorizontalForward(input.Head.Orientation);
-        distance = config.NearCentreAheadM;
     } else {
         direction = toCentre * (1.0 / centreDistance);
-        distance = std::min(centreDistance, config.MaxBehindM);
     }
+    // A distance that is not positive would put Link on Jamal's head: invalid, like a non-finite one.
+    double distance = config.PlaceDistanceM > 0.0 ? config.PlaceDistanceM : std::numeric_limits<double>::quiet_NaN();
     if (!std::isnan(input.ProbeDistanceM)) distance = std::min(distance, std::max(input.ProbeDistanceM, config.MinProbeM));
 
     Rig rig;
@@ -767,14 +782,19 @@ inline double OutsideDistance(const PlayArea& area, const Vec3& pointT, const Ve
 }
 
 inline double DefaultLeashM(bool seated) { return seated ? kSeatedLeashM : kDefaultLeashM; }
+// The leash for a placement distance when TRIAEVUM_XR_LEASH_M is not set: W1's running room past the
+// landing point (2.5 m standing, 1.5 m seated, about one blink per 0.7 s of running at ~3.6 m/s) kept.
+inline double DefaultLeashForPlaceM(double placeDistanceM, bool seated) {
+    return DefaultLeashM(seated) + (ClampPlaceDistanceM(placeDistanceM) - kW1PlaceDistanceM);
+}
 
 enum class TetherMode : uint8_t { Leash, Glide };
 
 struct TetherConfig {
     TetherMode Mode = TetherMode::Leash;
-    double LeashM = kDefaultLeashM;
+    double LeashM = kDefaultLeashM;   // raised to PlaceDistanceM + kLeashMarginM when shorter (EffectiveLeashM)
     double OutsideAreaM = 2.0;        // Link beyond the play area by this much (past Jamal's own excursion)
-    double BlinkAheadM = 1.0;         // Link lands this far ahead of the head along his travel
+    double PlaceDistanceM = kDefaultPlaceDistanceM;  // a blink lands Link this far ahead of the head
     double IdleSeconds = 0.75;
     double IdleRadiusFraction = 0.7;  // idle re-centre when |l - c| > fraction * r_room
     double StillSpeedMps = 0.1;
@@ -782,12 +802,33 @@ struct TetherConfig {
     double TeleportSpeedMps = 30.0;   // a faster step is a teleport: no travel direction from it
     // Glide: the anchor takes the excess beyond r_room, but never faster than this. Running Link (~3.6 m/s)
     // glides exactly; an excess that appears at once (a snap turn pivoting on the head, a near-centre
-    // placement 1 m ahead of the gaze, a hookshot pull) is worked off over a few frames under the
+    // placement ahead of the gaze, a hookshot pull) is worked off over a few frames under the
     // vignette instead of jumping the world by metres in one unannounced frame.
     double GlideMaxSpeedMps = 8.0;
     PlayArea Area;
     Vec3 CentreT;
 };
+
+// The landing distance in use: PlaceDistanceM, or the default when it is not a positive finite value.
+inline double TetherPlaceDistanceM(const TetherConfig& config) {
+    return std::isfinite(config.PlaceDistanceM) && config.PlaceDistanceM > 0.0 ? config.PlaceDistanceM
+                                                                               : kDefaultPlaceDistanceM;
+}
+// The leash never lies inside the landing distance (a blink would repeat every update).
+inline double EffectiveLeashM(const TetherConfig& config) {
+    const double place = TetherPlaceDistanceM(config);
+    return std::isfinite(config.LeashM) ? std::max(config.LeashM, place + kLeashMarginM) : place + kLeashMarginM;
+}
+// The play-area rule's distance (Link this far outside the area past Jamal's own excursion blinks). With
+// a small boundary the placement distance alone puts Link outside it, so the rule never fires before Link
+// could be a leash away from c, nor inside the landing distance (OutsideDistance is 1-Lipschitz: a blink
+// landing is at most the landing distance farther out than the head).
+inline double OutsideLimitM(const TetherConfig& config) {
+    double limit = std::max(config.OutsideAreaM, TetherPlaceDistanceM(config) + kLeashMarginM);
+    if (config.Area.Bounded)
+        limit = std::max(limit, EffectiveLeashM(config) - std::min(config.Area.HalfX, config.Area.HalfZ));
+    return limit;
+}
 struct TetherState {
     bool HasLast = false;
     Vec3 LastLinkWorld;
@@ -840,14 +881,16 @@ inline TetherStep UpdateTether(TetherState& state, const TetherConfig& config, c
     const double headDistance = DistanceXZ(linkT, headT);
     const double linkOutside = OutsideDistance(config.Area, linkT, config.CentreT);
     const double headOutside = OutsideDistance(config.Area, headT, config.CentreT);
+    const double place = TetherPlaceDistanceM(config);
+    const double leash = EffectiveLeashM(config);
     step.LinkT = linkT;
     step.HeadDistanceM = headDistance;
 
-    // Leash blink: Link 1.0 m ahead of the head along his travel, psi unchanged.
-    if (headDistance > config.LeashM || linkOutside > config.OutsideAreaM + headOutside) {
+    // Leash blink: Link the placement distance ahead of the head along his travel, psi unchanged.
+    if (headDistance > leash || linkOutside > OutsideLimitM(config) + headOutside) {
         const Vec3 travelW = state.HasTravel ? state.TravelWorld : YawDirection(linkFacingYaw);
         const Vec3 travelT = NormalizedXZ(WorldDirectionToTracking(rig, travelW), {0.0, 0.0, -1.0});
-        const Vec3 newLinkT{headT.X + travelT.X * config.BlinkAheadM, linkT.Y, headT.Z + travelT.Z * config.BlinkAheadM};
+        const Vec3 newLinkT{headT.X + travelT.X * place, linkT.Y, headT.Z + travelT.Z * place};
         step.NewRig.Anchor = AnchorForLink(rig, linkWorld, newLinkT);
         step.NewRig.Anchor.Y = rig.Anchor.Y;  // the floor rule owns a.y
         step.Event = RigEvent::Blink;
@@ -859,9 +902,11 @@ inline TetherStep UpdateTether(TetherState& state, const TetherConfig& config, c
 
     const double roomRadius = RoomRadius(config.Area);
     const double centreDistance = DistanceXZ(linkT, config.CentreT);
-    if (config.Mode == TetherMode::Glide && centreDistance > roomRadius) {
-        // Move the anchor by the excess beyond r_room (translation only), at most GlideMaxSpeedMps * dt.
-        const double excess = centreDistance - roomRadius;
+    // Glide keeps Link within max(r_room, placement distance) of c: a placement may stand him that far.
+    const double glideRadius = std::max(roomRadius, place);
+    if (config.Mode == TetherMode::Glide && centreDistance > glideRadius) {
+        // Move the anchor by the excess beyond the radius (translation only), at most GlideMaxSpeedMps * dt.
+        const double excess = centreDistance - glideRadius;
         const double maxShift =
             std::isfinite(config.GlideMaxSpeedMps) && config.GlideMaxSpeedMps > 0.0
                 ? config.GlideMaxSpeedMps * safeDt
@@ -880,9 +925,12 @@ inline TetherStep UpdateTether(TetherState& state, const TetherConfig& config, c
         return step;
     }
 
-    // Idle re-centre: Link still, far from c, and Jamal not standing on c.
+    // Idle re-centre: Link still and far from c, and c at least the placement distance from Jamal (never
+    // closer to him than a placement; a stationary boundary, where c is always nearer, never re-centres)
+    // and inside the leash (else the leash would blink him straight back).
+    const double headCentre = DistanceXZ(headT, config.CentreT);
     if (state.StillSeconds >= config.IdleSeconds && centreDistance > config.IdleRadiusFraction * roomRadius &&
-        DistanceXZ(headT, config.CentreT) >= config.CentreClearM) {
+        headCentre >= std::max(config.CentreClearM, place) && headCentre < leash) {
         const Vec3 newLinkT{config.CentreT.X, linkT.Y, config.CentreT.Z};
         step.NewRig.Anchor = AnchorForLink(rig, linkWorld, newLinkT);
         step.NewRig.Anchor.Y = rig.Anchor.Y;
