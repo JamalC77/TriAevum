@@ -1,10 +1,11 @@
-// quest_xr_logic_tests: the stick-click chords, the press latch, the screen placement and the in-world
-// HUD's lazy follow of the Quest immersive mode (quest_xr_input_logic.h). Title-free; runs on the headset from
+// quest_xr_logic_tests: the stick-click chords, the in-world movement stick, the press latch, the screen
+// placement and the in-world HUD's lazy follow of the Quest immersive mode (quest_xr_input_logic.h). Title-free; runs on the headset from
 // quest-tools-arm64.zip (run_all.sh) or on any host.
 #include "quest_xr_input_logic.h"
 
 #include <cmath>
 #include <cstdio>
+#include <string_view>
 
 namespace {
 
@@ -93,6 +94,113 @@ void TapsAndChords() {
         double t = 0;
         auto start = Hold(c, t, 0.2, false, false, true);
         CHECK(start.StartHeld && !start.ToggleSettings);
+    }
+}
+
+// Like Hold, in the in-world deliberate-menu mode with the right stick idle or not.
+ChordOutput HoldWorld(StickChords& chords, double& now, double seconds, bool l3, bool r3, bool menu,
+                      bool rightIdle = true) {
+    ChordOutput any;
+    const double end = now + seconds;
+    while (now < end) {
+        const auto out = chords.Update(now, l3, r3, menu, true, rightIdle);
+        any.SelectTap |= out.SelectTap;
+        any.MenuTap |= out.MenuTap;
+        any.Recenter |= out.Recenter;
+        any.ToggleSettings |= out.ToggleSettings;
+        any.StartHeld |= out.StartHeld;
+        now += 1.0 / 72.0;
+    }
+    return any;
+}
+
+void DeliberateMenu() {
+    {  // in-world: an R3 tap (a stray click) never opens the menu
+        StickChords c;
+        double t = 0;
+        HoldWorld(c, t, 0.2, false, true, false);
+        CHECK(!HoldWorld(c, t, 0.1, false, false, false).MenuTap);
+    }
+    {  // in-world: R3 held 0.7 s with the stick centred opens it once, while held; the release is no tap
+        StickChords c;
+        double t = 0;
+        CHECK(!HoldWorld(c, t, 0.6, false, true, false).MenuTap);
+        int fired = 0;
+        for (int frame = 0; frame < 72; ++frame) {
+            fired += c.Update(t, false, true, false, true, true).MenuTap ? 1 : 0;
+            t += 1.0 / 72.0;
+        }
+        CHECK(fired == 1);
+        CHECK(!HoldWorld(c, t, 0.1, false, false, false).MenuTap);
+        // the menu then shows the screen (Q3 mapping): the same release is still no tap
+        StickChords d;
+        double u = 0;
+        CHECK(HoldWorld(d, u, 0.8, false, true, false).MenuTap);
+        CHECK(!Hold(d, u, 0.1, false, false, false).MenuTap);
+    }
+    {  // in-world: R3 held while steering (stick deflected at any point) never opens it
+        StickChords c;
+        double t = 0;
+        HoldWorld(c, t, 0.2, false, true, false, false);
+        CHECK(!HoldWorld(c, t, 1.0, false, true, false, true).MenuTap);
+        CHECK(!HoldWorld(c, t, 0.1, false, false, false).MenuTap);
+    }
+    {  // in-world: L3 joining the hold spoils it; both held still recenter
+        StickChords c;
+        double t = 0;
+        HoldWorld(c, t, 0.3, false, true, false);
+        const auto both = HoldWorld(c, t, 1.1, true, true, false);
+        CHECK(both.Recenter && !both.MenuTap);
+        CHECK(!HoldWorld(c, t, 0.1, false, false, false).MenuTap);
+    }
+    {  // the Q3 screen mapping is unchanged: the stick idle flag is ignored outside the world
+        StickChords c;
+        double t = 0;
+        for (int frame = 0; frame < 14; ++frame) {
+            c.Update(t, false, true, false, false, false);
+            t += 1.0 / 72.0;
+        }
+        CHECK(c.Update(t, false, false, false, false, false).MenuTap);
+    }
+}
+
+void MovementStick() {
+    {  // the left stick alone
+        const auto m = PickMoveStick(0.5F, 0.7F, true, 0.0F, 0.0F);
+        CHECK(m.Source == StickSource::Left && Near(m.X, 0.5F) && Near(m.Y, 0.7F));
+    }
+    {  // left idle: the right stick moves Link
+        const auto m = PickMoveStick(0.05F, 0.0F, true, -0.8F, 0.3F);
+        CHECK(m.Source == StickSource::Right && Near(m.X, -0.8F) && Near(m.Y, 0.3F));
+    }
+    {  // left controller not active (Jamal's session): the right stick, whatever the left reads
+        const auto m = PickMoveStick(0.9F, 0.0F, false, 0.0F, 0.4F);
+        CHECK(m.Source == StickSource::Right && Near(m.X, 0.0F) && Near(m.Y, 0.4F));
+        const auto idle = PickMoveStick(0.9F, 0.0F, false, 0.0F, 0.0F);
+        CHECK(idle.Source == StickSource::None && Near(idle.X, 0.0F) && Near(idle.Y, 0.0F));
+    }
+    {  // both pushed: the larger deflection wins; a tie keeps the left
+        CHECK(PickMoveStick(0.3F, 0.0F, true, 0.0F, -0.9F).Source == StickSource::Right);
+        CHECK(PickMoveStick(0.0F, 1.0F, true, 0.6F, 0.0F).Source == StickSource::Left);
+        CHECK(PickMoveStick(0.5F, 0.0F, true, 0.0F, 0.5F).Source == StickSource::Left);
+    }
+    {  // both idle: none, the left values pass through (drift stays below the game's dead zone)
+        const auto m = PickMoveStick(0.1F, 0.0F, true, 0.1F, 0.1F);
+        CHECK(m.Source == StickSource::None && Near(m.X, 0.1F));
+    }
+    {  // non-finite input is ignored
+        CHECK(PickMoveStick(NAN, 0.0F, true, 0.0F, 0.6F).Source == StickSource::Right);
+        CHECK(PickMoveStick(0.6F, 0.0F, true, INFINITY, 0.0F).Source == StickSource::Left);
+    }
+    CHECK(StickIdle(0.1F, 0.1F) && !StickIdle(0.2F, 0.0F) && StickIdle(NAN, 1.0F));
+    {  // the log tracker: changes only, idle is no change
+        StickSourceTracker tracker;
+        CHECK(!tracker.Update(StickSource::None));
+        CHECK(tracker.Update(StickSource::Right));
+        CHECK(!tracker.Update(StickSource::Right));
+        CHECK(!tracker.Update(StickSource::None));
+        CHECK(tracker.Update(StickSource::Left));
+        CHECK(std::string_view(StickSourceName(tracker.Last)) == "left");
     }
 }
 
@@ -295,6 +403,8 @@ void DisplayTicks() {
 
 int main() {
     TapsAndChords();
+    DeliberateMenu();
+    MovementStick();
     LatchAndPulse();
     Placement();
     HudFollowTests();

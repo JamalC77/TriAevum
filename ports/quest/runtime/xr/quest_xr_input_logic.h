@@ -14,9 +14,14 @@ namespace TriAevumQuestXr::Logic {
 //  - L3 and R3 held together for kRecenterSeconds: recenter the screen; no tap.
 //  - L3 held, then the menu button pressed: toggle the F1 settings window; no Start and no Select.
 //  - The menu button is Start, except a press that began as the F1 chord (until it is released).
+//  - Deliberate menu (in-world, while the world shows; the right stick then steers Link when the left
+//    one is idle): an R3 tap no longer opens the in-game menu. It opens on R3 held alone for
+//    kMenuHoldSeconds with the right stick centred the whole time (rightStickIdle), fired once while
+//    still held. A click while steering (stick deflected at any point of the hold), a short click, or
+//    any other stick click or the menu button during the hold never opens it.
 struct ChordOutput {
     bool SelectTap = false;
-    bool MenuTap = false;  // R3 tap
+    bool MenuTap = false;  // R3 tap (deliberate mode: the R3 hold)
     bool Recenter = false;
     bool ToggleSettings = false;
     bool StartHeld = false;
@@ -26,8 +31,10 @@ class StickChords {
   public:
     static constexpr double kTapSeconds = 0.4;
     static constexpr double kRecenterSeconds = 1.0;
+    static constexpr double kMenuHoldSeconds = 0.7;
 
-    ChordOutput Update(double now, bool l3, bool r3, bool menu) {
+    ChordOutput Update(double now, bool l3, bool r3, bool menu, bool deliberateMenu = false,
+                       bool rightStickIdle = true) {
         ChordOutput out;
         const bool l3Pressed = l3 && !mL3;
         const bool r3Pressed = r3 && !mR3;
@@ -40,8 +47,10 @@ class StickChords {
         if (r3Pressed) {
             mR3Since = now;
             mR3Spoiled = l3;
+            mR3HoldFired = false;
             if (l3) mL3Spoiled = true;
         }
+        if (deliberateMenu && r3 && !rightStickIdle) mR3Spoiled = true;
         if (menuPressed) {
             if (l3) {
                 out.ToggleSettings = true;
@@ -61,7 +70,14 @@ class StickChords {
         }
         if (!l3 && !r3) mRecenterFired = false;
         if (!l3 && mL3 && !mL3Spoiled && now - mL3Since <= kTapSeconds) out.SelectTap = true;
-        if (!r3 && mR3 && !mR3Spoiled && now - mR3Since <= kTapSeconds) out.MenuTap = true;
+        if (deliberateMenu) {
+            if (r3 && !mR3Spoiled && !mR3HoldFired && now - mR3Since >= kMenuHoldSeconds) {
+                out.MenuTap = true;
+                mR3HoldFired = true;
+            }
+        } else if (!r3 && mR3 && !mR3Spoiled && !mR3HoldFired && now - mR3Since <= kTapSeconds) {
+            out.MenuTap = true;
+        }
         if (!menu) mMenuChord = false;
         out.StartHeld = menu && !mMenuChord;
         mL3 = l3;
@@ -75,7 +91,55 @@ class StickChords {
   private:
     bool mL3 = false, mR3 = false, mMenu = false;
     bool mL3Spoiled = false, mR3Spoiled = false, mMenuChord = false, mRecenterFired = false;
+    bool mR3HoldFired = false;  // the deliberate hold fired: its release is no tap
     double mL3Since = 0.0, mR3Since = 0.0, mBothSince = -1.0;
+};
+
+// ---- Movement stick in-world (single-controller play): the Circle Pad takes the left stick, or the
+// right stick when the left one is idle or its controller is not active; with both pushed, the larger
+// deflection wins (a tie keeps the left). kStickIdle is the radius under which a stick counts as idle
+// (the game's own dead zone is larger, so idle drift never moves Link).
+enum class StickSource : uint8_t { None, Left, Right };
+
+inline const char* StickSourceName(StickSource source) {
+    switch (source) {
+    case StickSource::Left: return "left";
+    case StickSource::Right: return "right";
+    default: return "none";
+    }
+}
+
+struct MoveStick {
+    float X = 0.0F, Y = 0.0F;
+    StickSource Source = StickSource::None;  // None: both sticks idle (X/Y = the left stick as is)
+};
+
+inline constexpr float kStickIdle = 0.15F;
+
+inline bool StickIdle(float x, float y) {
+    if (!std::isfinite(x) || !std::isfinite(y)) return true;
+    return std::hypot(x, y) <= kStickIdle;
+}
+
+inline MoveStick PickMoveStick(float lx, float ly, bool leftActive, float rx, float ry) {
+    if (!std::isfinite(lx) || !std::isfinite(ly)) lx = ly = 0.0F;
+    if (!std::isfinite(rx) || !std::isfinite(ry)) rx = ry = 0.0F;
+    if (!leftActive) lx = ly = 0.0F;
+    const float left = std::hypot(lx, ly), right = std::hypot(rx, ry);
+    if (left <= kStickIdle && right <= kStickIdle) return {lx, ly, StickSource::None};
+    if (right > left) return {rx, ry, StickSource::Right};
+    return {lx, ly, StickSource::Left};
+}
+
+// The stick that last drove Link: Update returns true when it changes (left <-> right); idle
+// periods do not count as a change.
+struct StickSourceTracker {
+    StickSource Last = StickSource::None;
+    bool Update(StickSource source) {
+        if (source == StickSource::None || source == Last) return false;
+        Last = source;
+        return true;
+    }
 };
 
 // A synthetic button press that lasts long enough for a 30 Hz guest poll to see it.

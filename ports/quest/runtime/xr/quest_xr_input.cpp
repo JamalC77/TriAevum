@@ -42,6 +42,7 @@ Logic::PressLatch gLatch;
 Logic::StickChords gChords;
 Logic::Pulse gSelectPulse, gMenuPulse;
 Logic::Hysteresis gGripL, gGripR;
+Logic::StickSourceTracker gStickSource;
 uint32_t gLoggedInputs = 0;
 
 XrPath Path(const char* text) {
@@ -89,12 +90,13 @@ float ReadFloat(XrAction action) {
                                                                                              : 0.0F;
 }
 
-XrVector2f ReadVector(XrAction action) {
+XrVector2f ReadVector(XrAction action, bool* active = nullptr) {
     XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
     info.action = action;
     XrActionStateVector2f state{XR_TYPE_ACTION_STATE_VECTOR2F};
-    if (XR_SUCCEEDED(xrGetActionStateVector2f(G().Session, &info, &state)) && state.isActive) return state.currentState;
-    return {0.0F, 0.0F};
+    const bool isActive = XR_SUCCEEDED(xrGetActionStateVector2f(G().Session, &info, &state)) && state.isActive;
+    if (active != nullptr) *active = isActive;
+    return isActive ? state.currentState : XrVector2f{0.0F, 0.0F};
 }
 
 void PushSettingsKey() {
@@ -209,11 +211,19 @@ void SyncInput(XrTime) {
     const bool gripL = gGripL.Update(ReadFloat(gActions.GripL));
     const bool gripR = gGripR.Update(ReadFloat(gActions.GripR));
     const float triggerL = ReadFloat(gActions.TriggerL), triggerR = ReadFloat(gActions.TriggerR);
-    const XrVector2f left = ReadVector(gActions.LeftStick), right = ReadVector(gActions.RightStick);
+    bool leftActive = false;
+    const XrVector2f left = ReadVector(gActions.LeftStick, &leftActive), right = ReadVector(gActions.RightStick);
+    // In-world while the world shows: the right stick also steers Link (single-controller play: the
+    // left Touch can be off or asleep), so the in-game menu moves from an R3 tap to a deliberate R3
+    // hold with the right stick centred (quest_xr_input_logic.h). Screens keep the Q3 mapping.
+    const bool worldShown = WorldRequested() && RequestedLayerMode() == LayerMode::World;
 
-    const auto chords = gChords.Update(now, clickL, clickR, menu);
+    const auto chords = gChords.Update(now, clickL, clickR, menu, worldShown, Logic::StickIdle(right.x, right.y));
     if (chords.SelectTap) gSelectPulse.Fire(now);
-    if (chords.MenuTap) gMenuPulse.Fire(now);
+    if (chords.MenuTap) {
+        gMenuPulse.Fire(now);
+        if (worldShown) Haptic(false, true, 40);  // the hold took: a short buzz on the right hand
+    }
     if (chords.Recenter) {
         if (WorldRequested()) {
             // In-world: the chord re-places the world around Link (§1.1 G9), not the screen.
@@ -236,6 +246,16 @@ void SyncInput(XrTime) {
     // OpenXR thumbsticks are already Y up-positive, the PhysicalInputState convention.
     pad.LeftX = Logic::AxisToSdl(left.x);
     pad.LeftY = Logic::AxisToSdl(left.y);
+    if (worldShown) {
+        // The Circle Pad: the left stick, or the right one while the left is idle or inactive; the
+        // larger deflection wins. TakePad still hides the right stick from the game's C-stick.
+        const auto move = Logic::PickMoveStick(left.x, left.y, leftActive, right.x, right.y);
+        pad.LeftX = Logic::AxisToSdl(move.X);
+        pad.LeftY = Logic::AxisToSdl(move.Y);
+        if (gStickSource.Update(move.Source))
+            XRLOG("TRIAEVUM_XR_INPUT stick_source=%s left_active=%d", Logic::StickSourceName(move.Source),
+                  leftActive ? 1 : 0);
+    }
     pad.RightX = Logic::AxisToSdl(right.x);
     pad.RightY = Logic::AxisToSdl(right.y);
     pad.TriggerLeft = Logic::TriggerToSdl(triggerL);
@@ -256,6 +276,7 @@ void ReleaseInput() {
     gSelectPulse = {};
     gMenuPulse = {};
     gGripL.On = gGripR.On = false;
+    gStickSource = {};
     std::lock_guard lock(gPadMutex);
     gPad = {};
     gLatch.Reset();
@@ -268,8 +289,9 @@ bool TakePad(PadSnapshot* pad) {
     std::lock_guard lock(gPadMutex);
     *pad = gPad;
     pad->Buttons = gLatch.Take(gPad.Buttons);
-    // In-world, while the world shows: the right stick is the rig's (snap turn from W2), so the game's
-    // C-stick sees nothing (inworld-spec §7); Cinema and menus keep the raw Q3 mapping.
+    // In-world, while the world shows: the right stick is not the game's C-stick (inworld-spec §7); it
+    // reaches the game only as the Circle Pad while the left stick is idle (SyncInput). Cinema and
+    // menus keep the raw Q3 mapping.
     if (WorldRequested() && RequestedLayerMode() == LayerMode::World) pad->RightX = pad->RightY = 0;
     return true;
 }

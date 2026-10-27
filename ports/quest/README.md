@@ -56,7 +56,7 @@ them.
 | Left trigger / right trigger | ZL / ZR |
 | Left menu button (≡) | Start |
 | Left stick click (tap) | Select |
-| Right stick click (tap) | In-game menu (as R3 on a pad) |
+| Right stick click (tap) | In-game menu (as R3 on a pad); in-world while the world shows: hold ~0.7 s, stick centred |
 | Hold both stick clicks ~1 s | Recenter the screen in front of you (short buzz on both hands) |
 | Hold left stick click + press ≡ | Open/close the F1 settings window (short buzz, left hand) |
 
@@ -111,8 +111,13 @@ TRIAEVUM_XR_VIEW=world
   (STAGE), or along your gaze when you stand within 0.6 m of it. With a small (stationary) boundary he
   stands outside it, which is intended. The game camera itself is still the game's (mode R is W2), so
   things behind that unseen camera can be missing and billboards face it.
-- The left stick moves Link relative to that game camera; the right stick does nothing while the world
-  shows (it becomes snap turn in W2). If Link runs past the leash (default the placement distance +
+- The left stick moves Link relative to that game camera. While the world shows, the right stick moves
+  him the same way whenever the left stick is idle or the left controller is off (one-handed play);
+  with both pushed the larger deflection wins (`TRIAEVUM_XR_INPUT stick_source=left|right` on each
+  change). It is never the game's C-stick there. The in-game menu then opens with a deliberate hold:
+  right stick click held ~0.7 s with the right stick centred (short buzz, right hand); a click while
+  steering or a short click does nothing. On the screen (menus, cinema) a right stick click tap is
+  the in-game menu as before. If Link runs past the leash (default the placement distance +
   2.5 m, 4.3 m; never inside the placement distance), a short blink puts him the placement distance
   ahead of you along his run (about one blink per 0.7 s of running, as in W1). The play-area rule
   (Link more than 2 m past the bounds) never fires before Link could be a leash away from the centre,
