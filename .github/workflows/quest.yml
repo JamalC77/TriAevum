@@ -105,7 +105,7 @@ jobs:
         run: |
           unzip -l "${QUEST_OUT}/dist/TriAevum-Quest-arm64.apk"
           unzip -l "${QUEST_OUT}/dist/quest-tools-arm64.zip"
-          sha256sum "${QUEST_OUT}"/dist/*
+          sha256sum "${QUEST_OUT}"/dist/*.apk "${QUEST_OUT}"/dist/*.zip "${QUEST_OUT}"/dist/*.json
 
       - uses: actions/upload-artifact@v4
         with:
