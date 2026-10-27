@@ -195,6 +195,13 @@ endif()
 set_property(TARGET oot3d_actor_visibility_policy_tests PROPERTY
     FOLDER Tests)
 
+# In-world VR math (header-only, std only): rig, eye rows, mirror rule, sky rows, placement, tether,
+# floor, snap turn (quest-research/inworld-spec.md §2.2, §5). Not built by default; runs on any host.
+add_executable(oot3d_xr_math_tests EXCLUDE_FROM_ALL
+    tools/oot3d/native_game_runtime/oot3d_xr_math_tests.cpp
+)
+oot3d_target_defaults(oot3d_xr_math_tests FOLDER Tests)
+
 add_executable(oot3d_native_a32_actor_visibility_tests EXCLUDE_FROM_ALL
     tools/oot3d/native_game_runtime/oot3d_actor_visibility_policy.cpp
     tools/oot3d/native_game_runtime/oot3d_native_a32_actor_visibility.cpp
