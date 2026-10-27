@@ -219,8 +219,9 @@ class XrWorldSession {
     double mCullFov = XrCamera::kDefaultCullFovDegrees;
     XrCamera::MoveReference mMoveRef = XrCamera::MoveReference::HeadLatched;
     double mTurnDegrees = XrMath::kDefaultSnapDegrees;
-    bool mSmoothTurn = false;
-    double mSmoothTurnDegreesPerSecond = 90.0;
+    bool mSmoothTurn = true;
+    double mSmoothTurnDegreesPerSecond = 120.0;
+    bool mVignetteEnabled = false;      // TRIAEVUM_XR_VIGNETTE=1
     double mLastCameraUpdate = -1.0;
     double mLastRigInputs = -1.0;
     XrCamera::OwnerDecision mDecision;

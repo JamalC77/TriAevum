@@ -315,8 +315,8 @@ and look, so you can walk a full circle around Link and look behind you.
   direction is latched from your head when you push the stick and follows your head slowly while you
   hold it (`TRIAEVUM_XR_MOVE_REF`); Z-targeting latches it at the L press. Talking, shops, first person,
   crawling and the ocarina keep the game's own stick.
-- Right stick (with the left controller on): flick left/right for a 45 deg snap turn around your head
-  (80 ms blink, short buzz on the right hand; `TRIAEVUM_XR_TURN=30` or `smooth`); flick up/down for
+- Right stick (with the left controller on): left/right turns smoothly around your head (120 deg/s,
+  `TRIAEVUM_XR_TURN_SPEED`; `TRIAEVUM_XR_TURN=45` snaps instead, instantly, with a short buzz); flick up/down for
   D-pad up/down (TopScreen's first-person view is D-pad up). It never moves Link then. With the left
   controller off or asleep it moves Link instead and takes no flicks (one-handed play). The in-game
   menu is still the deliberate right stick click hold (~0.7 s, stick centred).
@@ -336,8 +336,8 @@ and look, so you can walk a full circle around Link and look behind you.
 - Every rig change (turns, recenters, placements, blinks, following Link, the floor) happens at the
   game's camera update, before your head is written, so the frame culled from your head is the frame
   drawn with that rig.
-- A vignette darkens the edge of view while the floor glides (landing, swimming, diving) or during a
-  smooth turn.
+- No comfort vignette by default. `TRIAEVUM_XR_VIGNETTE=1` darkens the edge of view while the anchor or
+  the floor glides (running, landing, swimming, diving) or during a smooth turn.
 - `TRIAEVUM_XR_CAMERA=native` runs W1 for A/B on the device: the native camera, no stick rotation (even
   with `TRIAEVUM_XR_MOVE_REF` set), no snap turns or D-pad flicks (the right stick moves Link while the
   left stick is idle, as in W1) and no vignette. `held` runs mode L (the native camera with the stick
@@ -349,8 +349,10 @@ and look, so you can walk a full circle around Link and look behind you.
 | `TRIAEVUM_XR_CAMERA` | `r` (default), `native` (W1), `held` (mode L) |
 | `TRIAEVUM_XR_CULL_FOV` | the head camera's FOV for culling, 60-150, default 130 |
 | `TRIAEVUM_XR_MOVE_REF` | `head-latched` (default), `head`, `line` (Link minus head beyond 0.6 m), `native` (no rotation) |
-| `TRIAEVUM_XR_TURN` | snap degrees (10-90, default 45) or `smooth` (90 deg/s with the vignette) |
-| `TRIAEVUM_XR_TETHER` | `leash` (default) or `glide` (the anchor glides past the room radius, vignette) |
+| `TRIAEVUM_XR_TURN` | `smooth` (default) or snap degrees (10-90, instant, no blink) |
+| `TRIAEVUM_XR_TURN_SPEED` | smooth turn rate, 30-360 deg/s, default 120 |
+| `TRIAEVUM_XR_TETHER` | `glide` (default: the world slides with running Link, keeping him within the placement distance of the play-area centre) or `leash` (W1's blink when he outruns the leash) |
+| `TRIAEVUM_XR_VIGNETTE=1` | the comfort vignette during glides and smooth turns (off by default) |
 | `TRIAEVUM_XR_SEATED=1` | seated: LOCAL_FLOOR, the floor offset from your seated eye height at each placement, leash 2.5 m |
 | `TRIAEVUM_XR_INPUT_LOG=1` | also log `TRIAEVUM_XR_STICK theta= yaw_cam= yaw_dir= psi_ref=` (latches and every 0.5 s) |
 

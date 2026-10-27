@@ -92,7 +92,8 @@ std::unique_ptr<XrWorldSession> XrWorldSession::Create() {
     session->mTether.LeashM = std::max(
         EnvNumber("TRIAEVUM_XR_LEASH_M", M::DefaultLeashForPlaceM(session->mPlaceM, session->mSeated), 1.0, 10.0),
         session->mPlaceM + M::kLeashMarginM);
-    session->mTether.Mode = EnvIs("TRIAEVUM_XR_TETHER", "glide") ? M::TetherMode::Glide : M::TetherMode::Leash;
+    // The anchor glides with running Link by default; the W1 leash blink is opt-in (TRIAEVUM_XR_TETHER=leash).
+    session->mTether.Mode = EnvIs("TRIAEVUM_XR_TETHER", "leash") ? M::TetherMode::Leash : M::TetherMode::Glide;
     XrWorldLog("TRIAEVUM_XR_WORLD_SESSION scale=%.1f place_m=%.2f leash_m=%.2f tether=%s seated=%d ui_cinema=%d "
                "force_world=%d",
                session->mScale, session->mPlaceM, session->mTether.LeashM,
@@ -135,19 +136,23 @@ bool XrWorldSession::ConfigureCamera(bool topScreenProfile) {
     mStickEnabled = !native && mMoveRef != C::MoveReference::Native;
     mCullFov = C::ParseCullFov(std::getenv("TRIAEVUM_XR_CULL_FOV"));
     mWriteFov = mCullFov;
+    // Smooth turning by default (TRIAEVUM_XR_TURN=<degrees> snaps instead); no comfort vignette unless
+    // TRIAEVUM_XR_VIGNETTE=1.
     const std::string_view turn = EnvText("TRIAEVUM_XR_TURN");
-    mSmoothTurn = turn == "smooth";
-    if (!turn.empty() && !mSmoothTurn) mTurnDegrees = EnvNumber("TRIAEVUM_XR_TURN", M::kDefaultSnapDegrees, 10.0, 90.0);
+    mSmoothTurn = turn.empty() || turn == "smooth";
+    if (!mSmoothTurn) mTurnDegrees = EnvNumber("TRIAEVUM_XR_TURN", M::kDefaultSnapDegrees, 10.0, 90.0);
+    mSmoothTurnDegreesPerSecond = EnvNumber("TRIAEVUM_XR_TURN_SPEED", 120.0, 30.0, 360.0);
+    mVignetteEnabled = !native && EnvIs("TRIAEVUM_XR_VIGNETTE", "1");
 #if defined(TRIAEVUM_QUEST_OPENXR)
     // W2's right-stick job (§5.5, §7): snap turns and D-pad flicks in mode R and mode L. The native A/B
     // baseline keeps W1's right stick (it moves Link while the left stick is idle, nothing else).
     TriAevumQuestXr::SetWorldFlicks(!native);
 #endif
     XrWorldLog("TRIAEVUM_XR_WORLD camera=%s reason=%s ui_profile=%s cull_fov=%.0f move_ref=%s stick=%d turn=%s "
-               "turn_deg=%.0f flicks=%d vignette=%d",
+               "turn_deg=%.0f turn_dps=%.0f flicks=%d vignette=%d",
                XrCameraModeName(mCameraMode), reason, topScreenProfile ? "topscreen" : "other", mCullFov,
                C::MoveReferenceName(mMoveRef), mStickEnabled ? 1 : 0, mSmoothTurn ? "smooth" : "snap", mTurnDegrees,
-               native ? 0 : 1, native ? 0 : 1);
+               mSmoothTurnDegreesPerSecond, native ? 0 : 1, mVignetteEnabled ? 1 : 0);
     return mModeR;
 }
 
@@ -501,7 +506,6 @@ void XrWorldSession::ApplyRigInputs(const XrGuestSnapshot& snapshot, double now,
         BumpEpoch("turn", 0.0);
         XrWorldLog("TRIAEVUM_XR_TURN dir=%s step_deg=%.0f psi=%.1f flicks=%d wall_fade=%.2f",
                    direction > 0 ? "right" : "left", mTurnDegrees, Degrees(mRig.Yaw), turns, mWallFade);
-        TriAevumQuestXr::RequestBlink(mRigEpoch, 80);
         TriAevumQuestXr::Pulse(1, 25);
     } else if (mSmoothTurn && turnsOn && dt > 0.0) {
         const float axis = TriAevumQuestXr::WorldTurnAxis();
@@ -962,7 +966,7 @@ void XrWorldSession::StampFrame(const XrGuestSnapshot& snapshot, const XrFrameFa
     mState.RigEpoch = mRigEpoch;
     // §5.7: the vignette from the anchor's glides and the smooth turn's yaw rate, World only; the native A/B
     // baseline has none (W1).
-    SetVignette(world && mCameraMode != XrCameraMode::Native ? M::VignetteStrength(mAnchorSpeedMps, mYawRate) : 0.0);
+    SetVignette(world && mVignetteEnabled ? M::VignetteStrength(mAnchorSpeedMps, mYawRate) : 0.0);
     if (!world) {
         SetWallFade(0.0, "layer");
         if (mActorHeadPublished) PublishActorHead(false, {});
