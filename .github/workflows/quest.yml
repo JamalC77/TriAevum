@@ -1,0 +1,126 @@
+name: Quest
+
+# The title-free Meta Quest 3 build of TriAevum (ports/quest): the runtime APK and the adb-runnable
+# probes. The title module and game data are built and staged privately on the player's PC and
+# side-loaded; nothing ROM-derived is built, packaged or uploaded here.
+on:
+  push:
+    branches: [quest]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    name: Quest APK (arm64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      NDK_VERSION: 29.0.14206865
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 3G
+      CCACHE_COMPILERCHECK: content
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      TRIAEVUM_ANDROID_DEPENDENCY_SOURCE_CACHE: ${{ github.workspace }}/.deps-src
+      QUEST_OUT: ${{ github.workspace }}/out/quest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: '~3.31.0'
+          ninjaVersion: '^1.11.1'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+
+      - name: Install the Android NDK and SDK packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ccache
+          "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --install \
+            "ndk;${NDK_VERSION}" 'platforms;android-35' 'build-tools;35.0.0' > /dev/null
+          grep Pkg.Revision "${ANDROID_HOME}/ndk/${NDK_VERSION}/source.properties"
+          cmake --version | head -1
+          ninja --version
+
+      - uses: actions/cache@v4
+        with:
+          path: .deps-src
+          key: quest-deps-src-${{ hashFiles('CMakeLists.txt', 'CMake/**', 'runtime/three_ds_recomp/CMakeLists.txt', 'runtime/three_ds_recomp/cmake/**', 'ports/quest/runtime/**') }}
+
+      - uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: quest-ccache-${{ env.NDK_VERSION }}-${{ github.sha }}
+          restore-keys: quest-ccache-${{ env.NDK_VERSION }}-
+
+      - name: Build
+        env:
+          TRIAEVUM_QUEST_KEYSTORE_BASE64: ${{ secrets.TRIAEVUM_QUEST_KEYSTORE_BASE64 }}
+          TRIAEVUM_QUEST_KEYSTORE_PASSWORD: ${{ secrets.TRIAEVUM_QUEST_KEYSTORE_PASSWORD }}
+          TRIAEVUM_QUEST_KEY_ALIAS: ${{ secrets.TRIAEVUM_QUEST_KEY_ALIAS }}
+          TRIAEVUM_QUEST_KEY_PASSWORD: ${{ secrets.TRIAEVUM_QUEST_KEY_PASSWORD }}
+          TRIAEVUM_QUEST_VERSION_CODE: ${{ github.run_number }}
+          TRIAEVUM_QUEST_VERSION_NAME: 0.8.0-beta.1.2-quest.${{ github.run_number }}
+        run: |
+          # A stable key keeps `adb install -r` working, which keeps the pushed data.
+          if [[ -z "${TRIAEVUM_QUEST_KEYSTORE_BASE64}" ]]; then
+            echo "::error::TRIAEVUM_QUEST_KEYSTORE_BASE64 is not set"; exit 1
+          fi
+          export TRIAEVUM_QUEST_KEYSTORE_FILE="${RUNNER_TEMP}/triaevum-quest.p12"
+          base64 -d <<< "${TRIAEVUM_QUEST_KEYSTORE_BASE64}" > "${TRIAEVUM_QUEST_KEYSTORE_FILE}"
+          unset TRIAEVUM_QUEST_KEYSTORE_BASE64
+          export ANDROID_NDK_HOME="${ANDROID_HOME}/ndk/${NDK_VERSION}"
+          mkdir -p "${TRIAEVUM_ANDROID_DEPENDENCY_SOURCE_CACHE}"
+          ccache --zero-stats
+          bash tools/quest/build_quest.sh
+          ccache --show-stats
+          rm -f "${TRIAEVUM_QUEST_KEYSTORE_FILE}"
+
+      - name: Keep the dependency sources for the next run
+        if: always()
+        run: |
+          shopt -s nullglob
+          for source in "${QUEST_OUT}"/rt/_deps/*-src; do
+            name="$(basename "${source}")"
+            [[ -e "${TRIAEVUM_ANDROID_DEPENDENCY_SOURCE_CACHE}/${name}" ]] ||
+              cp -a "${source}" "${TRIAEVUM_ANDROID_DEPENDENCY_SOURCE_CACHE}/${name}"
+          done
+          du -sh "${TRIAEVUM_ANDROID_DEPENDENCY_SOURCE_CACHE}" || true
+
+      - name: APK contents
+        run: |
+          unzip -l "${QUEST_OUT}/dist/TriAevum-Quest-arm64.apk"
+          unzip -l "${QUEST_OUT}/dist/quest-tools-arm64.zip"
+          sha256sum "${QUEST_OUT}"/dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TriAevum-Quest-arm64
+          path: |
+            ${{ env.QUEST_OUT }}/dist/TriAevum-Quest-arm64.apk
+            ${{ env.QUEST_OUT }}/dist/title-abi.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quest-tools-arm64
+          path: |
+            ${{ env.QUEST_OUT }}/dist/quest-tools-arm64.zip
+            ${{ env.QUEST_OUT }}/dist/title-abi.json
+          if-no-files-found: error
+          retention-days: 14

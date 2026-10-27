@@ -1,0 +1,25 @@
+{
+  "base": "v0.8.0-beta.1.2",
+  "files": {
+    "ports/android/native/CMakeLists.txt": "3bd6f81286c2553da495c1031aa31445e6cf89ac468b8887e86bc73d5f25909d",
+    "tools/oot3d/native_a32_runtime/oot3d_aot_architectural_state.h": "040a563963aeed65f164ebf06f3c4adcb11a316ace94fe254423109bac76dcf8",
+    "tools/oot3d/native_a32_runtime/oot3d_native_a32_vfp_fast.h": "9a088b912f5c46b6400b294996ffba17fa6201bc169f98fdc6305ff0f20d17f6",
+    "tools/oot3d/native_a32_runtime/oot3d_native_a32_vfp_ops.cpp": "dd1dc94b2cdfaf0114b1a2d70a2916b6771ebb95637f185dbb52190f17234f55",
+    "tools/oot3d/native_a32_runtime/oot3d_native_a32_vfp_ops.h": "084664767ca23597ba9f7da8cd5bee43189cc07153dc1243a9c6024fcce2df92",
+    "tools/oot3d/native_a32_runtime/upstream/recomp/a32_runtime.h": "82428b646cb72f43387005707c7f98e5df84f1b8aafc48d4b3d50bca8b0c4ba9",
+    "tools/oot3d/native_a32_runtime/upstream/recomp/a32_vfp_binary64.cpp": "3a5282a1f1a75dea2e0487f7634dcd130be7758a98176283b6a11c420ca99ee1",
+    "tools/oot3d/native_a32_runtime/upstream/recomp/a32_vfp_binary64.h": "27e614b4feeb55d3e51ab97dde61480c4f1e7f395f4c8f42255334e3c925300b",
+    "tools/oot3d/native_a32_runtime/upstream/recomp/a32_vfp_scalar.cpp": "d07a379cb9e1a72487e5ac50533bbf718f31414fc6960500e4ce9d934b1e94cc",
+    "tools/oot3d/native_a32_runtime/upstream/recomp/a32_vfp_scalar.h": "f0a7b1e6848f0667d2599d619ce85409ad8bc0bdbfefa70e23fee11f2f6d48f4",
+    "tools/oot3d/native_a32_runtime/upstream/recomp/a32_vfp_transport.cpp": "b55939f0e0789acbaae7c491fa53d2f02bc5c44d224cb6fed149dc3bcacbc8ed",
+    "tools/oot3d/native_a32_runtime/upstream/recomp/a32_vfp_transport.h": "18543bf915aa91b2b02aaf4bc33d068dac4d08c9b01c532a866474a68270c942",
+    "tools/oot3d/native_game_runtime/oot3d_native_a32_memory.cpp": "eaa288ef2cbfb3509aa7cdac86f0c912ef2a9258ed5d9a475dc32f2db8814b46",
+    "tools/oot3d/native_game_runtime/oot3d_native_a32_memory.h": "c20c60bd4250fea8cced71d8bdaad1e85437fd70484b967f1041f4b4ddd93e0f",
+    "tools/oot3d/native_game_runtime/oot3d_native_a32_memory_bus_defaults.cpp": "3375022305039689243d61588e52c26224fa33944da11f38a9bed664f666878e",
+    "tools/oot3d/native_game_runtime/oot3d_native_whole_aot_runtime.h": "42d7fc044982ca77f7b215d0d3e673cfeff42d34ff4b5013209af7897468e41b",
+    "tools/oot3d/native_game_runtime/triaevum_title_aot_abi.h": "0d1f99fd940145ffa1621b76ba4ec0de780a7c94b7111f98b3bf709415e283d3",
+    "tools/oot3d/native_game_runtime/triaevum_title_whole_aot_abi.h": "d3e6dccb6de4bb189466e4c90aaca36bc1dca88d642030668190869ef8865415",
+    "tools/oot3d/native_game_runtime/triaevum_title_whole_aot_plugin.cpp": "dbad4d4a1aa179291313ab9d6037e7c9d0897a97eb69e561eb8e077500d0cb38",
+    "tools/triaevum_release/cmake/TitleSupport.cmake": "58e210da70c0917196faf36d00d153c5b2a025b0f4858b3716f32744b05a5080"
+  }
+}

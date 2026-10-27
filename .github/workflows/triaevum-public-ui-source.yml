@@ -2,6 +2,9 @@ name: TriAevum public UI source
 
 on:
   push:
+    # The Quest port branch builds with quest.yml only.
+    branches-ignore:
+      - quest
     paths:
       - '.github/workflows/triaevum-public-ui-source.yml'
       - 'CMakeLists.txt'

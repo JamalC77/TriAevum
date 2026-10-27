@@ -2,6 +2,9 @@ name: TriAevum release policy
 
 on:
   push:
+    # The Quest port branch builds with quest.yml only.
+    branches-ignore:
+      - quest
     paths:
       - ".github/workflows/triaevum-release-policy.yml"
       - "runtime/triaevum_module/**"

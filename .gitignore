@@ -471,3 +471,6 @@ _packages
 /clang-format
 /clang-format.exe
 *.o2r
+
+# Quest build output (tools/quest/build_quest.sh)
+/out/
