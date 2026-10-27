@@ -167,6 +167,10 @@ TRIAEVUM_XR_VIEW=world
 | `TRIAEVUM_XR_FORCE_WORLD=1` | ignore every screen trigger except the session and the player (bring-up only) |
 | `TRIAEVUM_XR_VIEW_TRACE=1` | log the draw classes per scene (any mode, no rendering change; the W0 trace) |
 
+Developer builds: `TRIAEVUM_DEV_LOADOUT=sword,shield,slingshot,nuts,sticks,hearts:6` (or `full_child`)
+starts Link with gear, applied at gameplay start, after a `TRIAEVUM_DEV_WARP` arrival and after a
+continue (vocabulary and log lines: `docs/TRIAEVUM_DEVELOPER_WARP.md`, "Starting loadout").
+
 Developer builds (`TRIAEVUM_DEV_LAB`): the `capture` op takes an optional `"view"`:
 
 ```json

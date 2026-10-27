@@ -95,6 +95,54 @@ stays still. "Back to the game's view" restarts it from the game's camera.
 starts with it on at that pose. The placed lights' gizmos also show while it
 is on.
 
+## Starting loadout
+
+`TRIAEVUM_DEV_LOADOUT` (developer builds only) gives Link gear for developer
+runs, so a boot warp into a field does not leave him empty-handed. The value is
+a comma list (case-insensitive):
+
+| Token | Writes |
+|---|---|
+| `sword` | Kokiri Sword owned (equipment sword bit 0), equipped (sword value 1), on B (`0x3B`) |
+| `shield` | Deku Shield owned (shield bit 0, i.e. bit 4), equipped (shield value 1) |
+| `slingshot` | Slingshot in its slot, Bullet Bag level 1 if none, seeds full (30), on I (ZR in the TopScreen UI) |
+| `nuts` | Deku Nuts, nut upgrade level 1 if none, full (20), on Y |
+| `sticks` | Deku Sticks, stick upgrade level 1 if none, full (10), on X |
+| `boomerang` | Boomerang, on II (ZL in the TopScreen UI) |
+| `bombs` | Bombs, Bomb Bag level 1 if none, full (20); no button |
+| `hearts:N` | heart capacity N (1..20) and full health |
+| `full_child` | all of the above with `hearts:10` |
+
+For example `TRIAEVUM_DEV_LOADOUT=sword,shield,slingshot,nuts,sticks,hearts:6`.
+An unknown token stops the launch with the vocabulary. Ammo already on a bigger
+bag fills to that bag; a button the loadout does not use that shows an item it
+placed elsewhere is cleared. The gear is child gear: on adult Link only
+`hearts:N` applies (`child_gear=skipped_adult`).
+
+It is applied after 15 guest frames of stable play (not while a developer warp
+is on its way): once gameplay starts, again whenever a developer warp arrives
+(the `TRIAEVUM_DEV_WARP` boot warp, F1 and lab warps), and again when Link is
+back in play after his health reached zero (game over and continue, a fairy).
+Then the live player re-reads its equipment with the TopScreen equipment
+action's refresh (`Player+0x172C` cleared, `Player_SetEquipmentData`
+`0x0034913C(play, player)`, `Player+0x1714` bit 3), once it passes that action's
+gate (pause state 2, PlayState 3/2, nothing held, no cutscene action); a player
+replaced by a scene load reads the SaveContext itself.
+
+Every offset is cited in `oot3d_dev_loadout.cpp`: `guest_ui_layout.h`
+(SaveContext and `ItemEquips`/`Inventory` layouts), `ui_inventory_content.cpp`
+(upgrade masks, shifts, capacities and the item slot table, checked against
+code.bin's table at `0x0053CC44` before each item), `ui_pause_gear_semantics.cpp`
+(equipment bits) and the TopScreen item/HUD code that reads the same fields.
+Child equipment saved for an age swap (`+0x54`) is not written.
+
+Log lines (stderr): `TRIAEVUM_DEV_LOADOUT armed loadout="..."` at launch; per
+application one `field=<name> addr= before= wrote= read= ok=` line per field
+and `applied=start|warp|continue loadout= frame= child= fields= mismatches=`;
+then `refresh=ok|failed|gave_up|not_needed`. `oot3d_dev_loadout_tests` (fake
+guest) checks the vocabulary, every field, adult Link, the slot-table check and
+when it applies.
+
 ## Storage
 
 `developer-tools.json` beside the config: `WarpPoints` (SoH's format) and

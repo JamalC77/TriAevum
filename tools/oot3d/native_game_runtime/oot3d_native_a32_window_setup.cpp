@@ -895,6 +895,16 @@ void NativeA32WindowSession::Setup() {
                                                      : Oot3dNativeGame::DevWarpAge::Child,
                     std::string_view(time) == "night");
   }
+  // TRIAEVUM_DEV_LOADOUT="sword,shield,slingshot,nuts,sticks,hearts:6" (or
+  // "full_child"): starting gear, see oot3d_dev_loadout.h.
+  if (const char *loadout = std::getenv("TRIAEVUM_DEV_LOADOUT"); loadout != nullptr && *loadout != '\0') {
+    std::string loadoutError;
+    const auto spec = Oot3dNativeGame::ParseDevLoadout(loadout, &loadoutError);
+    if (!spec.has_value()) throw std::runtime_error("TRIAEVUM_DEV_LOADOUT: " + loadoutError);
+    devLoadout = std::make_unique<Oot3dNativeGame::DevLoadoutRuntime>(*spec);
+    std::fprintf(stderr, "TRIAEVUM_DEV_LOADOUT armed loadout=\"%s\"\n",
+                 Oot3dNativeGame::DescribeDevLoadout(*spec).c_str());
+  }
   // TRIAEVUM_DEV_WARP_ENTRANCE=<entrance>:<scene>:<child|adult>:<day|night>:
   // any native entrance, for oracle fixtures outside the Better list (0x28A,
   // the Lon Lon fence jump, spawns the adult player mounted on Epona).

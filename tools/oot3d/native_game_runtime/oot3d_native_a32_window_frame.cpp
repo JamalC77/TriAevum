@@ -1244,6 +1244,8 @@ bool NativeA32WindowSession::UpdateGuestServicesForRefresh(
   if (devWarp != nullptr) {
     if (devWarpGuest == nullptr) devWarpGuest = Oot3dNativeGame::MakeDevWarpProcessGuest(process);
     devWarp->Advance(*devWarpGuest, sceneViewProbe.Stats().LastPlayStateAddress, frameCount);
+    if (devLoadout != nullptr)
+      devLoadout->Advance(*devWarpGuest, sceneViewProbe.Stats().LastPlayStateAddress, devWarp->Status(), frameCount);
     UpdateDevFreeCameraTour(frameCount);
     if (devLab) UpdateDevLab(frameCount);
   }

@@ -144,6 +144,7 @@
 #if defined(TRIAEVUM_DEVELOPER_TOOLS)
 #include "oot3d_dev_tools_panel.h"
 #include "oot3d_dev_warp.h"
+#include "oot3d_dev_loadout.h"
 #include "oot3d_dev_emitter_inventory.h"
 #include "oot3d_dev_lab.h"
 #endif
@@ -333,6 +334,9 @@ private:
   // F1 > Dev Tools warping (developer builds only).
   std::shared_ptr<Oot3dNativeGame::DevWarpRuntime> devWarp;
   std::unique_ptr<Oot3dNativeGame::DevWarpGuest> devWarpGuest;
+  // TRIAEVUM_DEV_LOADOUT (oot3d_dev_loadout.h): starting gear, applied after
+  // the warp runtime each guest frame.
+  std::unique_ptr<Oot3dNativeGame::DevLoadoutRuntime> devLoadout;
   // TRIAEVUM_DEV_FREECAM_TOUR="f,r,u,yaw,pitch;...": free camera poses
   // relative to Link (forward/right/up units, yaw offset and pitch in
   // degrees), from 3 s after the scripted warp arrives (or gameplay starts),

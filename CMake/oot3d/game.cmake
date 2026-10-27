@@ -387,6 +387,7 @@ if (TARGET oot3d_native_a32_aot OR TARGET oot3d_native_whole_aot OR
             tools/oot3d/native_game_runtime/oot3d_dev_warp.cpp
             tools/oot3d/native_game_runtime/oot3d_dev_tools_panel.cpp
             tools/oot3d/native_game_runtime/oot3d_dev_warp_process.cpp
+            tools/oot3d/native_game_runtime/oot3d_dev_loadout.cpp
             tools/oot3d/native_game_runtime/oot3d_dev_emitter_inventory.cpp
             tools/oot3d/native_game_runtime/oot3d_dev_lab.cpp)
         set_source_files_properties(tools/oot3d/native_game_runtime/oot3d_dev_warp.cpp
@@ -401,6 +402,13 @@ if (TARGET oot3d_native_a32_aot OR TARGET oot3d_native_whole_aot OR
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/oot3d/decomp_support/include")
         target_link_libraries(oot3d_dev_warp_tests PRIVATE oot3d_native_game_runtime)
         oot3d_target_defaults(oot3d_dev_warp_tests FOLDER Tests)
+        # TRIAEVUM_DEV_LOADOUT against a fake guest (no title, no runtime library).
+        add_executable(oot3d_dev_loadout_tests EXCLUDE_FROM_ALL
+            tools/oot3d/native_game_runtime/oot3d_dev_loadout.cpp
+            tools/oot3d/native_game_runtime/oot3d_dev_loadout_tests.cpp)
+        target_include_directories(oot3d_dev_loadout_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/oot3d/native_game_runtime")
+        oot3d_target_defaults(oot3d_dev_loadout_tests FOLDER Tests)
         # Scene environment profiles for agents and scripts (validate, format,
         # explain), without starting the game.
         add_executable(triaevum_environment_tool EXCLUDE_FROM_ALL

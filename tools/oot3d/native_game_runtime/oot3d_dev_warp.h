@@ -34,6 +34,15 @@ class DevWarpGuest {
   // `accepted` is the helper's result: false when the slot is not free.
   virtual bool RequestTransition(uint32_t playState, uint16_t entrance,
                                  bool *accepted, std::string *error) = 0;
+  // The developer loadout: the player re-reads its equipment from the
+  // SaveContext (Player+0x172C cleared, then Player_SetEquipmentData
+  // 0x0034913C(play, player), the TopScreen equipment action's refresh).
+  virtual bool RefreshPlayerEquipment(uint32_t playState, uint32_t player, std::string *error) {
+    (void)playState;
+    (void)player;
+    if (error != nullptr) *error = "this guest cannot refresh the player";
+    return false;
+  }
 };
 
 class NativeA32Process;
