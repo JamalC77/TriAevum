@@ -7,12 +7,17 @@ on:
   push:
     branches: [quest]
   workflow_dispatch:
+    inputs:
+      developer_tools:
+        description: 'Personal developer build (F1 Dev Tools, warp, TRIAEVUM_DEV_LAB); 3-day artifact'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.developer_tools && 'dev' || 'product' }}
   cancel-in-progress: true
 
 jobs:
@@ -29,6 +34,9 @@ jobs:
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
       TRIAEVUM_ANDROID_DEPENDENCY_SOURCE_CACHE: ${{ github.workspace }}/.deps-src
       QUEST_OUT: ${{ github.workspace }}/out/quest
+      QUEST_DEVELOPER_TOOLS: ${{ inputs.developer_tools && '1' || '0' }}
+      ARTIFACT_SUFFIX: ${{ inputs.developer_tools && '-dev' || '' }}
+      ARTIFACT_DAYS: ${{ inputs.developer_tools && 3 || 14 }}
     steps:
       - uses: actions/checkout@v4
 
@@ -88,7 +96,10 @@ jobs:
           ccache --zero-stats
           bash tools/quest/build_quest.sh
           ccache --show-stats
-          rm -f "${TRIAEVUM_QUEST_KEYSTORE_FILE}"
+
+      - name: Remove the decoded keystore
+        if: always()
+        run: rm -f "${RUNNER_TEMP}/triaevum-quest.p12"
 
       - name: Keep the dependency sources for the next run
         if: always()
@@ -109,18 +120,18 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: TriAevum-Quest-arm64
+          name: TriAevum-Quest-arm64${{ env.ARTIFACT_SUFFIX }}
           path: |
             ${{ env.QUEST_OUT }}/dist/TriAevum-Quest-arm64.apk
             ${{ env.QUEST_OUT }}/dist/title-abi.json
           if-no-files-found: error
-          retention-days: 14
+          retention-days: ${{ env.ARTIFACT_DAYS }}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: quest-tools-arm64
+          name: quest-tools-arm64${{ env.ARTIFACT_SUFFIX }}
           path: |
             ${{ env.QUEST_OUT }}/dist/quest-tools-arm64.zip
             ${{ env.QUEST_OUT }}/dist/title-abi.json
           if-no-files-found: error
-          retention-days: 14
+          retention-days: ${{ env.ARTIFACT_DAYS }}

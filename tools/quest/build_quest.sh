@@ -9,6 +9,8 @@
 #   TRIAEVUM_ANDROID_DEPENDENCY_SOURCE_CACHE  optional FetchContent source cache (*-src trees)
 #   TRIAEVUM_QUEST_KEYSTORE_FILE + _KEYSTORE_PASSWORD/_KEY_ALIAS/_KEY_PASSWORD  release signing
 #   QUEST_SKIP_APK=1  stop after staging (no JDK/Gradle needed)
+#   QUEST_DEVELOPER_TOOLS=1  personal developer build: F1 Dev Tools, warp and the TRIAEVUM_DEV_LAB
+#                     file channel (never a public build)
 set -euo pipefail
 
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -40,6 +42,11 @@ echo "=== Runtime (libTriAevum.so, SDL2, title bootstrap, runtime tests) ==="
 rt_args=("${common[@]}")
 [[ -n "${TRIAEVUM_ANDROID_DEPENDENCY_SOURCE_CACHE:-}" ]] &&
   rt_args+=("-DTRIAEVUM_ANDROID_DEPENDENCY_SOURCE_CACHE=$TRIAEVUM_ANDROID_DEPENDENCY_SOURCE_CACHE")
+if [[ "${QUEST_DEVELOPER_TOOLS:-0}" == 1 ]]; then
+  rt_args+=(-DTRIAEVUM_DEVELOPER_TOOLS=ON)
+else
+  rt_args+=(-DTRIAEVUM_DEVELOPER_TOOLS=OFF)
+fi
 cmake -S "$root/ports/quest/runtime" -B "$out/rt" "${rt_args[@]}"
 cmake --build "$out/rt" --parallel "$jobs" --target \
   oot3d_native_game triaevum_title_aot_stub \
