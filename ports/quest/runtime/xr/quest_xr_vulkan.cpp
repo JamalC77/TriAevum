@@ -5,9 +5,11 @@
 // the static fade swapchain. The HUD (W4, minimal): the panel of a stereo publication with panelValid
 // is copied into its own swapchain in the same submit as the eyes.
 #include "quest_xr_internal.h"
+#include "quest_xr_input_logic.h"
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <stdexcept>
@@ -45,6 +47,10 @@ SwapchainState gEye;   // in-world: eye L -> layer 0, eye R -> layer 1
 SwapchainState gFade;  // in-world: static 16-layer array of (0, 0, 0, k/15)
 SwapchainState gHud;   // in-world: the HUD over transparent (premultiplied alpha), panel extent
 constexpr uint32_t kFadeLevels = 16;
+SwapchainState gVignette;  // in-world W2: static 8-layer array of radial masks (layer 0 unused)
+constexpr uint32_t kVignetteLevels = 8;
+constexpr VkExtent2D kVignetteExtent{64, 64};
+std::atomic<bool> gVignetteFailed{false};
 VkFormat gSwapchainFormat = VK_FORMAT_UNDEFINED;
 VkFormat gTargetFormat = VK_FORMAT_R8G8B8A8_UNORM;
 VkCommandPool gCommandPool = VK_NULL_HANDLE;
@@ -342,6 +348,10 @@ uint32_t FadeLevels() { return kFadeLevels; }
 XrSwapchain HudSwapchain() { return gHud.Handle; }
 VkExtent2D HudSwapchainExtent() { return gHud.Extent; }
 bool HudReleased() { return gHud.Handle != XR_NULL_HANDLE && gHud.Released.load(); }
+XrSwapchain VignetteSwapchain() { return gVignette.Handle; }
+VkExtent2D VignetteExtent() { return gVignette.Extent; }
+uint32_t VignetteLevels() { return kVignetteLevels; }
+bool VignetteReady() { return gVignette.Handle != XR_NULL_HANDLE && gVignette.Released.load(); }
 VkSemaphore RenderTimeline() { return gRenderTimeline; }
 VkSemaphore CopyTimeline() { return gCopyTimeline; }
 
@@ -394,6 +404,102 @@ void CreateWorldSwapchains() {
     } else {
         XRLOG("TRIAEVUM_XR_SWAPCHAIN hud=off (TRIAEVUM_XR_HUD=0)");
     }
+    // The vignette (W2, §5.7): a static array of premultiplied radial masks, uploaded once on the XR thread
+    // by PrepareVignetteSwapchain; a strength picks the layer.
+    CreateSwapchain(gVignette, "vignette", kVignetteExtent, kVignetteLevels, XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT);
+    XRLOG("TRIAEVUM_XR_SWAPCHAIN vignette=%ux%u array=%u images=%zu", kVignetteExtent.width, kVignetteExtent.height,
+          kVignetteLevels, gVignette.Images.size());
+}
+
+bool PrepareVignetteSwapchain() {
+    if (gVignette.Handle == XR_NULL_HANDLE || gVignetteFailed.load()) return false;
+    if (gVignette.Released.load()) return true;
+    auto& g = G();
+    // The masks in a host-visible staging buffer: (0, 0, 0, a) in every 8-bit RGBA/BGRA format.
+    const VkExtent2D extent = gVignette.Extent;
+    const VkDeviceSize layerBytes = static_cast<VkDeviceSize>(extent.width) * extent.height * 4U;
+    const VkDeviceSize bytes = layerBytes * kVignetteLevels;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    const auto fail = [&](const char* what, VkResult result) {
+        XRWARN("TRIAEVUM_XR_VIGNETTE failed=%s result=%d (no vignette this session)", what, static_cast<int>(result));
+        if (buffer != VK_NULL_HANDLE) vkDestroyBuffer(g.Device, buffer, nullptr);
+        if (memory != VK_NULL_HANDLE) vkFreeMemory(g.Device, memory, nullptr);
+        gVignetteFailed = true;
+        return false;
+    };
+    VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bufferInfo.size = bytes;
+    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkResult result = vkCreateBuffer(g.Device, &bufferInfo, nullptr, &buffer);
+    if (result != VK_SUCCESS) return fail("vkCreateBuffer", result);
+    VkMemoryRequirements requirements{};
+    vkGetBufferMemoryRequirements(g.Device, buffer, &requirements);
+    VkPhysicalDeviceMemoryProperties properties{};
+    vkGetPhysicalDeviceMemoryProperties(g.PhysicalDevice, &properties);
+    uint32_t type = UINT32_MAX;
+    constexpr VkMemoryPropertyFlags kWanted = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (uint32_t i = 0; i < properties.memoryTypeCount && type == UINT32_MAX; ++i)
+        if ((requirements.memoryTypeBits & (1U << i)) != 0U &&
+            (properties.memoryTypes[i].propertyFlags & kWanted) == kWanted)
+            type = i;
+    if (type == UINT32_MAX) return fail("memory_type", VK_ERROR_FEATURE_NOT_PRESENT);
+    VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocate.allocationSize = requirements.size;
+    allocate.memoryTypeIndex = type;
+    result = vkAllocateMemory(g.Device, &allocate, nullptr, &memory);
+    if (result != VK_SUCCESS) return fail("vkAllocateMemory", result);
+    result = vkBindBufferMemory(g.Device, buffer, memory, 0);
+    if (result != VK_SUCCESS) return fail("vkBindBufferMemory", result);
+    void* mapped = nullptr;
+    result = vkMapMemory(g.Device, memory, 0, bytes, 0, &mapped);
+    if (result != VK_SUCCESS) return fail("vkMapMemory", result);
+    auto* texels = static_cast<uint8_t*>(mapped);
+    for (uint32_t level = 0; level < kVignetteLevels; ++level) {
+        for (uint32_t row = 0; row < extent.height; ++row) {
+            for (uint32_t column = 0; column < extent.width; ++column) {
+                const float x = (static_cast<float>(column) + 0.5F) / static_cast<float>(extent.width) * 2.0F - 1.0F;
+                const float y = (static_cast<float>(row) + 0.5F) / static_cast<float>(extent.height) * 2.0F - 1.0F;
+                const float alpha = Logic::VignetteMaskAlpha(x, y, level, kVignetteLevels);
+                uint8_t* texel = texels + level * layerBytes + (static_cast<VkDeviceSize>(row) * extent.width + column) * 4U;
+                texel[0] = texel[1] = texel[2] = 0U;  // premultiplied black
+                texel[3] = static_cast<uint8_t>(std::lround(std::clamp(alpha, 0.0F, 1.0F) * 255.0F));
+            }
+        }
+    }
+    vkUnmapMemory(g.Device, memory);
+    const int index = AcquireAndWait(gVignette);
+    if (index < 0) {
+        vkDestroyBuffer(g.Device, buffer, nullptr);
+        vkFreeMemory(g.Device, memory, nullptr);
+        return false;  // tried again next display frame
+    }
+    CopySlot& slot = gVignette.Slots[static_cast<size_t>(index)];
+    VkCommandBuffer command = BeginSlot(slot);
+    const VkImage image = gVignette.Images[static_cast<size_t>(index)].image;
+    Barrier(command, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            kVignetteLevels);
+    VkBufferImageCopy copy{};
+    copy.bufferOffset = 0;
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, kVignetteLevels};
+    copy.imageExtent = {extent.width, extent.height, 1};
+    vkCmdCopyBufferToImage(command, buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    Barrier(command, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            kVignetteLevels);
+    vkEndCommandBuffer(command);
+    uint64_t signalled = 0;
+    const bool submitted = SubmitCopy(slot, 0, &signalled);
+    // Once per session: wait for the upload so the staging buffer can go.
+    if (submitted) vkWaitForFences(g.Device, 1, &slot.Fence, VK_TRUE, UINT64_MAX);
+    vkDestroyBuffer(g.Device, buffer, nullptr);
+    vkFreeMemory(g.Device, memory, nullptr);
+    if (!submitted) return fail("submit", VK_ERROR_UNKNOWN);
+    ReleaseImage(gVignette);
+    XRLOG("TRIAEVUM_XR_VIGNETTE ready levels=%u extent=%ux%u", kVignetteLevels, extent.width, extent.height);
+    return true;
 }
 
 bool PrepareFadeSwapchain() {
@@ -430,7 +536,7 @@ void CreateCopyResources() {
     pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pool.queueFamilyIndex = g.QueueFamily;
     Require(vkCreateCommandPool(g.Device, &pool, nullptr, &gCommandPool), "vkCreateCommandPool(xr)");
-    for (SwapchainState* swapchain : {&gQuad, &gEye, &gFade, &gHud}) {
+    for (SwapchainState* swapchain : {&gQuad, &gEye, &gFade, &gHud, &gVignette}) {
         swapchain->Slots.assign(swapchain->Images.size(), {});
         for (auto& slot : swapchain->Slots) {
             VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -783,6 +889,7 @@ void DestroyQuadSwapchain() {
     DestroySwapchain(gEye);
     DestroySwapchain(gFade);
     DestroySwapchain(gHud);
+    DestroySwapchain(gVignette);
     gHasShownViews = false;
 }
 
@@ -790,7 +897,7 @@ void DestroyVulkanObjects() {
     if (!Requested()) return;
     auto& g = G();
     if (g.Device == VK_NULL_HANDLE) return;
-    for (SwapchainState* swapchain : {&gQuad, &gEye, &gFade, &gHud}) {
+    for (SwapchainState* swapchain : {&gQuad, &gEye, &gFade, &gHud, &gVignette}) {
         for (auto& slot : swapchain->Slots)
             if (slot.Fence != VK_NULL_HANDLE) vkDestroyFence(g.Device, slot.Fence, nullptr);
         swapchain->Slots.clear();

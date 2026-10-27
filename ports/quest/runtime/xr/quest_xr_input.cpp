@@ -20,7 +20,8 @@ namespace {
 
 // SDL_GameControllerButton values (PadSnapshot::Buttons bit indices).
 constexpr uint32_t kA = 1U << 0, kB = 1U << 1, kX = 1U << 2, kY = 1U << 3, kBack = 1U << 4, kStart = 1U << 6,
-                   kRightStick = 1U << 8, kLeftShoulder = 1U << 9, kRightShoulder = 1U << 10;
+                   kRightStick = 1U << 8, kLeftShoulder = 1U << 9, kRightShoulder = 1U << 10,
+                   kDpadUp = 1U << 11, kDpadDown = 1U << 12;
 
 struct Actions {
     XrActionSet Set = XR_NULL_HANDLE;
@@ -41,6 +42,11 @@ Logic::PressLatch gLatch;
 // XR thread only.
 Logic::StickChords gChords;
 Logic::Pulse gSelectPulse, gMenuPulse;
+// In-world (W2): right stick flicks while the world shows (snap turns to the guest, D-pad pulses here).
+Logic::StickFlicks gFlicks;
+Logic::Pulse gDpadUpPulse, gDpadDownPulse;
+std::atomic<int32_t> gSnapTurns{0};
+std::atomic<float> gTurnAxis{0.0F};
 Logic::Hysteresis gGripL, gGripR;
 Logic::StickSourceTracker gStickSource;
 uint32_t gLoggedInputs = 0;
@@ -237,12 +243,32 @@ void SyncInput(XrTime) {
         PushSettingsKey();
         Haptic(true, false, 40);
     }
+    // In-world (inworld-spec §5.5, §7): while the world shows, right stick X flicks are snap turns (the
+    // guest applies them at Camera_Update) and Y flicks press the D-pad (up: TopScreen's first-person view);
+    // the game's C-stick sees nothing (TakePad).
+    if (WorldRequested() && RequestedLayerMode() == LayerMode::World) {
+        const auto flicks = gFlicks.Update(right.x, right.y);
+        if (flicks.Turn != 0) {
+            gSnapTurns.fetch_add(flicks.Turn);
+            XRLOG("TRIAEVUM_XR_FLICK axis=x dir=%s", flicks.Turn > 0 ? "right" : "left");
+        }
+        if (flicks.Vertical != 0) {
+            (flicks.Vertical > 0 ? gDpadUpPulse : gDpadDownPulse).Fire(now);
+            XRLOG("TRIAEVUM_XR_FLICK axis=y dir=%s dpad=%s", flicks.Vertical > 0 ? "up" : "down",
+                  flicks.Vertical > 0 ? "up" : "down");
+        }
+        gTurnAxis.store(std::isfinite(right.x) ? right.x : 0.0F);
+    } else {
+        gFlicks.Reset();
+        gTurnAxis.store(0.0F);
+    }
 
     PadSnapshot pad;
     pad.Buttons = (a ? kA : 0U) | (b ? kB : 0U) | (x ? kX : 0U) | (y ? kY : 0U) |
                   (gSelectPulse.Held(now) ? kBack : 0U) | (chords.StartHeld ? kStart : 0U) |
                   (gMenuPulse.Held(now) ? kRightStick : 0U) | (gripL ? kLeftShoulder : 0U) |
-                  (gripR ? kRightShoulder : 0U);
+                  (gripR ? kRightShoulder : 0U) | (gDpadUpPulse.Held(now) ? kDpadUp : 0U) |
+                  (gDpadDownPulse.Held(now) ? kDpadDown : 0U);
     // OpenXR thumbsticks are already Y up-positive, the PhysicalInputState convention.
     pad.LeftX = Logic::AxisToSdl(left.x);
     pad.LeftY = Logic::AxisToSdl(left.y);
@@ -275,6 +301,10 @@ void ReleaseInput() {
     gChords.Reset();
     gSelectPulse = {};
     gMenuPulse = {};
+    gDpadUpPulse = {};
+    gDpadDownPulse = {};
+    gFlicks.Reset();
+    gTurnAxis.store(0.0F);
     gGripL.On = gGripR.On = false;
     gStickSource = {};
     std::lock_guard lock(gPadMutex);
@@ -295,6 +325,10 @@ bool TakePad(PadSnapshot* pad) {
     if (WorldRequested() && RequestedLayerMode() == LayerMode::World) pad->RightX = pad->RightY = 0;
     return true;
 }
+
+int32_t TakeSnapTurns() { return gSnapTurns.exchange(0); }
+
+float WorldTurnAxis() { return gTurnAxis.load(); }
 
 void Haptic(bool left, bool right, int milliseconds) {
     if (!gHapticsBound || G().Session == XR_NULL_HANDLE) return;

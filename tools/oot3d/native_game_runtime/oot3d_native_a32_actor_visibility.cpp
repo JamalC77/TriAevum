@@ -114,6 +114,16 @@ bool Extends(const ActorCullingVolume& volume) {
     return volume.DistanceMultiplier > 1.0F || volume.Horizontal > 1.0F || volume.Vertical > 1.0F;
 }
 
+// R_always (in-world mode R): the actor's world position (+0x28) within the radius of the head.
+bool NearVrHead(MemoryBus& memory, uint32_t actor, const NativeActorVisibilityState& v) {
+    if (!v.VrAlways || !(v.VrAlwaysRadius > 0.0F)) return false;
+    std::array<float, 3> world{};
+    for (uint32_t i = 0; i < world.size(); ++i)
+        if (!ReadFloat(memory, actor + 0x28U + i * 4U, world[i]) || !std::isfinite(world[i])) return false;
+    const float dx = world[0] - v.VrHead[0], dy = world[1] - v.VrHead[1], dz = world[2] - v.VrHead[2];
+    return dx * dx + dy * dy + dz * dz <= v.VrAlwaysRadius * v.VrAlwaysRadius;
+}
+
 
 // The native arena is Graph_ThreadEntry's scratch buffer. Validate the live
 // bounds on every admission; an epoch counter is never used as free space.
@@ -140,7 +150,7 @@ bool ReadLightUsage(MemoryBus& memory, uint32_t arena, uint32_t& used) {
 // cursor into a separate overflow region instead, as 3.0 (0x005D11A0) keeps
 // every lit actor drawable. Native resets the cursor each frame.
 void RelieveLightArena(uint32_t arena, NativeActorVisibilityState& v) {
-    if (!v.ExtendedDrawDistance || v.HostMemory == nullptr || arena == 0U) return;
+    if (!(v.ExtendedDrawDistance || v.VrAlways) || v.HostMemory == nullptr || arena == 0U) return;
     auto& host = *v.HostMemory;
     uint32_t size = 0, base = 0, tail = 0;
     if (!host.Read32(arena, &size) || !host.Read32(arena + 4U, &base) ||
@@ -227,7 +237,7 @@ bool PrioritySample(MemoryBus& memory, uint32_t actor, const std::array<float, 1
 }
 
 void BeginBudgetWalk(GuestState& state, MemoryBus& memory, NativeActorVisibilityState& v) {
-    v.BudgetWalk = v.ExtendedDrawDistance;
+    v.BudgetWalk = v.ExtendedDrawDistance || v.VrAlways;
     v.BudgetValid = false;
     v.Reservations.clear();
     v.RemainingLights = 0U;
@@ -273,10 +283,13 @@ void BeginBudgetWalk(GuestState& state, MemoryBus& memory, NativeActorVisibility
             ActorCullingSample sample;
             if (init == 0U && entry.Draw != 0U && entry.Id != kActorEnViewer &&
                 PrioritySample(memory, actor, matrix, sample) &&
-                !ActorInsideNativeCullingVolume(sample) &&
-                ActorInsideExtendedCullingVolume(sample, v.CullingVolume)) {
-                candidates.push_back({identity, sample.X * sample.X + sample.Y * sample.Y + sample.Z * sample.Z,
-                    retained != v.Retained.end(), false});
+                !ActorInsideNativeCullingVolume(sample)) {
+                const bool extended = ActorInsideExtendedCullingVolume(sample, v.CullingVolume);
+                const bool nearHead = !extended && NearVrHead(memory, actor, v);
+                if (nearHead) ++v.VrAlwaysCandidates;
+                if (extended || nearHead)
+                    candidates.push_back({identity, sample.X * sample.X + sample.Y * sample.Y + sample.Z * sample.Z,
+                        retained != v.Retained.end(), false});
             }
             actor = next;
         }
@@ -375,17 +388,21 @@ void ApplyActorCulling(GuestState& state, MemoryBus& memory, NativeActorVisibili
                      visibility.LightAllocations, visibility.PreviousLightAllocations, visibility.PeakLightAllocations,
                      static_cast<unsigned long long>(visibility.LightOverflowRelocations),
                      static_cast<unsigned long long>(visibility.LightOverflowWraps));
-    if (!Extends(volume)) return;
+    const bool nearHead = NearVrHead(memory, actor, visibility);
+    if (!Extends(volume) && !nearHead) return;
     uint16_t id = 0U;
     ActorCullingSample sample;
     uint8_t nativeState = 0U;
     if (!memory.Read16(actor, &id) || id == kActorEnViewer || !ReadCullingSample(memory, actor, sample) ||
         !memory.Read8(actor + kActorCullingState, &nativeState))
         return;
-    const auto classified = ClassifyExtendedActorCulling(sample, volume);
-    if (visibility.ExtendedDrawDistance) {
-        if (classified == ActorCullingClass::Inside)
-            (void)ApplyBudgetedCulling(state, memory, visibility, nativeState);
+    auto classified = ClassifyExtendedActorCulling(sample, volume);
+    const bool rescue = nearHead && classified != ActorCullingClass::Inside;
+    if (rescue) classified = ActorCullingClass::Inside;
+    if (visibility.ExtendedDrawDistance || visibility.VrAlways) {
+        if (classified == ActorCullingClass::Inside &&
+            ApplyBudgetedCulling(state, memory, visibility, nativeState) && rescue)
+            ++visibility.VrAlwaysGranted;
         return;
     }
     const auto next = static_cast<uint8_t>(classified);

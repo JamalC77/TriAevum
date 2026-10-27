@@ -214,6 +214,8 @@ class Oot3dPicaVisualFrameAccumulator final {
                  std::span<const uint32_t> displayOutputs,
                  std::span<const Oot3dPicaViewportState> continuationViewports = {});
     size_t PendingDrawCount() const;
+    // The sequence the next finished frame will carry (the frame being recorded now).
+    [[nodiscard]] uint64_t NextSequence() const noexcept { return mNextSequence; }
     // Live plans the accumulator has not published as a frame yet. They still
     // pin the copy versions their textures reference.
     [[nodiscard]] std::span<const Oot3dPicaVulkanDrawPlan> PendingDraws()

@@ -139,6 +139,16 @@ void RequestBlink(uint32_t rigEpoch, uint32_t fadeMs);
 const char* LayerModeName(LayerMode mode);
 // Haptic pulse: hand 0 left, 1 right, 2 both.
 void Pulse(int hand, uint32_t milliseconds);
+// W2 (§3.1, §4.4, §5.5, §5.7). Head inside geometry: 0..1 of black over the world while it shows
+// (combined with the transition fade by max). Vignette: 0..1, a VIEW-locked radial mask while the world
+// shows. Both any thread, applied on the next display frame.
+void SetWallFade(float alpha);
+void SetVignette(float strength);
+// Right stick X flicks (> 0.7, re-armed below 0.3) while the world shows, since the last take: + right,
+// - left (snap turns, §5.5). Its Y flicks press the D-pad (up / down) for the game instead (§7).
+int32_t TakeSnapTurns();
+// The right stick's X while the world shows (the smooth-turn option, TRIAEVUM_XR_TURN=smooth); 0 else.
+float WorldTurnAxis();
 
 }  // namespace TriAevumQuestXr
 

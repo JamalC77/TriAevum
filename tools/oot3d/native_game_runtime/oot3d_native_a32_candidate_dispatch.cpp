@@ -627,7 +627,13 @@ bool ExecuteTopScreenUiSourcePortBlock(
               {play, static_cast<std::int16_t>(cameraSetting),
                static_cast<std::int16_t>(cameraIndex)});
     }
-    if (!dispatch.TopScreenCamera.Camera.Enabled) {
+    // Mode R (inworld-spec §4.2): with the in-world source installed the phases run whenever it owns
+    // an update, whatever TopScreen's own free-camera option says.
+    if (dispatch.TopScreenCamera.Phase ==
+        Oot3dNativeGame::TopScreenCameraGuestPhase::Idle)
+      dispatch.TopScreenCamera.Vr = dispatch.VrCamera.get();
+    if (!dispatch.TopScreenCamera.Camera.Enabled &&
+        dispatch.TopScreenCamera.Vr == nullptr) {
       dispatch.TopScreenExtendedCameraActive = false;
       return false;
     }
@@ -734,7 +740,7 @@ bool ExecuteTopScreenUiSourcePortBlock(
                             dispatch.TopScreenCamera.ScratchAddress + 0x30U);
     case Oot3dNativeGame::TopScreenCameraGuestPhase::Collision:
       if (!Oot3dNativeGame::CommitTopScreenFreeCameraCollision(
-              memory, &dispatch.TopScreenCamera))
+              memory, &dispatch.TopScreenCamera, nullptr, state.r[0]))
         return false;
       return branchToNative(Oot3dNativeGame::kTopScreenCameraQuakeUpdate,
                             dispatch.TopScreenCamera.CameraAddress,
@@ -774,6 +780,20 @@ bool ExecuteTopScreenUiSourcePortBlock(
     std::uint32_t nativeFovBits = 0U;
     if (!memory.Read32(state.r[4] + 0x10U, &nativeFovBits)) {
       return false;
+    }
+    // Mode R (inworld-spec §4.2 FovScalar row): while the head owned the last main-camera update the
+    // view's FOV is the cull FOV, unclamped (both TopScreen and the native code clamp to 20..110).
+    float vrFov = 0.0F;
+    if (dispatch.VrCamera != nullptr &&
+        dispatch.VrCamera->Fov(std::bit_cast<float>(nativeFovBits), &vrFov)) {
+      state.vfp[16] = std::bit_cast<std::uint32_t>(vrFov);
+      nextPc = pc + 4U;
+      state.r[15] = nextPc;
+      *result = {oot3d::recomp::a32::ExitKind::Branch, nextPc,
+                 oot3d::recomp::a32::FallbackReason::None, pc};
+      if (blocksConsumed != nullptr)
+        *blocksConsumed = 1U;
+      return true;
     }
     const float resolvedFov = Oot3dNativeGame::ResolveTopScreenCameraFovDegrees(
         std::bit_cast<float>(nativeFovBits),

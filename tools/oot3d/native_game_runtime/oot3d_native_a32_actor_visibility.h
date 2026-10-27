@@ -8,6 +8,7 @@
 #include "fast/oot3d/scene_presentation_policy.h"
 #include "recomp/a32_runtime.h"
 
+#include <array>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -109,6 +110,15 @@ struct NativeActorVisibilityState {
     bool BudgetValid = false;
     std::vector<NativeActorVisibilityReservation> Reservations;
     std::vector<NativeActorVisibilityRetention> Retained;
+    // In-world mode R (quest-research/inworld-spec.md §6, R_always): while the head owns the game camera, an
+    // actor within VrAlwaysRadius of the head (game world, u) is drawn although the culling volume rejects
+    // it, through the budgeted path (the walk runs its light budget for it whatever ExtendedDrawDistance
+    // says). Written at Camera_Update by the XR session, on the same guest thread.
+    bool VrAlways = false;
+    std::array<float, 3> VrHead{};
+    float VrAlwaysRadius = 0.0F;
+    uint64_t VrAlwaysCandidates = 0U;  // natively culled actors near the head offered to the budget walk
+    uint64_t VrAlwaysGranted = 0U;     // ... drawn through the extension
 };
 
 // A standalone save must wait until temporary guest culling fields have

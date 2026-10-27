@@ -569,7 +569,10 @@ struct NativeCandidateDispatchState {
   bool TopScreenPauseAotBarrier = false;
   bool TopScreenExtendedCameraActive = false;
   Oot3dNativeGame::TopScreenFreeCameraGuestRuntime TopScreenCamera;
-  // Developer free camera (inactive unless F1 > Dev Tools turns it on).
+  // In-world mode R (inworld-spec §4.2): the head-driven camera source, installed by window setup in the
+  // immersive world mode with the TopScreen profile; TopScreenCamera.Vr points at it at every
+  // Camera_Update entry (a savestate load resets TopScreenCamera).
+  std::shared_ptr<Oot3dNativeGame::TopScreenVrCameraSource> VrCamera;
   std::shared_ptr<Oot3dNativeGame::DevFreeCamera> DevFreeCamera =
       std::make_shared<Oot3dNativeGame::DevFreeCamera>();
   bool DevFreeCameraReported = false;

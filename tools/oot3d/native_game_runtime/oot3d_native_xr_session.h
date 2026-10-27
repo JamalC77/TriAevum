@@ -1,25 +1,34 @@
-// oot3d_native_xr_session.h: the guest side of the in-world mode's first light (quest-research/inworld-spec.md
-// §3.4, §4.1, §4.3, §5.2-5.4, W1 day 4). Immersive world mode only (TRIAEVUM_XR_VIEW=world); everything runs on
-// the guest (game) thread except the atomics the render worker reports through.
+// oot3d_native_xr_session.h: the guest side of the in-world mode (quest-research/inworld-spec.md §3.4, §4,
+// §5, §7; W1 first light, W2 mode R). Immersive world mode only (TRIAEVUM_XR_VIEW=world); everything runs
+// on the guest (game) thread except the atomics the render worker reports through.
 //
 //  - Tick-locked pacing: p_N = p_{N-1} + 3 on a 90 Hz display, presentation time from ticks, the target
 //    display time T_N = DisplayTime(p_N + shown latency) the eyes are predicted for.
-//  - The W1 state (World / Cinema / Black) from the guest snapshot and the frame facts, with the layer
+//  - The layer state (World / Cinema / Black) from the guest snapshot and the frame facts, with the layer
 //    mode requests and TRIAEVUM_XR_CAMERA / TRIAEVUM_XR_FLAGS logs.
 //  - The rig: placement (first, recenter, Cinema exit, doors, scene changes), the leash blink and idle
-//    re-centre, the floor (grounded / swimming); TRIAEVUM_XR_RIG on every change.
-//  - The frame state each render command is drawn with, and TRIAEVUM_XR_TICK every 5 s.
+//    re-centre, the floor (grounded / swimming), snap turns; TRIAEVUM_XR_RIG on every change.
+//  - Mode R (W2, TRIAEVUM_XR_CAMERA=r, the default with the TopScreen profile): at every main-camera
+//    Camera_Update (VrCameraSource, oot3d_native_vr_camera.h) the owner decision of §4.3, the camera write
+//    from the head predicted for T_N, the head-in-geometry segment and its wall fade, the placement probes
+//    that hold a placement in Black, the cutscene-camera motion test, R_always for the actor culling.
+//  - The stick (§7): the Circle Pad of each guest refresh rotated from the camera yaw to psi_ref.
+//  - The frame state each render command is drawn with, and TRIAEVUM_XR_TICK / _CAMWRITE every 5 s.
 #pragma once
 
 #include "oot3d_native_xr_guest_snapshot.h"
+#include "oot3d_xr_camera_logic.h"
 #include "oot3d_xr_world_logic.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
 
 namespace Oot3dNativeGame {
+
+struct NativeActorVisibilityState;
 
 // What the render command of one host frame needs (captured by value, inworld-spec §4.5).
 struct XrFrameState {
@@ -48,10 +57,42 @@ struct XrHostSignals {
     bool HostGui = false;  // F1, the menu bar, the in-game menu
 };
 
+// Who drives the main camera in world mode (TRIAEVUM_XR_CAMERA).
+enum class XrCameraMode : uint8_t {
+    Native,  // W1: no Camera_Update hook, no stick rotation (A/B against mode R)
+    ModeR,   // W2: the head owns the camera through the TopScreen phases (§4.2)
+    Held,    // mode L (ladder I2): the native camera, the rig live, the stick rotated (§7)
+};
+const char* XrCameraModeName(XrCameraMode mode);
+
+// One main-camera Camera_Update as VrCameraSource read it (game world).
+struct XrCameraGuest {
+    bool MainCamera = false;
+    uint32_t Camera = 0, PlayState = 0;
+    XrMath::Vec3 CameraEye, CameraAt;  // the camera's current eye/at (+0x8C/+0x80)
+    XrMath::Vec3 ViewEye, ViewAt;      // the play view (+0x1B8/+0x1C4): whichever camera drew last
+    float ViewFov = 0.0F;              // play+0x198
+    int16_t Status = 7, Setting = 0;
+};
+// What the host does with that update.
+struct XrCameraUpdate {
+    bool Own = false;
+    bool Probe = false;                 // a placement probe: the camera holds where it is
+    XrCamera::GeometrySegment Segment;  // the update's one BgCheck segment
+    XrCamera::CameraWrite Write;
+    float FovDegrees = 0.0F;
+};
+
 class XrWorldSession {
   public:
     // Null unless the immersive world mode is on (Quest build, TRIAEVUM_XR=1, TRIAEVUM_XR_VIEW=world).
     static std::unique_ptr<XrWorldSession> Create();
+
+    // Window setup, once: the camera mode from TRIAEVUM_XR_CAMERA and whether the TopScreen profile (the
+    // only one with an observable Camera_Update) is active. True: install a VrCameraSource.
+    bool ConfigureCamera(bool topScreenProfile);
+    XrCameraMode CameraMode() const { return mCameraMode; }
+    void SetActorVisibility(NativeActorVisibilityState* actors) { mActors = actors; }
 
     // RunFrame start: the tick-locked presentation step. True: `elapsedSeconds` is the presentation time
     // of this frame from the display ticks; false: no display clock (use the steady clock).
@@ -61,9 +102,24 @@ class XrWorldSession {
     // time was discarded and its tick never waited for, so the pace restarts from the display clock.
     void NoteHeldFrame();
 
-    // Once per completed visual frame (PresentVisualFrame, beside the actor interactions).
-    void StampFrame(const XrGuestSnapshot& snapshot, const XrFrameFacts& facts, const XrHostSignals& host);
+    // Once per completed visual frame (PresentVisualFrame, beside the actor interactions). `sequence` is
+    // the visual frame's (the camera write it was drawn with carried the sequence being recorded).
+    void StampFrame(const XrGuestSnapshot& snapshot, const XrFrameFacts& facts, const XrHostSignals& host,
+                    uint64_t sequence = 0);
     XrFrameState FrameState() const { return mState; }
+
+    // Mode R, at every main-camera Camera_Update entry (guest thread, VrCameraSource). `recording` is the
+    // visual-frame sequence being recorded.
+    XrCameraUpdate BeginCameraUpdate(const XrGuestSnapshot& snapshot, const XrCameraGuest& camera,
+                                     uint64_t recording);
+    // The update's BgCheck result: the collided end of the segment Begin returned.
+    void CommitCameraUpdate(const XrMath::Vec3& collided);
+    void NoteCameraQuake(bool active);
+    // FovScalar of the main view: the cull FOV while the head owned the last main-camera update.
+    bool CameraFov(float loaded, float* degrees);
+
+    // §7: the Circle Pad of one guest refresh (SampleGuestRefreshInput), rotated in place.
+    void RotateStick(const XrGuestSnapshot& snapshot, bool ocarina, int16_t& x, int16_t& y);
 
     // Render worker reports (atomics).
     void NoteRenderSafety(bool fallbackFrames) { mRenderSafety.store(fallbackFrames); }
@@ -75,18 +131,35 @@ class XrWorldSession {
     void NoteHorizon(double milliseconds);
     void NotePredictFailure() { mPredictFailures.fetch_add(1); }
 
-    // Every 5 s (guest thread): TRIAEVUM_XR_TICK.
+    // Every 5 s (guest thread): TRIAEVUM_XR_TICK, TRIAEVUM_XR_CAMWRITE.
     void LogPeriodic(double audioBufferedMs);
     double Scale() const { return mScale; }
 
   private:
+    struct ProbeOutcome {
+        bool Used = false;
+        XrCamera::ProbeChoice Choice;
+        bool TimedOut = false;
+    };
     XrWorldSession() = default;
-    void Place(const XrGuestSnapshot& snapshot, const char* reason, double now);
+    double Now() const;
+    void Place(const XrGuestSnapshot& snapshot, const char* reason, double now, const ProbeOutcome* probes = nullptr);
+    void StartPlacement(const XrGuestSnapshot& snapshot, const char* reason, double now);
+    void FinishPendingPlacement(const XrGuestSnapshot& snapshot, double now, bool force);
+    void ApplyRigInputs(const XrGuestSnapshot& snapshot, double now, double dt);
     void BumpEpoch(const char* event, double distanceM);
     void LogRig(const char* event, double distanceM);
     void LogFlags(const XrGuestSnapshot& snapshot, const char* reason);
+    void LogDecision(const XrCamera::OwnerDecision& decision, const XrGuestSnapshot& snapshot,
+                     const XrCameraGuest& camera);
+    void SetWallFade(double fade);
+    void SetVignette(double strength);
+    void PublishActorHead(bool valid, const XrMath::Vec3& head);
     XrMath::Vec3 LinkVrWorld(const XrGuestSnapshot& snapshot, bool floor) const;
     bool HeadInTracking(XrMath::Pose* head) const;
+    bool HeadAt(int64_t displayTimeNs, XrMath::Pose* head) const;
+    bool HookLive(double now) const { return mModeR && mLastCameraUpdate >= 0.0 && now - mLastCameraUpdate < 0.25; }
+    double ProbeLengthM() const;
 
     XrFrameState mState;
     XrWorld::XrTickPacer mPacer;
@@ -104,9 +177,10 @@ class XrWorldSession {
     bool mCentreSet = false;   // unbounded spaces: the head at the first placement
     double mScale = XrMath::kDefaultScale;
     double mPlaceM = XrMath::kDefaultPlaceDistanceM;  // TRIAEVUM_XR_PLACE_M: head to Link at placements
-    double mSeatY = 0.0;       // LOCAL: the floor 1.65 m below the origin
+    double mSeatY = 0.0;       // LOCAL: the floor 1.65 m below the origin; seated: plus the seat offset
     double mEyeHeightM = 1.6;  // the head over the virtual floor at the last placement
     bool mBounded = false;
+    bool mSeated = false;      // TRIAEVUM_XR_SEATED=1 (§5.6)
     double mLastStamp = -1.0;
     uint32_t mLastFlags1 = 0, mLastFlags2 = 0;
     int16_t mLastSetting = -1;
@@ -122,6 +196,54 @@ class XrWorldSession {
     std::atomic<double> mHorizonSum{0.0}, mHorizonMax{0.0};
     std::atomic<bool> mRenderSafety{false};
     std::atomic<bool> mRenderSafetyReset{false};
+
+    // ---- Mode R and the W2 rig inputs (guest thread)
+    XrCameraMode mCameraMode = XrCameraMode::Native;
+    bool mModeR = false;                // the hook is installed
+    bool mStickEnabled = false;
+    double mCullFov = XrCamera::kDefaultCullFovDegrees;
+    XrCamera::MoveReference mMoveRef = XrCamera::MoveReference::HeadLatched;
+    double mTurnDegrees = XrMath::kDefaultSnapDegrees;
+    bool mSmoothTurn = false;
+    double mSmoothTurnDegreesPerSecond = 90.0;
+    double mLastCameraUpdate = -1.0;
+    double mLastRigInputs = -1.0;
+    XrCamera::OwnerDecision mDecision;
+    bool mDecisionLogged = false;
+    XrCamera::OwnerDecision mLoggedDecision;
+    bool mOwnedLast = false;            // the last main-camera update was head-owned (FovScalar)
+    bool mFirstWriteLogged = false;
+    XrCamera::CameraWrite mWrite;
+    XrCamera::GameHead mHeadGame;
+    XrMath::Vec3 mProbeFrom;
+    int mProbeIndex = -1;
+    XrCamera::HeadInGeometry mGeometry;
+    uint32_t mGeometryEpoch = UINT32_MAX;
+    double mWallFade = 0.0;
+    XrCamera::PlacementProbes mProbes;
+    struct PendingPlacement {
+        bool Active = false;
+        const char* Reason = "";
+        double Since = 0.0;
+    } mPending;
+    XrCamera::CutsceneCameraMonitor mCutsceneMonitor;
+    bool mCutsceneMoving = false;
+    uint32_t mHeldStaticRun = 0;        // consecutive Held-static main-camera updates
+    XrCamera::StickReference mStick;
+    double mLastStickTime = -1.0;
+    double mLastStickLog = -1.0;
+    double mVignette = 0.0;
+    double mAnchorSpeedMps = 0.0, mYawRate = 0.0;
+    uint64_t mRecordingSequence = 0;
+    NativeActorVisibilityState* mActors = nullptr;
+    bool mActorHeadPublished = false;
+    std::array<uint64_t, 13> mHeldEntries{};
+    // 5 s counters.
+    uint64_t mCamUpdates = 0, mCamOwned = 0, mCamProbes = 0, mCamHeld = 0, mHeadFailures = 0, mFovHooks = 0,
+             mWallFadeUpdates = 0, mStickRotations = 0, mStickBypassed = 0, mTurns = 0, mQuakes = 0,
+             mSeqSamples = 0, mProbeRuns = 0;
+    double mSeqLagSum = 0.0, mThetaAbsMax = 0.0;
+    float mFovLoaded = 0.0F;
 };
 
 }  // namespace Oot3dNativeGame

@@ -135,7 +135,22 @@ bool BeginTopScreenFreeCameraGuestUpdate(
   runtime->LastOwnershipInput = input;
   runtime->LastOwnershipBlockers =
       ResolveTopScreenFreeCameraBlockers(input);
-  *active = UpdateTopScreenFreeCameraOwnership(runtime->Camera, input);
+  if (runtime->Vr != nullptr) {
+    // Mode R: the host source decides alone; TopScreen's orbit stays off.
+    TopScreenVrCameraBegin begin;
+    begin.CameraAddress = cameraAddress;
+    begin.GlobalContextAddress = globalContext;
+    begin.PlayerAddress = player;
+    begin.Ownership = input;
+    begin.At = at;
+    begin.Eye = eye;
+    runtime->Camera.Active = false;
+    *active = runtime->Vr->Begin(memory, begin) && player != 0U;
+    runtime->VrOwned = *active;
+  } else {
+    *active = UpdateTopScreenFreeCameraOwnership(runtime->Camera, input);
+    runtime->VrOwned = false;
+  }
   runtime->OutAddress = outAddress;
   runtime->CameraAddress = cameraAddress;
   runtime->GlobalContextAddress = globalContext;
@@ -295,6 +310,16 @@ bool PrepareTopScreenFreeCameraCollision(
   std::array<std::uint8_t, 20> world{};
   if (!memory.ReadBytes(player + 0x28U, world) ||
       !memory.WriteBytes(camera + 0xDCU, world)) return false;
+  if (runtime->VrOwned && runtime->Vr != nullptr) {
+    // Mode R: no orbit; the one BgCheck segment of this update is the source's (§4.4).
+    const auto segment = runtime->Vr->Segment();
+    if (!WriteVec3(memory, runtime->ScratchAddress + kAtScratchOffset,
+                   segment.From) ||
+        !WriteVec3(memory, runtime->ScratchAddress + kEyeScratchOffset,
+                   segment.To)) return false;
+    runtime->Phase = TopScreenCameraGuestPhase::Collision;
+    return true;
+  }
   const auto orbit = BuildTopScreenFreeCameraOrbit(
       runtime->Camera,
       {position, currentAt, currentEye, linkAge != 0U,
@@ -311,11 +336,32 @@ bool PrepareTopScreenFreeCameraCollision(
 
 bool CommitTopScreenFreeCameraCollision(
     NativeA32Memory &memory, TopScreenFreeCameraGuestRuntime *runtime,
-    std::string *error) {
+    std::string *error, std::uint32_t bgCheckResult) {
   if (runtime == nullptr ||
       runtime->Phase != TopScreenCameraGuestPhase::Collision) {
     SetError(error, "TopScreen camera collision commit phase mismatch");
     return false;
+  }
+  if (runtime->VrOwned && runtime->Vr != nullptr) {
+    // Mode R: no lerp, no collision applied; the camera is the source's (the head, or kept in place
+    // during a placement probe).
+    TopScreenCameraVec3 collided;
+    if (!ReadVec3(memory, runtime->ScratchAddress + kEyeScratchOffset,
+                  &collided)) return false;
+    runtime->VrWrite = runtime->Vr->Commit(collided, bgCheckResult);
+    const auto camera = runtime->CameraAddress;
+    const auto global = runtime->GlobalContextAddress;
+    const auto &write = runtime->VrWrite;
+    if (!WriteVec3(memory, camera + 0x80U, write.At) ||
+        !WriteVec3(memory, camera + 0x8CU, write.Eye) ||
+        !WriteVec3(memory, camera + 0xA4U, write.Eye) ||
+        !WriteVec3(memory, global + 0x1C4U, write.At) ||
+        !WriteVec3(memory, global + 0x1B8U, write.Eye)) return false;
+    std::array<std::uint8_t, 0x24> zeroShake{};
+    if (!memory.WriteBytes(runtime->ScratchAddress + kShakeScratchOffset,
+                           zeroShake)) return false;
+    runtime->Phase = TopScreenCameraGuestPhase::Quake;
+    return true;
   }
   TopScreenCameraVec3 intendedAt;
   TopScreenCameraVec3 intendedEye;
@@ -353,6 +399,27 @@ bool ApplyTopScreenFreeCameraQuake(
     return false;
   }
   const auto global = runtime->GlobalContextAddress;
+  if (runtime->VrOwned && runtime->Vr != nullptr) {
+    // Mode R: shake offsets are ignored (the source may pulse instead); the cull FOV goes to the play
+    // view unclamped, the head's angles to the returned and stored camera directions.
+    runtime->Vr->Quake(quakeActive);
+    const auto &write = runtime->VrWrite;
+    const auto pitch = static_cast<std::uint16_t>(write.Pitch);
+    const auto yaw = static_cast<std::uint16_t>(write.Yaw);
+    if (!WriteVec3(memory, global + 0x1D0U, {0.0F, 1.0F, 0.0F}) ||
+        !WriteFloat(memory, global + 0x198U, write.FovDegrees) ||
+        !memory.Write16(runtime->OutAddress, pitch) ||
+        !memory.Write16(runtime->OutAddress + 2U, yaw) ||
+        !memory.Write16(runtime->OutAddress + 4U, 0U) ||
+        !memory.Write16(runtime->CameraAddress + 0x17CU, pitch) ||
+        !memory.Write16(runtime->CameraAddress + 0x17EU, yaw) ||
+        !memory.Write16(runtime->CameraAddress + 0x180U, 0U) ||
+        !memory.Write16(runtime->CameraAddress + 0x182U, pitch) ||
+        !memory.Write16(runtime->CameraAddress + 0x184U, yaw) ||
+        !memory.Write16(runtime->CameraAddress + 0x186U, 0U)) return false;
+    runtime->Phase = TopScreenCameraGuestPhase::CameraData;
+    return true;
+  }
   std::uint16_t cameraSetting = 0U;
   float viewFov = 0.0F;
   if (!memory.Read16(runtime->CameraAddress + 0x18AU, &cameraSetting) ||
@@ -466,6 +533,8 @@ void ResetTopScreenFreeCameraGuestUpdate(
   runtime->RightStickX = 0;
   runtime->RightStickY = 0;
   runtime->RelativeInput = false;
+  // The mode-R source stays installed; only this update's ownership ends.
+  runtime->VrOwned = false;
 }
 
 } // namespace Oot3dNativeGame

@@ -58,6 +58,7 @@
 #include "oot3d_native_pica_visual_frame.h"
 #include "oot3d_native_pica_visual_savestate.h"
 #include "oot3d_native_pica_vulkan_bridge.h"
+#include "oot3d_native_vr_camera.h"
 #include "oot3d_native_xr_view.h"
 #include "oot3d_native_pica_vulkan_plan.h"
 #include "oot3d_native_player_temporal_bridge.h"

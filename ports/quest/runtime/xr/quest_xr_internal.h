@@ -120,6 +120,13 @@ uint32_t FadeLevels();
 XrSwapchain HudSwapchain();        // XR_NULL_HANDLE when the HUD is off
 VkExtent2D HudSwapchainExtent();
 bool HudReleased();                // a HUD image was copied and released (the layer may show it)
+// W2 (§5.7): the vignette, a static array of radial masks (layer k = strength k / (levels - 1)), built
+// once on the XR thread from a staging buffer.
+bool PrepareVignetteSwapchain();   // XR thread: uploads the masks once; true when usable
+bool VignetteReady();
+XrSwapchain VignetteSwapchain();
+VkExtent2D VignetteExtent();
+uint32_t VignetteLevels();
 bool ShownViews(Fast::StereoViews* views);  // XR thread: the poses of the pair on the eye swapchain
 uint32_t LatestPublishedRigEpoch();         // any thread: the highest RigEpoch PublishStereo received
 struct SinkStats {

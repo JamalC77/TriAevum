@@ -956,6 +956,22 @@ void NativeA32WindowSession::Setup() {
     xrViewRenderer = Oot3dNativeGame::XrViewRenderer::Create(worldMode);
     xrWorld = Oot3dNativeGame::XrWorldSession::Create();
     if (xrWorld != nullptr && xrViewRenderer != nullptr) xrViewRenderer->SetScale(xrWorld->Scale());
+    // Mode R (inworld-spec §4.2, W2): the head owns the game camera through the TopScreen phases, the only
+    // profile with an observable Camera_Update; other profiles run Held everywhere (mode L).
+    const bool topScreenProfile = launch.UiProfile == Oot3dNativeGame::Oot3dUiProfile::TopScreen;
+    nativeCandidateDispatch.VrCamera.reset();
+    if (xrWorld != nullptr) {
+      xrWorld->SetActorVisibility(&widescreenProjection.ActorVisibility);
+      if (xrWorld->ConfigureCamera(topScreenProfile)) {
+        auto source = Oot3dNativeGame::VrCameraSource::ForSession(xrWorld.get());
+        source->SetSequenceSource([this] { return picaPresentationScheduler.NextSequence(); });
+        nativeCandidateDispatch.VrCamera = std::move(source);
+      }
+    } else if (xrViewRenderer != nullptr && xrViewRenderer->Preview() && topScreenProfile) {
+      // The PC preview's circle head drives the game camera (W2 day 5); other heads leave it native.
+      nativeCandidateDispatch.VrCamera = Oot3dNativeGame::VrCameraSource::ForPreview(
+          xrViewRenderer->PreviewConfig().Head, xrViewRenderer->Scale(), &widescreenProjection.ActorVisibility);
+    }
   }
   programPreparation =
       dynamic_cast<Fast::Renderer3ds::PicaProgramPreparationBackend *>(&api);

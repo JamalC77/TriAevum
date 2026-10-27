@@ -129,6 +129,10 @@ public:
   Oot3dPicaPresentationSchedulerState CaptureState() const;
   bool RestoreState(Oot3dPicaPresentationSchedulerState state);
   size_t PendingDrawCount() const;
+  // The visual-frame sequence being recorded (in-world stamping, inworld-spec §4.5).
+  [[nodiscard]] uint64_t NextSequence() const noexcept {
+    return mAccumulator.NextSequence();
+  }
   // Live plans not yet published as a frame: their copy references still pin
   // the GPU copy versions they sampled.
   [[nodiscard]] std::span<const Oot3dPicaVulkanDrawPlan> PendingDraws()

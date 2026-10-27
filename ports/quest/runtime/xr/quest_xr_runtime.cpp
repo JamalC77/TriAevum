@@ -106,6 +106,10 @@ std::atomic<bool> gRecenterRequested{false};
 
 // ---- in-world state (inworld-spec §3)
 std::atomic<uint32_t> gWorldRecenters{0};
+// W2: head inside geometry (black over the world by max with the transition fade) and the vignette
+// strength (§4.4, §5.7); written by the guest thread, read by the XR thread each display frame.
+std::atomic<float> gWallFade{0.0F};
+std::atomic<float> gVignette{0.0F};
 // Written at StartSession and when a STAGE reference-space change redraws the boundary (XR thread);
 // read by the guest thread at each placement.
 std::mutex gPlayAreaMutex;
@@ -512,6 +516,8 @@ void PollEvents() {
 struct FrameStats {
     uint64_t DisplayFrames = 0, ShouldRenderFalse = 0;
     double WaitFrameMsMax = 0.0, BeginFrameMsMax = 0.0;
+    uint64_t WallFadeFrames = 0, VignetteFrames = 0;  // in-world W2: display frames with each overlay
+    float WallFadeMax = 0.0F, VignetteMax = 0.0F;
 };
 
 void LogStats(FrameStats& frames) {
@@ -547,6 +553,11 @@ void LogStats(FrameStats& frames) {
         gHudPlacementsLogged = 0;
         gHudShownFrames = 0;
     }
+    if (WorldRequested())
+        XRLOG("TRIAEVUM_XR_OVERLAY wall_fade_frames=%llu wall_fade_max=%.2f vignette_frames=%llu vignette_max=%.2f "
+              "vignette_ready=%d",
+              static_cast<unsigned long long>(frames.WallFadeFrames), frames.WallFadeMax,
+              static_cast<unsigned long long>(frames.VignetteFrames), frames.VignetteMax, VignetteReady() ? 1 : 0);
     frames = {};
 }
 
@@ -730,6 +741,7 @@ void XrThreadMain() {
         const double period = frameState.predictedDisplayPeriod > 0 ? frameState.predictedDisplayPeriod * 1e-9 : 1.0 / 90.0;
         if (world) UpdateLayers(period);
         const bool fadeReady = world && PrepareFadeSwapchain();
+        const bool vignetteReady = world && PrepareVignetteSwapchain();
 
         XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
         XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
@@ -737,7 +749,8 @@ void XrThreadMain() {
                                                                {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
         XrCompositionLayerQuad fade{XR_TYPE_COMPOSITION_LAYER_QUAD};
         XrCompositionLayerQuad hud{XR_TYPE_COMPOSITION_LAYER_QUAD};
-        const XrCompositionLayerBaseHeader* layers[4] = {};
+        XrCompositionLayerQuad vignette{XR_TYPE_COMPOSITION_LAYER_QUAD};
+        const XrCompositionLayerBaseHeader* layers[5] = {};
         uint32_t layerCount = 0;
         const auto addQuad = [&] {
             const VkExtent2D extent = QuadExtent();
@@ -751,9 +764,18 @@ void XrThreadMain() {
             quad.size = gScreen.Size;
             layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad);
         };
+        // W2 (§4.4): the head inside geometry darkens the world by max with the transition fade.
+        const double wall = world && gLayers.Shown == LayerMode::World
+                                ? std::clamp(static_cast<double>(gWallFade.load()), 0.0, 1.0)
+                                : 0.0;
+        const double alpha = std::max(gLayers.Alpha, wall);
+        if (wall > 0.0) {
+            ++frames.WallFadeFrames;
+            frames.WallFadeMax = std::max(frames.WallFadeMax, static_cast<float>(wall));
+        }
         if (!world) {
             if (frameState.shouldRender && QuadReleased() && gPlaced) addQuad();
-        } else if (frameState.shouldRender && gLayers.Alpha < 0.999) {
+        } else if (frameState.shouldRender && alpha < 0.999) {
             Fast::StereoViews shown;
             if (gLayers.Shown == LayerMode::World && EyeReleased() && ShownViews(&shown)) {
                 // The pose and the image always come from the same publication (§3.3).
@@ -781,10 +803,29 @@ void XrThreadMain() {
                     layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&hud);
                     ++gHudShownFrames;
                 }
+                // W2 (§5.7): the vignette, head-locked like the fade, one radial mask per strength level.
+                const float strength = std::clamp(gVignette.load(), 0.0F, 1.0F);
+                const auto vignetteLevel =
+                    static_cast<uint32_t>(std::lround(strength * static_cast<float>(VignetteLevels() - 1)));
+                if (vignetteReady && vignetteLevel != 0U) {
+                    ++frames.VignetteFrames;
+                    frames.VignetteMax = std::max(frames.VignetteMax, strength);
+                    const VkExtent2D extent = VignetteExtent();
+                    vignette.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                    vignette.space = g.ViewSpace;
+                    vignette.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                    vignette.subImage.swapchain = VignetteSwapchain();
+                    vignette.subImage.imageRect = {
+                        {0, 0}, {static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height)}};
+                    vignette.subImage.imageArrayIndex = vignetteLevel;
+                    vignette.pose = {{0.0F, 0.0F, 0.0F, 1.0F}, {0.0F, 0.0F, -0.5F}};
+                    vignette.size = {2.0F, 2.0F};
+                    layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&vignette);
+                }
             } else if (gLayers.Shown == LayerMode::Cinema && QuadReleased() && gPlaced) {
                 addQuad();
             }
-            const auto level = static_cast<uint32_t>(std::lround(gLayers.Alpha * (FadeLevels() - 1)));
+            const auto level = static_cast<uint32_t>(std::lround(alpha * (FadeLevels() - 1)));
             if (layerCount != 0U && level != 0U && fadeReady) {
                 // Black over the scene, head-locked: 2 m wide at 0.5 m covers the field of view.
                 fade.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
@@ -1141,8 +1182,10 @@ void CreateWorldSpace() {
     XrReferenceSpaceCreateInfo info{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
     info.poseInReferenceSpace.orientation.w = 1.0F;
     XrExtent2Df bounds{0.0F, 0.0F};
+    // Seated (§5.6, TRIAEVUM_XR_SEATED=1) uses LOCAL_FLOOR: the seat, not the room, is the reference.
     const bool forceLocalFloor = std::string_view(std::getenv("TRIAEVUM_XR_WORLD_SPACE") != nullptr
-                                                      ? std::getenv("TRIAEVUM_XR_WORLD_SPACE") : "") == "local_floor";
+                                                      ? std::getenv("TRIAEVUM_XR_WORLD_SPACE") : "") == "local_floor" ||
+                                 EnvFlag("TRIAEVUM_XR_SEATED");
     if (offered(XR_REFERENCE_SPACE_TYPE_STAGE) && !forceLocalFloor) {
         info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
         XrSpace stage = XR_NULL_HANDLE;
@@ -1413,6 +1456,12 @@ void RequestBlink(uint32_t rigEpoch, uint32_t fadeMs) {
 
 void Pulse(int hand, uint32_t milliseconds) {
     Haptic(hand == 0 || hand == 2, hand == 1 || hand == 2, static_cast<int>(milliseconds));
+}
+
+void SetWallFade(float alpha) { gWallFade.store(std::isfinite(alpha) ? std::clamp(alpha, 0.0F, 1.0F) : 0.0F); }
+
+void SetVignette(float strength) {
+    gVignette.store(std::isfinite(strength) ? std::clamp(strength, 0.0F, 1.0F) : 0.0F);
 }
 
 bool NoteGuestPaused(bool paused) {

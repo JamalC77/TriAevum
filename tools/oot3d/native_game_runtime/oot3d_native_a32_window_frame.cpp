@@ -922,6 +922,21 @@ bool NativeA32WindowSession::SampleGuestRefreshInput(
           nativeCandidateDispatch.TopScreenVersionChoiceReveal)) {
     uiLifecycleBridge.RevealNativeVersionChoice();
   }
+  if (xrWorld != nullptr && !inputTimeline.Enabled()) {
+    // In-world (inworld-spec §7): the Circle Pad of this refresh pushes Link relative to where Jamal
+    // looks, from the camera yaw Player reads (play+0x364+0x17E) to psi_ref, in World and Held alike.
+    const auto &probe = playerTimingProbe.Stats();
+    const uint32_t playState = probe.LastPlayStateAddress != 0U
+                                   ? probe.LastPlayStateAddress
+                                   : sceneViewProbe.Stats().LastPlayStateAddress;
+    Oot3dNativeGame::TopScreenOcarinaState ocarina;
+    const bool ocarinaActive = nativeCandidateDispatch.TopScreenUiProfile &&
+                               Oot3dNativeGame::ReadTopScreenOcarinaState(process.Memory(), &ocarina) &&
+                               ocarina.Active;
+    xrWorld->RotateStick(
+        Oot3dNativeGame::ReadXrGuestSnapshot(process.Memory(), probe.LastPlayerAddress, playState),
+        ocarinaActive, inputFrame.Hid.CirclePadX, inputFrame.Hid.CirclePadY);
+  }
   inputDiagnostics.Observe(inputFrame);
   if (inputFrame.Exit) {
     window.Close();
@@ -2000,7 +2015,7 @@ void NativeA32WindowSession::PresentVisualFrame(
                              inGameMenuStorage->IsOpen();
               xrWorld->StampFrame(
                   Oot3dNativeGame::ReadXrGuestSnapshot(process.Memory(), probe.LastPlayerAddress, playState),
-                  Oot3dNativeGame::CollectXrFrameFacts(*finished), host);
+                  Oot3dNativeGame::CollectXrFrameFacts(*finished), host, finished->Sequence);
             }
             if (xrViewRenderer != nullptr && xrViewRenderer->TraceEnabled()) {
               // The W0 trace groups its table by scene (play+0x104).
