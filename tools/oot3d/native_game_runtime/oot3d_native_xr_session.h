@@ -57,6 +57,9 @@ class XrWorldSession {
     // of this frame from the display ticks; false: no display clock (use the steady clock).
     bool BeginPresentation(double* elapsedSeconds);
     void NoteRefreshesDue(uint32_t due);  // beats (presentations with 0 or 2+ refreshes outside overruns)
+    // A RunFrame that held the guest (session not focused, the preparation screen): its presentation
+    // time was discarded and its tick never waited for, so the pace restarts from the display clock.
+    void NoteHeldFrame();
 
     // Once per completed visual frame (PresentVisualFrame, beside the actor interactions).
     void StampFrame(const XrGuestSnapshot& snapshot, const XrFrameFacts& facts, const XrHostSignals& host);
@@ -64,6 +67,8 @@ class XrWorldSession {
 
     // Render worker reports (atomics).
     void NoteRenderSafety(bool fallbackFrames) { mRenderSafety.store(fallbackFrames); }
+    // Render worker: true once after a render-safety hold ended (the fallback frame count restarts).
+    bool TakeRenderSafetyReset() { return mRenderSafetyReset.exchange(false); }
     void NoteTickWait(bool reached) {
         if (!reached) mPacerFallbacks.fetch_add(1);
     }
@@ -86,6 +91,8 @@ class XrWorldSession {
     XrFrameState mState;
     XrWorld::XrTickPacer mPacer;
     XrWorld::XrWorldClassifier mClassifier;
+    XrWorld::XrRenderSafetyHold mSafety;
+    int16_t mSafetyScene = -1;
     XrWorld::XrWorldState mRequested = XrWorld::XrWorldState::Cinema;
     bool mRigValid = false;
     XrMath::Rig mRig;
@@ -107,11 +114,13 @@ class XrWorldSession {
     std::chrono::steady_clock::time_point mStart = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point mNextLog = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     // Counters (5 s windows).
-    uint64_t mOverruns = 0, mBeats = 0, mPresentations = 0, mPlacements = 0, mBlinks = 0;
+    uint64_t mOverruns = 0, mBeats = 0, mPresentations = 0, mPlacements = 0, mBlinks = 0, mResyncs = 0,
+             mHeldFrames = 0;
     std::atomic<uint64_t> mPacerFallbacks{0}, mPredictFailures{0};
     std::atomic<uint64_t> mHorizonCount{0};
     std::atomic<double> mHorizonSum{0.0}, mHorizonMax{0.0};
     std::atomic<bool> mRenderSafety{false};
+    std::atomic<bool> mRenderSafetyReset{false};
 };
 
 }  // namespace Oot3dNativeGame

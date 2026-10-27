@@ -230,6 +230,9 @@ const Oot3dPicaVisualFrameViewSample& XrViewRenderer::BuildEye(const Oot3dPicaVi
         const Facts facts = ExtractFacts(view, sample, camera);
         const W::XrDrawClass drawClass = W::ClassifyXrDraw(facts.Draw);
         W::XrDrawClass counted = drawClass;
+        if (eyeIndex == 0 && facts.Draw.OnTopTarget && !facts.Draw.UiDomain &&
+            facts.Draw.Projection == M::ProjectionStatus::NonNegativeC)
+            ++mStats.NonNegativeC;
         const auto treatment = W::TreatmentOf(drawClass);
         if (treatment == W::XrDrawTreatment::Omit) {
             target.Omitted = true;
@@ -312,13 +315,14 @@ bool XrViewRenderer::EndPresentation(bool eyesBuilt) {
             };
             XrWorldLog("TRIAEVUM_XR_VIEW samples=%llu full=%llu sky=%llu offtarget=%llu ui=%llu screen=%llu "
                        "ortho_full=%llu ortho_omitted=%llu framecam=%llu fallback=%llu row_failures=%llu "
-                       "mirrored=%llu mirror_disagree=%llu no_frame_camera=%llu C=%.4f detR=%d detV=%d "
-                       "fallback_frames=%llu",
+                       "c_nonneg=%llu mirrored=%llu mirror_disagree=%llu no_frame_camera=%llu C=%.4f detR=%d "
+                       "detV=%d fallback_frames=%llu",
                        static_cast<unsigned long long>(mStats.EyeSamples), count(W::XrDrawClass::World),
                        count(W::XrDrawClass::Sky), count(W::XrDrawClass::OffTarget), count(W::XrDrawClass::Ui),
                        count(W::XrDrawClass::Screen), count(W::XrDrawClass::OrthoFull),
                        count(W::XrDrawClass::OrthoOmitted), count(W::XrDrawClass::FrameCam),
                        count(W::XrDrawClass::Fallback), static_cast<unsigned long long>(mStats.RowFailures),
+                       static_cast<unsigned long long>(mStats.NonNegativeC),
                        static_cast<unsigned long long>(mStats.MirroredSamples),
                        static_cast<unsigned long long>(mStats.MirrorDisagreements),
                        static_cast<unsigned long long>(mStats.NoFrameCamera), mStats.C, mStats.DetR, mStats.DetV,

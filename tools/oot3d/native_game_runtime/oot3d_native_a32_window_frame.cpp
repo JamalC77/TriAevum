@@ -398,6 +398,8 @@ bool NativeA32WindowSession::RunFrame() {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
       renderStream.Submit([&] { realtimePacer.ResetDeadline(); });
       lastPresentationTime = std::chrono::steady_clock::now();
+      // In-world: this frame's pace tick was never waited for; the pace restarts from the clock.
+      if (xrWorld != nullptr) xrWorld->NoteHeldFrame();
       return false;
     }
 #if defined(TRIAEVUM_QUEST_OPENXR)
@@ -421,6 +423,7 @@ bool NativeA32WindowSession::RunFrame() {
       renderStream.Submit([&] { realtimePacer.ResetDeadline(); });
       lastPresentationTime = std::chrono::steady_clock::now();
       lastCompletedFrameTime = lastPresentationTime;
+      if (xrWorld != nullptr) xrWorld->NoteHeldFrame();
       return false;
     }
     phaseTiming.RendererFrameStartSeconds += SecondsSince(rendererFrameStart);
@@ -644,6 +647,9 @@ bool NativeA32WindowSession::RunFrame() {
                        forcedView = std::exchange(pendingForcedScreenshotView, {}),
                        xrPacing = xrWorld != nullptr && xrWorld->FrameState().TickPacing,
                        xrPaceTick = xrWorld != nullptr ? xrWorld->FrameState().PaceTick : 0U] {
+    // In-world: whether this host frame executed both eyes (taken here, once per frame).
+    const bool xrEyes = std::exchange(xrEyesDrawn, false);
+    (void)xrEyes;
     if (!forcedScreenshot.empty()) screenshotState.ForcedPath = forcedScreenshot;
     if (rendererFrameSkipped) {
       capturedTemporalSample.reset();
@@ -659,14 +665,13 @@ bool NativeA32WindowSession::RunFrame() {
          ShouldWriteFramebufferScreenshot(hostArgs, static_cast<uint32_t>(presentationSerial),
                                           screenshotState))) {
       // In-world captures (G14): the dev lab's "view" (left|right|panel); --screenshot takes the
-      // left eye of a world frame. An eye of a frame that drew none falls back to the panel.
-      const std::string requested = forcedView.empty()
-                                        ? std::string(xrRenderState.World ? "left" : "panel")
-                                        : forcedView;
+      // left eye of a frame that drew a pair. An eye of a frame that drew none (Cinema/Black, no
+      // prediction, no presented sample) falls back to the panel: its eye images are older frames'.
+      const std::string requested = forcedView.empty() ? std::string(xrEyes ? "left" : "panel") : forcedView;
       uint32_t view = requested == "left"    ? Fast::kXrViewEyeLeft
                       : requested == "right" ? Fast::kXrViewEyeRight
                                              : Fast::kXrViewPanel;
-      if (view != Fast::kXrViewPanel && !xrRenderState.World) view = Fast::kXrViewPanel;
+      if (view != Fast::kXrViewPanel && !xrEyes) view = Fast::kXrViewPanel;
       const bool selected = api.SelectXrView(view);
       if (view != Fast::kXrViewPanel) {
         const auto eye = TriAevumQuestXr::EyeExtent();
@@ -674,9 +679,10 @@ bool NativeA32WindowSession::RunFrame() {
         captureHeight = eye.height;
       }
       Oot3dNativeGame::XrWorldLog(
-          "TRIAEVUM_XR_CAPTURE view=%s requested=%s selected=%d world_frame=%d w=%u h=%u path=%s",
+          "TRIAEVUM_XR_CAPTURE view=%s requested=%s selected=%d world_frame=%d eyes_drawn=%d w=%u h=%u path=%s",
           view == Fast::kXrViewEyeLeft ? "left" : view == Fast::kXrViewEyeRight ? "right" : "panel",
-          requested.c_str(), selected ? 1 : 0, xrRenderState.World ? 1 : 0, captureWidth, captureHeight,
+          requested.c_str(), selected ? 1 : 0, xrRenderState.World ? 1 : 0, xrEyes ? 1 : 0, captureWidth,
+          captureHeight,
           screenshotState.ForcedPath.empty() ? "(--screenshot)" : screenshotState.ForcedPath.string().c_str());
     }
 #endif
@@ -1868,6 +1874,17 @@ void NativeA32WindowSession::PresentVisualFrame(
           ? std::optional<uint32_t>(topFramebuffer->AddressRight)
           : std::nullopt,
       traceSelectedTopTransfer);
+  // In-world: every host frame's render side learns its frame state (a world frame publishes a pair or
+  // nothing; it never re-scans or publishes the panel), also without a selected top transfer (LCD
+  // forced black, no top framebuffer or no transfer for it).
+  bool xrFrameCommandSubmitted = false;
+  const auto submitXrFrameCommand = [&] {
+    if (xrWorld == nullptr || xrFrameCommandSubmitted) return;
+    xrFrameCommandSubmitted = true;
+    renderStream.Submit([&, xrFrame = xrWorld->FrameState()] {
+      if (!rendererFrameSkipped) BeginXrRenderCommand(xrFrame);
+    });
+  };
   if (!lcdForceBlack) {
     if (topFramebuffer.has_value()) {
       auto selected =
@@ -1962,6 +1979,7 @@ void NativeA32WindowSession::PresentVisualFrame(
                     std::move(*finished));
           }
         }
+        xrFrameCommandSubmitted = true;
         renderStream.Submit([&, topSelection, completedFrame, supersededFrames,
                              frameActors, suppressTopScreenBackdrop,
                              presentationElapsedSeconds,
@@ -2275,6 +2293,7 @@ void NativeA32WindowSession::PresentVisualFrame(
         });
       }
     }
+    submitXrFrameCommand();  // before the bottom frontend command, which reads the frame state
 
     const bool presentNativeBottomFrontend =
         Oot3dNativeGame::ShouldPresentNativeBottomFrontend(
@@ -2316,6 +2335,7 @@ void NativeA32WindowSession::PresentVisualFrame(
       }
     }
   }
+  submitXrFrameCommand();  // LCD forced black
   phaseTiming.VisualPresentationSeconds +=
       SecondsSince(visualPresentationStart);
 }
@@ -3082,8 +3102,12 @@ bool NativeA32WindowSession::ExecuteXrEyes(const Oot3dNativeGame::Oot3dPicaVisua
 #if defined(TRIAEVUM_QUEST_OPENXR)
   if (xr.World() && xrWorld != nullptr) {
     const auto &state = xrRenderState;
+    // The render safety counts consecutive eye frames: a held trip ended (or any non-World frame)
+    // restarts the count, so one bad second never ends the world mode for the session.
+    if (xrWorld->TakeRenderSafetyReset()) xr.ResetRenderSafety();
     if (!state.World) {
       // Cinema / Black: the Q3 picture into the panel (namespace 2), as the screen mode.
+      xr.ResetRenderSafety();
       api.SelectXrView(Fast::kXrViewPanel);
       return false;
     }
@@ -3120,6 +3144,7 @@ bool NativeA32WindowSession::ExecuteXrEyes(const Oot3dNativeGame::Oot3dPicaVisua
     api.SelectXrView(Fast::kXrViewPanel);
     views.Valid = true;
     api.SetXrStereoViews(views);
+    xrEyesDrawn = true;
     xrWorld->NoteRenderSafety(xr.EndPresentation(true));
     capturedTemporalSample = temporalSample;
     const double elapsed = SecondsSince(started);

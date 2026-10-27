@@ -163,4 +163,29 @@ inline float ScreenHeight(float width, uint32_t pixelWidth, uint32_t pixelHeight
     return pixelWidth == 0U ? 0.0F : width * static_cast<float>(pixelHeight) / static_cast<float>(pixelWidth);
 }
 
+// ---- The display clock's tick (inworld-spec §3.4): display periods since the session began, from the
+// runtime's predicted display times, not a count of xrWaitFrame calls. A late wait that skips periods
+// advances the tick by the periods that passed (counted in Skipped); a stopped session (Pause) does not
+// count its gap. The tick stays monotonic.
+struct DisplayTickClock {
+    uint64_t Tick = 0;
+    uint64_t Skipped = 0;  // periods skipped by late waits (the owner resets it per stats window)
+    int64_t LastDisplayTime = 0;
+    bool Running = false;
+    // One successful xrWaitFrame: the tick of its display frame.
+    uint64_t Advance(int64_t displayTime, int64_t period) {
+        uint64_t step = 1;
+        if (Running && period > 0 && displayTime > LastDisplayTime) {
+            const double periods = static_cast<double>(displayTime - LastDisplayTime) / static_cast<double>(period);
+            if (std::isfinite(periods) && periods > 1.5) step = static_cast<uint64_t>(std::llround(periods));
+        }
+        Skipped += step - 1U;
+        Tick += step;
+        LastDisplayTime = displayTime;
+        Running = true;
+        return Tick;
+    }
+    void Pause() { Running = false; }
+};
+
 }  // namespace TriAevumQuestXr::Logic

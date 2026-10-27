@@ -1249,6 +1249,8 @@ class GfxRenderingAPIVulkan final : public GfxRenderingAPI,
     bool mXrWorldFrame = false;  // SetXrStereoViews this frame
     std::array<bool, 8> mXrNamespaceExtentSet{};
     std::array<Oot3d::RenderExtent, 8> mXrNamespaceExtents{};
+    // The camera-dependent effects the world mode turned off for rendering (bits; logged on change).
+    uint32_t mXrForcedEffects = UINT32_MAX;
 #endif
 #if defined(__ANDROID__)
     std::atomic<bool> mSurfaceLost{false};

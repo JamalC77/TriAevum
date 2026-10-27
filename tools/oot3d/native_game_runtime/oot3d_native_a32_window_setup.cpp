@@ -1489,11 +1489,22 @@ void NativeA32WindowSession::UpdateScenePresentation() {
       Fast::Oot3d::ResolveScenePresentationPolicy(
           std::max<uint32_t>(1, presentationPicture.Width),
           std::max<uint32_t>(1, presentationPicture.Height));
-  widescreenProjection.Projection.FovMultiplier = graphics.FovMultiplier;
+  // In-world (inworld-spec §2.4): the eye rows replace the game's x/y rows, so a wider game frustum
+  // only costs; the FOV multiplier is 1. The presentation expansion still follows the panel picture:
+  // Cinema shows ns2 at that picture, and a 5:3 frustum would be stretched there (§13).
+  const float fovMultiplier = xrWorld != nullptr ? 1.0F : graphics.FovMultiplier;
+  if (xrWorld != nullptr && graphics.FovMultiplier != xrLoggedFovSetting) {
+    xrLoggedFovSetting = graphics.FovMultiplier;
+    Oot3dNativeGame::XrWorldLog("TRIAEVUM_XR_FOV multiplier=1 setting=%.2f expansion_h=%.3f expansion_v=%.3f",
+                                graphics.FovMultiplier,
+                                widescreenProjection.Projection.Presentation.HorizontalFovExpansion,
+                                widescreenProjection.Projection.Presentation.VerticalFovExpansion);
+  }
+  widescreenProjection.Projection.FovMultiplier = fovMultiplier;
   auto &visibility = widescreenProjection.ActorVisibility;
   visibility.ExtendedDrawDistance = graphics.ExtendedDrawDistance;
   visibility.Presentation = widescreenProjection.Projection.Presentation;
-  visibility.FovMultiplier = graphics.FovMultiplier;
+  visibility.FovMultiplier = fovMultiplier;
   // Off stops new extra loads; resident slots keep their hooks until they
   // retire (ObjectBankExtension::ShouldObserve).
   if (objectBankStorage) objectBankStorage->SetEnabled(graphics.ExtendedDrawDistance);

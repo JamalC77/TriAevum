@@ -100,8 +100,35 @@ void TestClasses() {
     CHECK(ClassifyXrDraw(f) == XrDrawClass::OrthoOmitted);
     f.ViewportCoversTarget = true;
     CHECK(ClassifyXrDraw(f) == XrDrawClass::OrthoFull);
+    // A perspective f3 with C >= 0 is the fallback class (§2.2), whatever its viewport: never drawn
+    // head-locked with the game's rows. Only a true orthographic f3 is ortho.
     f.Projection = M::ProjectionStatus::NonNegativeC;
-    CHECK(ClassifyXrDraw(f) == XrDrawClass::OrthoFull);
+    CHECK(ClassifyXrDraw(f) == XrDrawClass::Fallback);
+    f.ViewportCoversTarget = false;
+    CHECK(ClassifyXrDraw(f) == XrDrawClass::Fallback);
+    {
+        // From real rows: C = +1 perspective (full and partial viewport), and an orthographic f3.
+        const M::Rows positive = GameRows(-0.8, 0.8, -0.5, 0.5, 1, 1.0);
+        XrDrawFacts g;
+        g.Projection = M::DecomposeGameProjection(positive).Status;
+        CHECK(g.Projection == M::ProjectionStatus::NonNegativeC);
+        g.HasWorldToView = true;
+        g.ViewportCoversTarget = true;
+        CHECK(ClassifyXrDraw(g) == XrDrawClass::Fallback);
+        g.ViewportCoversTarget = false;
+        CHECK(ClassifyXrDraw(g) == XrDrawClass::Fallback);
+        M::Rows ortho{};
+        ortho[0] = {0.0F, 0.01F, 0.0F, -1.0F};
+        ortho[1] = {-0.008F, 0.0F, 0.0F, 1.0F};
+        ortho[2] = {0.0F, 0.0F, 0.001F, -0.5F};
+        ortho[3] = {0.0F, 0.0F, 0.0F, 1.0F};
+        g.Projection = M::DecomposeGameProjection(ortho).Status;
+        CHECK(g.Projection == M::ProjectionStatus::NotPerspective);
+        CHECK(ClassifyXrDraw(g) == XrDrawClass::OrthoOmitted);
+        g.ViewportCoversTarget = true;
+        CHECK(ClassifyXrDraw(g) == XrDrawClass::OrthoFull);
+    }
+    f.ViewportCoversTarget = true;
     f.Projection = M::ProjectionStatus::OffAxis;
     CHECK(ClassifyXrDraw(f) == XrDrawClass::Fallback);
     f.Projection = M::ProjectionStatus::Ok;
@@ -257,6 +284,47 @@ void TestPacing() {
     pacer.Restart();
     step = pacer.Next(500);
     CHECK(step.Started && step.PaceTick == 503);
+    // Pipelined steady state: the guest one frame ahead of the render worker's tick wait (latest = p_{N-2})
+    // is normal, never a resync.
+    {
+        XrTickPacer p;
+        p.SetDivisor(3);
+        p.Next(1000);  // 1003
+        bool resynced = false;
+        uint64_t latest = 1000;
+        for (int i = 0; i < 50; ++i) {
+            const auto s = p.Next(latest);
+            resynced = resynced || s.Resynced || s.Overrun;
+            latest = s.PaceTick - 3;  // the previous frame's tick reached
+        }
+        CHECK(!resynced);
+    }
+    // A frozen display clock (a held guest, tick waits timing out): the pace never leads it by more
+    // than 2d + margin, and each resynced step is one guest frame of presentation time.
+    {
+        XrTickPacer p;
+        p.SetDivisor(3);
+        bool bounded = true, oneFrame = true;
+        int resyncs = 0;
+        for (int i = 0; i < 100; ++i) {
+            const auto s = p.Next(2000);
+            bounded = bounded && s.PaceTick <= 2000 + p.Divisor() + XrTickPacer::kMargin + p.Divisor();
+            oneFrame = oneFrame && s.Delta == 3;
+            resyncs += s.Resynced ? 1 : 0;
+        }
+        CHECK(bounded && oneFrame && resyncs > 0);
+        CHECK(p.AheadLimit() == 8U);
+        // Far ahead (the reviewed failure: ~1000 ticks after a preparation screen): one step resyncs.
+        XrTickPacer q;
+        q.SetDivisor(3);
+        q.Next(5000);  // 5003
+        for (int i = 0; i < 400; ++i) (void)q.Next(5000 + static_cast<uint64_t>(i) * 3);  // keeps pace
+        const uint64_t ahead = q.Previous();
+        const auto s = q.Next(ahead - 600);  // the clock is 600 ticks behind the pace
+        CHECK(s.Resynced && s.PaceTick == ahead - 600 + 3 && s.Delta == 3 && !s.Overrun);
+        const auto t = q.Next(ahead - 600 + 3);
+        CHECK(!t.Resynced && !t.Overrun && t.PaceTick == ahead - 600 + 6 && t.Delta == 3);
+    }
     CHECK(TickDivisor(90.0) == 3 && TickDivisor(72.0) == 2 && TickDivisor(120.0) == 4 && TickDivisor(60.0) == 2 &&
           TickDivisor(0.0) == 3 && TickDivisor(80.0) == 2);
     CHECK(TickDisplayTimeNs(10, 1'000'000'000, 11'111'111, 13) == 1'000'000'000 + 3 * 11'111'111);
@@ -433,6 +501,78 @@ void TestClassifier() {
     Report("classifier");
 }
 
+void TestRenderSafety() {
+    // The hold: tripped -> blocking for 5 s -> cleared; a repeat holds 10 s, then 20, 40, 60, 60.
+    {
+        XrRenderSafetyHold hold;
+        auto s = hold.Update(false, 0.0, false);
+        CHECK(!s.Blocking && !s.Tripped && !s.Cleared);
+        s = hold.Update(true, 1.0, false);
+        CHECK(s.Blocking && s.Tripped && s.HoldSeconds == 5.0);
+        s = hold.Update(true, 5.9, false);
+        CHECK(s.Blocking && !s.Tripped && !s.Cleared);
+        s = hold.Update(true, 6.0, false);  // the stale flag at the clearing update does not block
+        CHECK(!s.Blocking && s.Cleared && std::string_view(s.ClearReason) == "hold" && s.HoldSeconds == 5.0);
+        s = hold.Update(false, 6.1, false);
+        CHECK(!s.Blocking && !s.Cleared);
+        const double expected[] = {10.0, 20.0, 40.0, 60.0, 60.0};
+        double now = 10.0;
+        bool doubling = true;
+        for (double seconds : expected) {
+            s = hold.Update(true, now, false);
+            doubling = doubling && s.Tripped && s.HoldSeconds == seconds;
+            s = hold.Update(false, now + seconds - 0.01, false);
+            doubling = doubling && s.Blocking;
+            s = hold.Update(false, now + seconds, false);
+            doubling = doubling && s.Cleared && !s.Blocking;
+            now += seconds + 1.0;
+        }
+        CHECK(doubling);
+        // A scene change ends a hold at once and restores the first hold.
+        s = hold.Update(true, now, false);
+        CHECK(s.Tripped && s.HoldSeconds == 60.0);
+        s = hold.Update(false, now + 1.0, true);
+        CHECK(s.Cleared && !s.Blocking && std::string_view(s.ClearReason) == "scene");
+        s = hold.Update(true, now + 2.0, false);
+        CHECK(s.Tripped && s.HoldSeconds == 5.0);
+        CHECK(hold.Holding());
+    }
+    // Through the classifier: World -> safety -> Cinema; the flag clears -> 0.5 s -> Black -> World
+    // (placed as a Cinema exit). The reviewed latch: the safety must not pin Cinema for the session.
+    {
+        XrWorldClassifier c;
+        XrRenderSafetyHold hold;
+        double now = 0.0;
+        auto t = Gameplay(now);
+        for (int i = 0; i < 30; ++i) {
+            t.Now = now = i / 30.0;
+            c.Update(t);
+        }
+        CHECK(c.State() == XrWorldState::World);
+        bool tripped = true;  // the render worker reports 30 fallback frames
+        bool sawCinema = false, placedAgain = false;
+        const char* reason = "";
+        double worldAgainAt = -1.0;
+        for (int i = 0; i < 400 && worldAgainAt < 0.0; ++i) {
+            t.Now = now += 1.0 / 30;
+            const auto safety = hold.Update(tripped, now, false);
+            if (safety.Cleared) tripped = false;  // the session clears the reported flag
+            t.RenderSafety = safety.Blocking;
+            const auto step = c.Update(t);
+            if (step.State == XrWorldState::Cinema) sawCinema = true;
+            if (step.Place) {
+                placedAgain = true;
+                reason = step.PlaceReason;
+            }
+            if (sawCinema && step.State == XrWorldState::World) worldAgainAt = now;
+        }
+        CHECK(sawCinema && placedAgain && std::string_view(reason) == "cinema_exit");
+        // 1.0 s (start) + 5 s hold + 0.5 s clear + 0.15 s black, within a frame or two.
+        CHECK(worldAgainAt > 6.6 && worldAgainAt < 6.8);
+    }
+    Report("safety");
+}
+
 }  // namespace
 
 int main() {
@@ -441,6 +581,7 @@ int main() {
     TestPreviewHead();
     TestPacing();
     TestClassifier();
+    TestRenderSafety();
     std::printf("oot3d_xr_world_logic_tests: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

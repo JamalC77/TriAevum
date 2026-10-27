@@ -382,6 +382,45 @@ void GfxRenderingAPIVulkan::StartFrame() {
         }
     }
     auto graphicsSnapshot = settingsRuntime.SnapshotForRendering();
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    if (mXrWorld) {
+        // In-world (W1): the passes that build their camera from the guest perspective and the game's
+        // WorldToView (interactive grass, Hi-Z/SSR and water reflections, AO, screen-space GI, temporal
+        // motion/TAA) would be misregistered in the eye namespaces, whose rows are the eye's. Off for
+        // this frame's rendering (the settings stay as they are); per-eye cameras are a later milestone.
+        auto& value = graphicsSnapshot.Value;
+        auto& effects = value.Effects;
+        uint32_t forced = 0;
+        const auto force = [&forced](bool on, uint32_t bit) { forced |= on ? bit : 0U; };
+        force(value.Grass.Quality != Oot3d::GrassQuality::Off, 1U << 0);
+        force(effects.Reflections != Oot3d::ReflectionMode::Off, 1U << 1);
+        force(effects.WaterReflections && Oot3d::UsesFullSceneLighting(effects.SurfaceLighting), 1U << 2);
+        force(effects.AmbientOcclusion != Oot3d::AmbientOcclusionMode::Off, 1U << 3);
+        force(effects.GlobalIllumination.Mode != Oot3d::GlobalIlluminationMode::Off, 1U << 4);
+        const bool temporalAa = value.AntiAliasing == Oot3d::AntiAliasingMode::Taa ||
+            (value.AntiAliasing == Oot3d::AntiAliasingMode::Upscaler && Oot3d::IsTemporalUpscaler(value.Upscaler));
+        force(temporalAa, 1U << 5);
+        value.Grass.Quality = Oot3d::GrassQuality::Off;
+        effects.Reflections = Oot3d::ReflectionMode::Off;
+        effects.WaterReflections = false;
+        effects.AmbientOcclusion = Oot3d::AmbientOcclusionMode::Off;
+        effects.GlobalIllumination.Mode = Oot3d::GlobalIlluminationMode::Off;
+        if (temporalAa) value.AntiAliasing = Oot3d::AntiAliasingMode::Off;
+        if (forced != mXrForcedEffects) {
+            mXrForcedEffects = forced;
+            static constexpr const char* kNames[] = {"grass", "reflections", "water_reflections", "ao", "gi",
+                                                     "temporal_aa"};
+            std::string names;
+            for (uint32_t bit = 0; bit < 6U; ++bit) {
+                if ((forced & (1U << bit)) == 0U) continue;
+                if (!names.empty()) names += ',';
+                names += kNames[bit];
+            }
+            const std::string line = "TRIAEVUM_XR_VIEW effects_forced_off=" + (names.empty() ? std::string("none") : names);
+            TriAevumQuestXr::LogLine(line.c_str());
+        }
+    }
+#endif
     // Water reflections with Reflections Off (EffectsSettings::WaterReflections):
     // the frame traces Hi-Z, and only water writes a reflection material.
     {

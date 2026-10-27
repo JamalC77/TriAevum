@@ -106,25 +106,50 @@ std::atomic<bool> gRecenterRequested{false};
 
 // ---- in-world state (inworld-spec §3)
 std::atomic<uint32_t> gWorldRecenters{0};
-PlayArea gPlayArea;  // written at StartSession, read-only afterwards
+// Written at StartSession and when a STAGE reference-space change redraws the boundary (XR thread);
+// read by the guest thread at each placement.
+std::mutex gPlayAreaMutex;
+PlayArea gPlayArea;
 
-// The display clock, published after each xrWaitFrame (§3.4 G3).
+// A reference-space change of the world space or LOCAL (§3.2), applied once a display frame reaches
+// its changeTime (XR thread only).
+struct PendingSpaceChange {
+    bool Pending = false;
+    XrReferenceSpaceType Type = XR_REFERENCE_SPACE_TYPE_LOCAL;
+    XrTime ChangeTime = 0;
+};
+PendingSpaceChange gWorldSpaceChange;
+
+// The display clock, published after each xrWaitFrame (§3.4 G3): the tick counts display periods
+// (from the predicted display times), so a late wait that skips a period advances it by two.
 std::mutex gTickMutex;
 std::condition_variable gTickChanged;
 TickInfo gTick;
-uint64_t gTickCounter = 0;  // XR thread
+Logic::DisplayTickClock gTickClock;  // under gTickMutex (written by the XR thread only)
 
 void PublishTick(bool valid, int64_t displayTime, int64_t period) {
     {
         std::lock_guard lock(gTickMutex);
         if (valid) {
-            gTick.Tick = ++gTickCounter;
+            gTick.Tick = gTickClock.Advance(displayTime, period);
             gTick.DisplayTimeNs = displayTime;
             gTick.PeriodNs = period;
+        } else {
+            gTickClock.Pause();
         }
         gTick.Valid = valid;
     }
     gTickChanged.notify_all();
+}
+
+uint64_t CurrentTick() {
+    std::lock_guard lock(gTickMutex);
+    return gTickClock.Tick;
+}
+
+uint64_t TakeSkippedTicks() {
+    std::lock_guard lock(gTickMutex);
+    return std::exchange(gTickClock.Skipped, uint64_t{0});
 }
 
 // Layer modes and fades (§3.3): requests from the runtime's threads, the machine on the XR thread.
@@ -344,16 +369,26 @@ void PollEvents() {
             break;
         case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING: {
             const auto& change = reinterpret_cast<const XrEventDataReferenceSpaceChangePending&>(event);
-            XRLOG("TRIAEVUM_XR_EVENT reference_space_change space=%d", static_cast<int>(change.referenceSpaceType));
+            XRLOG("TRIAEVUM_XR_EVENT reference_space_change space=%d change_time=%lld",
+                  static_cast<int>(change.referenceSpaceType), static_cast<long long>(change.changeTime));
             if (change.referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL) {
                 gPlaced = false;
                 gPlaceAfter = change.changeTime;
                 gPlaceReason = "space_change";
             }
-            // In-world: a user recenter changes LOCAL, not STAGE; either re-places the world (§3.2).
+            // In-world: a user recenter changes LOCAL, not STAGE; either re-places the world (§3.2),
+            // once a display frame reaches changeTime (ApplyWorldSpaceChange in the frame loop).
             if (WorldRequested() && (change.referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL ||
-                                     change.referenceSpaceType == G().WorldSpaceType))
-                NoteWorldRecenter("space_change");
+                                     change.referenceSpaceType == G().WorldSpaceType)) {
+                auto& pending = gWorldSpaceChange;
+                // A second change before the first applied: the later time; a change of the world space
+                // itself wins over LOCAL (it blinks and, for STAGE, refreshes the bounds).
+                if (!pending.Pending || change.referenceSpaceType == G().WorldSpaceType)
+                    pending.Type = change.referenceSpaceType;
+                pending.ChangeTime =
+                    pending.Pending ? std::max(pending.ChangeTime, change.changeTime) : change.changeTime;
+                pending.Pending = true;
+            }
             break;
         }
         case XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED:
@@ -391,7 +426,7 @@ void LogStats(FrameStats& frames) {
           "stale_display_frames=%llu incomplete_skips=%llu publications_dropped=%llu swapchain_wait_timeouts=%llu "
           "wait_frame_ms_max=%.1f begin_frame_ms_max=%.1f copy_wait_ms_max=%.1f guest_paused=%d "
           "guest_refreshes_while_paused=%llu refresh_hz=%.0f stereo_publications=%llu stereo_copies=%llu "
-          "layer=%s target=%s fade=%.2f phase=%s",
+          "layer=%s target=%s fade=%.2f phase=%s skipped_ticks=%llu",
           SessionStateName(g.SessionState.load()), static_cast<unsigned long long>(frames.DisplayFrames),
           static_cast<unsigned long long>(frames.ShouldRenderFalse), static_cast<unsigned long long>(sink.Copies),
           static_cast<unsigned long long>(sink.Publications),
@@ -402,7 +437,8 @@ void LogStats(FrameStats& frames) {
           sink.CopyWaitMsMax, gGuestPaused.load() ? 1 : 0,
           static_cast<unsigned long long>(gGuestRefreshesWhilePaused.load()), g.RefreshHz.load(),
           static_cast<unsigned long long>(sink.StereoPublications), static_cast<unsigned long long>(sink.StereoCopies),
-          LayerModeName(gLayers.Shown), LayerModeName(gLayers.Target), gLayers.Alpha, PhaseName(gLayers.Step));
+          LayerModeName(gLayers.Shown), LayerModeName(gLayers.Target), gLayers.Alpha, PhaseName(gLayers.Step),
+          static_cast<unsigned long long>(TakeSkippedTicks()));
     frames = {};
 }
 
@@ -477,6 +513,43 @@ void UpdateLayers(double dt) {
     }
 }
 
+// A pending reference-space change of the world space or LOCAL (§3.2), once this display frame
+// reaches its changeTime: a STAGE change re-reads the bounds; a change that moves the world space goes
+// black at once (the pairs on screen were rendered in the old frame) until a pair of the re-placed rig
+// is shown; then the world recenter (re-placement) is noted for the guest.
+void ApplyWorldSpaceChange(XrTime displayTime) {
+    auto& pending = gWorldSpaceChange;
+    if (!pending.Pending || (pending.ChangeTime != 0 && displayTime < pending.ChangeTime)) return;
+    pending.Pending = false;
+    auto& g = G();
+    const XrReferenceSpaceType world = g.WorldSpaceType;
+    if (pending.Type == XR_REFERENCE_SPACE_TYPE_STAGE && world == XR_REFERENCE_SPACE_TYPE_STAGE) {
+        XrExtent2Df bounds{0.0F, 0.0F};
+        const XrResult result = xrGetReferenceSpaceBoundsRect(g.Session, XR_REFERENCE_SPACE_TYPE_STAGE, &bounds);
+        const bool usable = result == XR_SUCCESS && bounds.width >= 1.0F && bounds.height >= 1.0F;
+        {
+            std::lock_guard lock(gPlayAreaMutex);
+            // Below 1 x 1 m the leash runs unbounded (the space stays STAGE until W2 can switch it).
+            gPlayArea.HalfX = usable ? bounds.width * 0.5F : 0.0F;
+            gPlayArea.HalfZ = usable ? bounds.height * 0.5F : 0.0F;
+            gPlayArea.Bounded = usable;
+        }
+        XRLOG("TRIAEVUM_XR_WORLD bounds_changed=%.2fx%.2f result=%d bounded=%d", bounds.width, bounds.height,
+              static_cast<int>(result), usable ? 1 : 0);
+    }
+    const bool worldSpaceMoved =
+        pending.Type == world ||
+        (pending.Type == XR_REFERENCE_SPACE_TYPE_LOCAL &&
+         (world == XR_REFERENCE_SPACE_TYPE_LOCAL || world == XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR_EXT));
+    if (worldSpaceMoved) {
+        // Black from this display frame on (the layer machine runs below in the same frame); the hold
+        // ends with a pair of the rig the guest places next (its epoch is past every published one)
+        // or after 300 ms.
+        RequestBlink(LatestPublishedRigEpoch() + 1U, 150);
+    }
+    NoteWorldRecenter(worldSpaceMoved ? "space_change" : "local_change");
+}
+
 double MillisecondsSince(std::chrono::steady_clock::time_point start) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
@@ -539,8 +612,9 @@ void XrThreadMain() {
         }
         wasFocused = focused;
         PlaceScreenIfNeeded(frameState.predictedDisplayTime);
+        if (world) ApplyWorldSpaceChange(frameState.predictedDisplayTime);
         if (frameState.shouldRender) {
-            CopyLatest(gTickCounter);
+            CopyLatest(CurrentTick());
         } else {
             ++frames.ShouldRenderFalse;
         }
@@ -954,6 +1028,7 @@ void CreateWorldSpace() {
         if (XR_SUCCEEDED(created) && bounded == XR_SUCCESS && bounds.width >= 1.0F && bounds.height >= 1.0F) {
             g.WorldSpace = stage;
             g.WorldSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
+            std::lock_guard lock(gPlayAreaMutex);
             gPlayArea = {bounds.width * 0.5F, bounds.height * 0.5F, true, 0.0F, "STAGE"};
         } else {
             XRLOG("TRIAEVUM_XR_WORLD stage_rejected create=%d bounds_result=%d bounds=%.2fx%.2f",
@@ -965,6 +1040,7 @@ void CreateWorldSpace() {
         info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR_EXT;
         if (XR_SUCCEEDED(xrCreateReferenceSpace(g.Session, &info, &g.WorldSpace))) {
             g.WorldSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR_EXT;
+            std::lock_guard lock(gPlayAreaMutex);
             gPlayArea = {0.0F, 0.0F, false, 0.0F, "LOCAL_FLOOR"};
         }
     }
@@ -972,6 +1048,7 @@ void CreateWorldSpace() {
         info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
         CheckXr(xrCreateReferenceSpace(g.Session, &info, &g.WorldSpace), "xrCreateReferenceSpace(world LOCAL)");
         g.WorldSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+        std::lock_guard lock(gPlayAreaMutex);
         gPlayArea = {0.0F, 0.0F, false, 1.65F, "LOCAL"};
     }
     // The view configuration (G2): the runtime's recommended eye size beside the chosen one (§2.6 gate).
@@ -983,9 +1060,10 @@ void CreateWorldSpace() {
         xrEnumerateViewConfigurationViews(g.Instance, g.System, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, viewCount,
                                           &viewCount, views.data());
     const VkExtent2D eye = EyeExtent();
+    const PlayArea area = WorldPlayArea();
     XRLOG("TRIAEVUM_XR_WORLD space=%s bounds=%.2fx%.2f floor_below_origin_m=%.2f offered_spaces=%s eye=%ux%u "
           "recommended=%ux%u max=%ux%u views=%u local_floor_ext=%d",
-          gPlayArea.Space, gPlayArea.HalfX * 2.0F, gPlayArea.HalfZ * 2.0F, gPlayArea.FloorBelowOriginM, list.c_str(),
+          area.Space, area.HalfX * 2.0F, area.HalfZ * 2.0F, area.FloorBelowOriginM, list.c_str(),
           eye.width, eye.height, viewCount != 0U ? views[0].recommendedImageRectWidth : 0U,
           viewCount != 0U ? views[0].recommendedImageRectHeight : 0U,
           viewCount != 0U ? views[0].maxImageRectWidth : 0U, viewCount != 0U ? views[0].maxImageRectHeight : 0U,
@@ -1174,7 +1252,10 @@ bool LocateHead(int64_t displayTimeNs, HeadPose* out) {
     return true;
 }
 
-PlayArea WorldPlayArea() { return gPlayArea; }
+PlayArea WorldPlayArea() {
+    std::lock_guard lock(gPlayAreaMutex);
+    return gPlayArea;
+}
 
 uint32_t TakeWorldRecenter() { return gWorldRecenters.exchange(0); }
 

@@ -158,10 +158,31 @@ void Placement() {
 
 }  // namespace
 
+void DisplayTicks() {
+    constexpr int64_t kPeriod = 11'111'111;  // 90 Hz
+    DisplayTickClock clock;
+    int64_t t = 5'000'000'000;
+    CHECK(clock.Advance(t, kPeriod) == 1U);
+    CHECK(clock.Advance(t += kPeriod, kPeriod) == 2U);
+    CHECK(clock.Advance(t += kPeriod + 900'000, kPeriod) == 3U);  // jitter is one period
+    CHECK(clock.Advance(t += 3 * kPeriod, kPeriod) == 6U);        // a late wait: two periods skipped
+    CHECK(clock.Skipped == 2U);
+    CHECK(clock.Advance(t, kPeriod) == 7U);                       // the same time again: still monotonic
+    // A refresh switch (90 -> 72 Hz): one period of the new rate is one tick.
+    constexpr int64_t k72 = 13'888'889;
+    CHECK(clock.Advance(t += k72, k72) == 8U);
+    // A stopped session's gap is not counted; the tick goes on by one.
+    clock.Pause();
+    const uint64_t skipped = clock.Skipped;
+    CHECK(clock.Advance(t += 50 * k72, k72) == 9U && clock.Skipped == skipped);
+    CHECK(clock.Advance(t += k72, k72) == 10U);
+}
+
 int main() {
     TapsAndChords();
     LatchAndPulse();
     Placement();
+    DisplayTicks();
     if (failures != 0) {
         std::printf("quest_xr_logic_tests: %d failure(s)\n", failures);
         return 1;

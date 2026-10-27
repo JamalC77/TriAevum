@@ -85,6 +85,7 @@ uint64_t gCopyValue = 0;
 bool gFirstImageLogged = false;
 Fast::StereoViews gShownViews{};
 bool gHasShownViews = false;
+std::atomic<uint32_t> gPublishedRigEpoch{0};  // renderer writes, XR thread reads
 
 VkFormat UnormTwin(VkFormat format) {
     switch (format) {
@@ -549,6 +550,7 @@ void PublishStereo(uint32_t slot, uint64_t renderValue, const Fast::StereoViews&
     gLatest.Kind = PublicationKind::Stereo;
     gLatest.Views = views;
     gLatest.PanelValid = panelValid;
+    if (views.RigEpoch > gPublishedRigEpoch.load()) gPublishedRigEpoch.store(views.RigEpoch);
     ++gStats.Publications;
     ++gStats.StereoPublications;
 }
@@ -682,6 +684,8 @@ void CopyLatest(uint64_t tick) {
         NoteFirstImage();
     }
 }
+
+uint32_t LatestPublishedRigEpoch() { return gPublishedRigEpoch.load(); }
 
 bool ShownViews(Fast::StereoViews* views) {
     if (!gHasShownViews) return false;

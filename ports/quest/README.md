@@ -117,6 +117,16 @@ TRIAEVUM_XR_VIEW=world
   doors and scene changes go black, then place the world behind Link again.
 - The display runs at 90 Hz (unless `TRIAEVUM_XR_REFRESH` is set) and each 30 Hz eye pair is shown
   for exactly 3 display frames. The game's frame-rate setting should stay Original (30).
+- A system recenter (or a redrawn boundary) takes effect at the runtime's change time: the world goes
+  black at once and comes back placed behind Link again; a new STAGE boundary is read again
+  (`TRIAEVUM_XR_WORLD bounds_changed=WxD`).
+- If the eye passes keep producing unusable draws (fallback draws in 30 consecutive eye frames), the
+  screen is shown for 5 s (doubled on each repeat, at most 60 s; a scene change ends it), then the
+  world is tried again (`TRIAEVUM_XR_VIEW render_safety=tripped|cleared`).
+- While the mode is on, the effects that build their camera from the game camera are off for rendering
+  (interactive grass, reflections and water reflections, AO, GI, TAA and temporal upscalers; MSAA,
+  SMAA and FXAA stay): they would slide against the eye images. The settings themselves are kept
+  (`TRIAEVUM_XR_VIEW effects_forced_off=...`). The FOV multiplier is 1 (`TRIAEVUM_XR_FOV`).
 
 | Key (in-world) | Values |
 |---|---|
@@ -139,11 +149,13 @@ Developer builds (`TRIAEVUM_DEV_LAB`): the `capture` op takes an optional `"view
 {"id": 3, "op": "capture", "path": "/sdcard/Android/data/org.triaevum.quest/files/logs/panel.bmp", "view": "panel"}
 ```
 
-`left`/`right` write the eye image (eye extent) of a world frame, `panel` the panel/HUD image (the
-cinema picture, or in a world frame the HUD overlays over black); without `view` a world frame gives
-the left eye, otherwise the panel. An eye asked for in a non-world frame falls back to the panel
-(`TRIAEVUM_XR_CAPTURE view=panel requested=left world_frame=0`). `--screenshot` captures the left
-eye of world frames.
+`left`/`right` write the eye image (eye extent) of the frame's eye pair, `panel` the panel/HUD image
+(the cinema picture, or in a world frame the HUD overlays over the black the frame-start clear left
+there; it is not shown in the headset before W4); without `view` a frame that drew a pair gives the
+left eye, otherwise the panel. An eye asked for in a frame that drew no pair (Cinema/Black, a failed
+pose prediction, no presented sample) falls back to the panel, since its eye images belong to an
+older frame (`TRIAEVUM_XR_CAPTURE view=panel requested=left eyes_drawn=0`). `--screenshot` captures
+the left eye of frames that drew a pair.
 
 In-world log lines (tag `TriAevumXR` and `native-stderr.log`):
 
@@ -151,17 +163,20 @@ In-world log lines (tag `TriAevumXR` and `native-stderr.log`):
 |---|---|
 | `TRIAEVUM_XR_VIEW_SELECT view=world` | the mode is on |
 | `TRIAEVUM_XR_WORLD space=STAGE bounds=WxD ... recommended=WxH` | world space, play area, the runtime's eye size |
+| `TRIAEVUM_XR_EVENT reference_space_change space= change_time=`, `TRIAEVUM_XR_RECENTER world=1 reason=space_change\|local_change`, `TRIAEVUM_XR_WORLD bounds_changed=WxD` | a system recenter or boundary change, applied at its change time |
 | `TRIAEVUM_XR_SWAPCHAIN eye=WxH array=2`, `TRIAEVUM_XR_SWAPCHAIN fade=4x4`, `TRIAEVUM_XR_FADE ready`, `TRIAEVUM_XR_TARGETS slots=2 views=3` | eye and fade swapchains, renderer targets |
 | `TRIAEVUM_XR_REFRESH ... requested=90` | the 90 Hz default |
 | `TRIAEVUM_XR_NAMESPACES ns1=400x240 ... ns3=WxH ns4=WxH` | per-namespace extents (set once) |
 | `TRIAEVUM_XR_CAMERA state=world\|cinema\|black owner=native blockers=0x.. (names)` | every state change and its reason |
 | `TRIAEVUM_XR_LAYER request= / shown=` | the compositor's layer mode (fades) |
 | `TRIAEVUM_XR_RIG event=place\|recenter\|door\|blink\|idle\|floor ... dist_m= epoch=` | rig changes; `event=status` every 5 s while the world shows |
-| `TRIAEVUM_XR_STATS ... stereo_publications= stereo_copies= layer=world` | ~150 pairs and ~450 display frames per 5 s at 90 Hz |
-| `TRIAEVUM_XR_TICK pairs= late_pairs= overruns= beats= lat_ticks= horizon_ms_mean= pacer_fallbacks=` | the 3:1 lock (`beats=0`, `late_pairs` < 1%) |
-| `TRIAEVUM_XR_VIEW full= sky= ui= ... fallback= mirrored= C= detR= detV=` | draw classes of the eye passes (every 5 s) |
+| `TRIAEVUM_XR_STATS ... stereo_publications= stereo_copies= layer=world skipped_ticks=` | ~150 pairs and ~450 display frames per 5 s at 90 Hz; `skipped_ticks` = display periods the XR thread missed (the tick counts periods, not waits) |
+| `TRIAEVUM_XR_TICK pairs= late_pairs= overruns= beats= lat_ticks= horizon_ms_mean= pacer_fallbacks= ... resyncs= held_frames= render_safety=` | the 3:1 lock (`beats=0`, `late_pairs` < 1%); `resyncs` = the pace pulled back to the display clock after it ran ahead (`TRIAEVUM_XR_TICK resync pace_was= latest= pace=`); `held_frames` = frames the guest was held (system menu, preparation screen) |
+| `TRIAEVUM_XR_VIEW full= sky= ui= ... fallback= c_nonneg= mirrored= C= detR= detV= fallback_frames=` | draw classes of the eye passes (every 5 s); `c_nonneg` = perspective rows with C >= 0, left out as fallback |
+| `TRIAEVUM_XR_VIEW render_safety=tripped hold_s= / cleared reason=hold\|scene` | the render safety's screen hold |
+| `TRIAEVUM_XR_VIEW effects_forced_off=` / `TRIAEVUM_XR_FOV multiplier=1 setting=` | camera-dependent effects and the FOV multiplier the mode overrides |
 | `TRIAEVUM_XR_FLAGS reason=edge flags1= flags2= setting=` | player flag and camera setting edges (decomp numbering check) |
-| `TRIAEVUM_XR_CAPTURE view= requested= w= h= path=` | a capture |
+| `TRIAEVUM_XR_CAPTURE view= requested= world_frame= eyes_drawn= w= h= path=` | a capture |
 
 On a PC (no headset), `TRIAEVUM_XR_PREVIEW=left|right` shows one eye in the desktop window
 (`TRIAEVUM_XR_PREVIEW_HEAD=identity` (default, must equal the mono picture), `sweep90`, `sweep180`, or

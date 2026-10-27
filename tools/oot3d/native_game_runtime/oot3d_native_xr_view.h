@@ -47,6 +47,7 @@ struct XrViewStats {
     uint64_t MirroredSamples = 0;
     uint64_t MirrorDisagreements = 0;  // draws whose own camera disagrees with the frame's mirror flag
     uint64_t RowFailures = 0;      // eye rows that could not be built (counted in fallback too)
+    uint64_t NonNegativeC = 0;     // perspective rows with C >= 0 (counted in fallback too, §2.2)
     uint64_t NoFrameCamera = 0;    // samples without a frame camera
     uint64_t FallbackFrames = 0;   // consecutive eye frames with fallback draws (render safety)
     double C = 0.0;
@@ -91,6 +92,13 @@ class XrViewRenderer {
     // After each presentation: the 5 s TRIAEVUM_XR_VIEW line; returns true while the render safety holds
     // (fallback draws in 30 consecutive eye frames).
     bool EndPresentation(bool eyesBuilt);
+    // The count of consecutive fallback frames restarts: every non-World presentation (the frames are
+    // consecutive eye frames only) and the end of a render-safety hold (XrWorldSession).
+    void ResetRenderSafety() {
+        mConsecutiveFallbackFrames = 0;
+        mStats.FallbackFrames = 0;
+        mFallbackThisFrame = false;
+    }
 
     const XrViewStats& Stats() const { return mStats; }
 

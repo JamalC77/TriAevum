@@ -6,6 +6,7 @@
 //    an eye pass (game uniforms, eye rows, rotation-only sky rows, or left out);
 //  - the eye-row rewrite with its per-camera chain cache (§2.2 "one rigid inverse per distinct V_g,d");
 //  - the tick-locked pacing p_N (§3.4) and the display time of a tick;
+//  - the render-safety hold (§2.3): Cinema for a timed hold after 30 fallback frames, then World again;
 //  - the W1 state classifier (§4.3 rows that need no hook): World / Cinema / Black with blockers;
 //  - the PC preview heads (§2.7): identity, an offset from the frame camera, the 90/180 deg sweeps.
 #pragma once
@@ -93,7 +94,9 @@ struct XrDrawFacts {
 inline XrDrawClass ClassifyXrDraw(const XrDrawFacts& f) {
     if (!f.OnTopTarget) return XrDrawClass::OffTarget;
     if (f.UiDomain) return f.ScreenContent ? XrDrawClass::Screen : XrDrawClass::Ui;
-    if (f.Projection == M::ProjectionStatus::NotPerspective || f.Projection == M::ProjectionStatus::NonNegativeC)
+    // Only a true orthographic f3 (not (0, 0, C, 0)) is ortho; a perspective f3 with C >= 0 is the
+    // fallback class (§2.2), counted and left out, never drawn head-locked with the game's rows.
+    if (f.Projection == M::ProjectionStatus::NotPerspective)
         return f.ViewportCoversTarget ? XrDrawClass::OrthoFull : XrDrawClass::OrthoOmitted;
     if (f.Projection != M::ProjectionStatus::Ok) return XrDrawClass::Fallback;
     if (!f.HasWorldToView) return f.HasFrameCamera ? XrDrawClass::FrameCam : XrDrawClass::Fallback;
@@ -220,13 +223,18 @@ inline bool XrDrawRows(const M::Rows& f, const std::array<float, 16>& worldToVie
 
 // ---------------------------------------------------------------------------------------------------
 // Tick-locked pacing (§3.4): p_N = p_{N-1} + d; a frame that starts with less than `margin` ticks left
-// resets the phase to latest + d (an overrun) instead of waiting for the next multiple.
+// resets the phase to latest + d (an overrun) instead of waiting for the next multiple. A pace that ran
+// ahead of the display clock (frames that advanced it without waiting for their tick: a held guest, tick
+// waits that timed out) is resynced to latest + d as well, so the guest never plays in slow motion while
+// real ticks catch up. The guest may be one frame ahead of the render worker's tick wait, so up to
+// 2d + margin ahead is normal.
 
 struct XrTickStep {
     uint64_t PaceTick = 0;  // p_N
     uint64_t Delta = 0;     // p_N - p_{N-1} (ticks of presentation time this frame)
     bool Overrun = false;
     bool Started = false;   // first step after (re)start: no previous tick
+    bool Resynced = false;  // the pace was ahead of the display clock and was pulled back
 };
 
 class XrTickPacer {
@@ -236,6 +244,8 @@ class XrTickPacer {
     uint32_t Divisor() const { return mDivisor; }
     void Restart() { mStarted = false; }
     uint64_t Previous() const { return mPrevious; }
+    // The furthest p_N may lead the latest tick before it is resynced.
+    uint64_t AheadLimit() const { return 2U * static_cast<uint64_t>(mDivisor) + kMargin; }
     XrTickStep Next(uint64_t latestTick) {
         XrTickStep step;
         if (!mStarted) {
@@ -247,6 +257,15 @@ class XrTickPacer {
             return step;
         }
         uint64_t pace = mPrevious + mDivisor;
+        if (pace > latestTick + AheadLimit()) {
+            // One guest frame of presentation time (p_N may move back: Delta is not pace - previous).
+            pace = latestTick + mDivisor;
+            step.Resynced = true;
+            step.PaceTick = pace;
+            step.Delta = mDivisor;
+            mPrevious = pace;
+            return step;
+        }
         if (latestTick + kMargin > pace) {
             pace = latestTick + mDivisor;
             step.Overrun = true;
@@ -273,6 +292,61 @@ inline uint32_t TickDivisor(double displayHz, double guestHz = 30.0) {
     if (!(displayHz > 0.0) || !(guestHz > 0.0)) return 3;
     return static_cast<uint32_t>(std::max(1.0, std::floor(displayHz / guestHz + 0.25)));
 }
+
+// ---------------------------------------------------------------------------------------------------
+// The render safety (§2.3: fallback draws in 30 consecutive eye frames switch to Cinema) as a timed
+// fallback, not a latch: the trip holds Cinema for 5 s (doubled on each repeat, 60 s at most); a scene
+// change ends the hold at once and restores the 5 s first hold. After the hold World is tried again (the
+// classifier's 0.5 s clear, then Black and placement); the render worker's count restarts from zero.
+
+class XrRenderSafetyHold {
+  public:
+    static constexpr double kFirstHoldSeconds = 5.0;
+    static constexpr double kMaxHoldSeconds = 60.0;
+    struct Step {
+        bool Blocking = false;  // the classifier's RenderSafety signal this update
+        bool Tripped = false;   // a hold started this update
+        bool Cleared = false;   // a hold ended this update: the reported flag and the count must reset
+        const char* ClearReason = "";
+        double HoldSeconds = 0.0;  // the hold that started or ended
+    };
+    // `tripped`: the render worker's flag (fallback frames >= 30). One update per completed guest frame.
+    Step Update(bool tripped, double now, bool sceneChanged) {
+        Step step;
+        if (mHolding) {
+            const bool expired = now - mSince >= mHold;
+            if (sceneChanged || expired) {
+                mHolding = false;
+                step.Cleared = true;
+                step.ClearReason = sceneChanged ? "scene" : "hold";
+                step.HoldSeconds = mHold;
+                if (sceneChanged) mNextHold = kFirstHoldSeconds;
+                return step;
+            }
+            step.Blocking = true;
+            step.HoldSeconds = mHold;
+            return step;
+        }
+        if (sceneChanged) mNextHold = kFirstHoldSeconds;
+        if (tripped) {
+            mHolding = true;
+            mSince = now;
+            mHold = mNextHold;
+            mNextHold = std::min(mNextHold * 2.0, kMaxHoldSeconds);
+            step.Blocking = true;
+            step.Tripped = true;
+            step.HoldSeconds = mHold;
+        }
+        return step;
+    }
+    bool Holding() const { return mHolding; }
+
+  private:
+    bool mHolding = false;
+    double mSince = 0.0;
+    double mHold = kFirstHoldSeconds;
+    double mNextHold = kFirstHoldSeconds;
+};
 
 // ---------------------------------------------------------------------------------------------------
 // The W1 state classifier (§4.3 rows that need no Camera_Update hook; §0 first light). One update per

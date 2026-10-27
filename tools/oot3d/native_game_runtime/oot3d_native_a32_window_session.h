@@ -600,6 +600,11 @@ private:
   // Render side: the state the current render command draws with, the namespace extents set once.
   Oot3dNativeGame::XrFrameState xrRenderState;
   bool xrExtentsApplied = false;
+  // Render side: both eyes of this host frame were executed (a pair is published); taken by the
+  // end-of-frame command (captures fall back to the panel without one).
+  bool xrEyesDrawn = false;
+  // Guest side: the FOV multiplier setting last logged as overridden (TRIAEVUM_XR_FOV).
+  float xrLoggedFovSetting = -1.0F;
   // Dev lab "capture" view (left|right|panel) of the pending forced screenshot.
   std::string pendingForcedScreenshotView;
 };

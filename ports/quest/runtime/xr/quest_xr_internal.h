@@ -117,6 +117,7 @@ bool EyeReleased();
 XrSwapchain FadeSwapchain();
 uint32_t FadeLevels();
 bool ShownViews(Fast::StereoViews* views);  // XR thread: the poses of the pair on the eye swapchain
+uint32_t LatestPublishedRigEpoch();         // any thread: the highest RigEpoch PublishStereo received
 struct SinkStats {
     uint64_t Publications = 0, Copies = 0, StaleDisplayFrames = 0, IncompleteSkips = 0, PublicationsDropped = 0,
              SwapchainWaitTimeouts = 0, StereoPublications = 0, StereoCopies = 0;

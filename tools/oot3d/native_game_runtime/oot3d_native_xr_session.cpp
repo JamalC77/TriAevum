@@ -86,10 +86,19 @@ bool XrWorldSession::BeginPresentation(double* elapsedSeconds) {
         mPacer.SetDivisor(divisor);
         mPacer.Restart();
     }
+    const uint64_t previousPace = mPacer.Previous();
     const auto step = mPacer.Next(tick.Tick);
     ++mPresentations;
     if (step.Overrun) ++mOverruns;
-    mLastOverrun = step.Overrun || step.Started;
+    if (step.Resynced) {
+        // The pace led the display clock by more than 2d + margin (tick waits that timed out): pulled
+        // back to latest + d, logged on the first one of a 5 s window.
+        if (mResyncs++ == 0U)
+            XrWorldLog("TRIAEVUM_XR_TICK resync pace_was=%llu latest=%llu pace=%llu",
+                       static_cast<unsigned long long>(previousPace + divisor),
+                       static_cast<unsigned long long>(tick.Tick), static_cast<unsigned long long>(step.PaceTick));
+    }
+    mLastOverrun = step.Overrun || step.Started || step.Resynced;
     const uint32_t latency = TriAevumQuestXr::ShownLatencyTicks();
     mState.PaceTick = step.PaceTick;
     mState.TargetTick = step.PaceTick + latency;
@@ -112,6 +121,13 @@ bool XrWorldSession::BeginPresentation(double* elapsedSeconds) {
 
 void XrWorldSession::NoteRefreshesDue(uint32_t due) {
     if (mState.TickPacing && !mLastOverrun && due != 1U) ++mBeats;
+}
+
+void XrWorldSession::NoteHeldFrame() {
+    // BeginPresentation already advanced p_N for this frame; nothing waited for that tick and the
+    // scheduler restored its clock, so the next frame starts the pace again from the latest tick.
+    mPacer.Restart();
+    ++mHeldFrames;
 }
 
 void XrWorldSession::NoteHorizon(double milliseconds) {
@@ -240,7 +256,23 @@ void XrWorldSession::StampFrame(const XrGuestSnapshot& snapshot, const XrFrameFa
     signals.UiRuleEnabled = !EnvIs("TRIAEVUM_XR_UI_CINEMA", "0");
     signals.PlayerValid = snapshot.PlayerValid;
     signals.SessionReady = mState.TickPacing;
-    signals.RenderSafety = mRenderSafety.load();
+    {
+        // The render safety (§2.3) as a timed hold: Cinema for 5 s (doubling per repeat, 60 s cap, a
+        // scene change ends it), then the reported flag and the render worker's count restart.
+        const bool sceneChanged = snapshot.PlayerValid && snapshot.Scene != mSafetyScene;
+        if (snapshot.PlayerValid) mSafetyScene = snapshot.Scene;
+        const auto safety = mSafety.Update(mRenderSafety.load(), now, sceneChanged);
+        if (safety.Tripped)
+            XrWorldLog("TRIAEVUM_XR_VIEW render_safety=tripped hold_s=%.0f scene=0x%X", safety.HoldSeconds,
+                       static_cast<unsigned>(static_cast<uint16_t>(snapshot.Scene)));
+        if (safety.Cleared) {
+            mRenderSafety.store(false);
+            mRenderSafetyReset.store(true);
+            XrWorldLog("TRIAEVUM_XR_VIEW render_safety=cleared reason=%s hold_s=%.0f", safety.ClearReason,
+                       safety.HoldSeconds);
+        }
+        signals.RenderSafety = safety.Blocking;
+    }
     signals.Flags1 = snapshot.Flags1;
     signals.Flags2 = snapshot.Flags2;
     signals.CameraSetting = snapshot.CameraValid ? snapshot.CameraSetting : 0;
@@ -368,7 +400,8 @@ void XrWorldSession::LogPeriodic(double audioBufferedMs) {
     const double horizonMax = mHorizonMax.exchange(0.0);
     XrWorldLog("TRIAEVUM_XR_TICK pairs=%llu late_pairs=%llu overruns=%llu beats=%llu presentations=%llu lat_ticks=%u "
                "horizon_ms_mean=%.1f horizon_ms_max=%.1f pacer_fallbacks=%llu predict_failures=%llu "
-               "audio_buffered_ms=%.0f divisor=%u pacing=%d state=%s placements=%llu blinks=%llu epoch=%u",
+               "audio_buffered_ms=%.0f divisor=%u pacing=%d state=%s placements=%llu blinks=%llu epoch=%u "
+               "resyncs=%llu held_frames=%llu render_safety=%d",
                static_cast<unsigned long long>(pairs.Pairs), static_cast<unsigned long long>(pairs.LatePairs),
                static_cast<unsigned long long>(mOverruns), static_cast<unsigned long long>(mBeats),
                static_cast<unsigned long long>(mPresentations), pairs.LatencyTicks,
@@ -377,7 +410,8 @@ void XrWorldSession::LogPeriodic(double audioBufferedMs) {
                static_cast<unsigned long long>(mPredictFailures.exchange(0)), audioBufferedMs, mPacer.Divisor(),
                mState.TickPacing ? 1 : 0, W::XrWorldStateName(mState.Mode),
                static_cast<unsigned long long>(mPlacements), static_cast<unsigned long long>(mBlinks),
-               mState.RigEpoch);
+               mState.RigEpoch, static_cast<unsigned long long>(mResyncs),
+               static_cast<unsigned long long>(mHeldFrames), mSafety.Holding() ? 1 : 0);
     if (mState.World) {
         M::Pose head;
         const bool hasHead = HeadInTracking(&head);
@@ -389,7 +423,7 @@ void XrWorldSession::LogPeriodic(double audioBufferedMs) {
                    hasHead ? M::DistanceXZ(linkT, head.Position) : -1.0, M::RadiansToDegrees(mRig.Yaw),
                    static_cast<int>(mFloor.Mode), mRig.Anchor.Y, mState.RigEpoch);
     }
-    mOverruns = mBeats = mPresentations = mPlacements = mBlinks = 0;
+    mOverruns = mBeats = mPresentations = mPlacements = mBlinks = mResyncs = mHeldFrames = 0;
 }
 
 }  // namespace Oot3dNativeGame
