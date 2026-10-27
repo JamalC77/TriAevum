@@ -7,6 +7,8 @@ dependencies { testImplementation("junit:junit:4.13.2") }
 val sdlSource = providers.gradleProperty("triaevumSdlSource")
 val nativeStage = providers.gradleProperty("triaevumNativeStage")
 val questAssets = providers.gradleProperty("triaevumQuestAssets")
+// Immersive mode (TriAevumXrActivity, the OpenXR loader); false only for a QUEST_OPENXR=0 build.
+val questOpenXr = providers.gradleProperty("triaevumQuestOpenXr").map { it.toBoolean() }.orElse(true)
 val versionCodeValue = (System.getenv("TRIAEVUM_QUEST_VERSION_CODE") ?: "1").toInt()
 val versionNameValue = System.getenv("TRIAEVUM_QUEST_VERSION_NAME") ?: "0.8.0-beta.1.2-quest.dev"
 val keystore = System.getenv("TRIAEVUM_QUEST_KEYSTORE_FILE")?.let { file(it) }?.takeIf { it.isFile }
@@ -21,7 +23,9 @@ android {
         versionCode = versionCodeValue
         versionName = versionNameValue
         ndk { abiFilters += "arm64-v8a" }
+        buildConfigField("boolean", "QUEST_OPENXR", questOpenXr.get().toString())
     }
+    buildFeatures { buildConfig = true }
     signingConfigs {
         if (keystore != null) {
             create("quest") {
@@ -64,7 +68,9 @@ tasks.register("checkNativeStage") {
         check(sdlSource.isPresent && nativeStage.isPresent && questAssets.isPresent) {
             "Supply -PtriaevumSdlSource, -PtriaevumNativeStage and -PtriaevumQuestAssets from tools/quest/build_quest.sh."
         }
-        for (name in listOf("SDL2", "TriAevum", "triaevum_title_bootstrap", "c++_shared")) {
+        val required = listOf("SDL2", "TriAevum", "triaevum_title_bootstrap", "c++_shared") +
+            (if (questOpenXr.get()) listOf("openxr_loader") else emptyList())
+        for (name in required) {
             check(file("${nativeStage.get()}/arm64-v8a/lib$name.so").isFile) { "Missing native library: $name" }
         }
         check(!file("${nativeStage.get()}/arm64-v8a/libtriaevum_title_aot.so").exists()) {

@@ -1,20 +1,43 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Milestone Q2: a 2D Horizon OS panel app (no VR intent category), so the game shows flat
-     in a panel window. The immersive OpenXR activity replaces it in Q3. -->
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<!-- Milestone Q3: a Meta Quest hybrid app. The launcher is a 2D panel that installs the side-loaded
+     title, then starts the immersive TriAevumXrActivity (OpenXR, the game on a virtual screen) or the
+     flat-panel TriAevumGameActivity (TRIAEVUM_QUEST_MODE=panel, or the launcher's choice). The Quest
+     entries follow Xelee's platforms/android/app/src/xr/AndroidManifest.xml and the hello app. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:metavr="http://schemas.meta.com/metavr-sdk">
+
+    <!-- Hybrid (2D panel + immersive) apps need Horizon OS v69+. -->
+    <metavr:uses-metavr-sdk
+        metavr:minSdkVersion="69"
+        metavr:targetSdkVersion="207" />
+
     <uses-feature android:name="android.hardware.vulkan.level" android:version="1" android:required="true" />
+    <uses-feature android:name="android.hardware.vr.headtracking" android:version="1" android:required="true" />
+    <uses-feature android:name="com.oculus.feature.PASSTHROUGH" android:required="false" />
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
     <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
     <uses-feature android:name="android.hardware.gamepad" android:required="false" />
     <uses-feature android:name="android.hardware.usb.host" android:required="false" />
     <uses-permission android:name="android.permission.VIBRATE" />
 
+    <!-- Khronos loader: the runtime broker. -->
+    <uses-permission android:name="org.khronos.openxr.permission.OPENXR" />
+    <uses-permission android:name="org.khronos.openxr.permission.OPENXR_SYSTEM" />
+
+    <queries>
+        <provider android:authorities="org.khronos.openxr.runtime_broker;org.khronos.openxr.system_runtime_broker" />
+        <intent><action android:name="org.khronos.openxr.OpenXRRuntimeService" /></intent>
+        <intent><action android:name="org.khronos.openxr.OpenXRApiLayerService" /></intent>
+    </queries>
+
     <application android:label="@string/app_name"
         android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen"
         android:allowBackup="false">
         <meta-data android:name="com.oculus.supportedDevices" android:value="quest3|quest3s" />
+        <meta-data android:name="com.oculus.vr.focusaware" android:value="true" />
 
-        <!-- Installs a side-loaded title module, checks it, then starts the game. -->
+        <!-- Installs a side-loaded title module, checks it, then starts the game. The 2D category
+             keeps it a panel in the hybrid app; MAIN/LAUNCHER stays as the required entry. -->
         <activity android:name=".TriAevumLauncherActivity" android:exported="true"
             android:screenOrientation="landscape"
             android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode|navigation|density">
@@ -22,11 +45,17 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="com.oculus.intent.category.2D" />
+            </intent-filter>
             <layout android:defaultWidth="1280dp" android:defaultHeight="720dp"
                 android:minWidth="640dp" android:minHeight="360dp" />
         </activity>
 
-        <!-- SDL owns the Surface and lifecycle. Not exported: only the launcher starts it. -->
+        <!-- The flat panel: SDL owns the Surface and lifecycle. Not exported: only the launcher
+             starts it. -->
         <activity android:name=".TriAevumGameActivity" android:exported="false"
             android:screenOrientation="landscape"
             android:launchMode="singleTask"
@@ -34,6 +63,24 @@
             android:configChanges="layoutDirection|locale|keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode|navigation|density">
             <layout android:defaultWidth="1280dp" android:defaultHeight="720dp"
                 android:minWidth="640dp" android:minHeight="360dp" />
+        </activity>
+
+        <!-- The immersive game, in its own process: SDL keeps process-wide state, so it cannot
+             share one with the panel activity. Exported for the direct-start test hook; its runtime
+             arguments are accepted only inside the app's own directories (TriAevumSdlActivity). -->
+        <activity android:name=".TriAevumXrActivity"
+            android:process=":xr"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="landscape"
+            android:resizeableActivity="false"
+            android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|smallestScreenSize|uiMode|layoutDirection|locale|fontScale">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="com.oculus.intent.category.VR" />
+                <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD" />
+            </intent-filter>
         </activity>
     </application>
 </manifest>
