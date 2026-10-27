@@ -276,9 +276,24 @@ jobs:
           Get-ChildItem $env:BUILD_DIR -File | Where-Object Extension -in '.exe', '.dll', '.json' |
             Format-Table Name, Length -AutoSize
           & "$env:LLVM_ROOT\bin\llvm-readobj.exe" --coff-imports $exe | Select-String 'Name:' | Select-Object -Unique
-          $env:PATH = "$env:BUILD_DIR;$env:PATH"
-          $info = & $exe --product-info 2>&1
-          "--product-info exit code: $LASTEXITCODE"
+          # The runner has no Vulkan loader; TriAevum.exe imports vulkan-1.dll,
+          # so take LunarG's loader for this check only (never packaged).
+          $rt = "$env:RUNNER_TEMP\vkrt"
+          curl.exe -fsSL --retry 5 -o "$env:RUNNER_TEMP\vkrt.zip" "https://sdk.lunarg.com/sdk/download/$env:VULKAN_SDK_VERSION/windows/VulkanRT-X64-$env:VULKAN_SDK_VERSION-Components.zip"
+          if ($LASTEXITCODE) { throw 'Vulkan runtime download failed' }
+          Expand-Archive "$env:RUNNER_TEMP\vkrt.zip" "$env:RUNNER_TEMP\vkrt-zip" -Force
+          $loader = Get-ChildItem "$env:RUNNER_TEMP\vkrt-zip" -Recurse -Filter vulkan-1.dll |
+            Where-Object { $_.FullName -like '*\x64\*' } | Select-Object -First 1
+          if (-not $loader) { $loader = Get-ChildItem "$env:RUNNER_TEMP\vkrt-zip" -Recurse -Filter vulkan-1.dll | Select-Object -First 1 }
+          if (-not $loader) { throw 'No vulkan-1.dll in the Vulkan runtime archive' }
+          New-Item -ItemType Directory -Force $rt | Out-Null
+          Copy-Item $loader.FullName $rt
+          $env:PATH = "$rt;$env:BUILD_DIR;$env:PATH"
+          $info = & $exe --product-info
+          $code = $LASTEXITCODE
+          "--product-info exit code: $code"
+          if ($code) { throw "TriAevum.exe --product-info failed with $code" }
+          $info | Out-File -Encoding utf8 "$env:RUNNER_TEMP\product-info.json"
           $info
 
       - name: Stage artifacts
@@ -292,8 +307,8 @@ jobs:
           Copy-Item "$env:BUILD_DIR\symbols\*" $sym
           $exe = Join-Path $out 'TriAevum.exe'
           $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
-          $env:PATH = "$env:BUILD_DIR;$env:PATH"
-          $info = (& $exe --product-info 2>$null) -join "`n"
+          $info = Get-Content "$env:RUNNER_TEMP\product-info.json" -Raw | ConvertFrom-Json
+          Copy-Item "$env:RUNNER_TEMP\product-info.json" (Join-Path $out 'product-info.json')
           [ordered]@{
             format = 'triaevum_vr_host_build_v1'
             source_commit = '${{ github.sha }}'
@@ -306,7 +321,7 @@ jobs:
             vcpkg = $env:VCPKG_REF
             msvc_toolset = '${{ steps.vs.outputs.msvc }}'
             modules_excluded = @('triaevum_immerse', 'triaevum_dlss')
-            product_info = $info
+            product_info = [ordered]@{ format = $info.format; source_commit = $info.source_commit; whole_aot_plugin_abi = $info.whole_aot_plugin_abi; capabilities = $info.capabilities }
           } | ConvertTo-Json -Depth 4 | Out-File -Encoding utf8 (Join-Path $out 'build-info.json')
           Get-Content (Join-Path $out 'build-info.json')
 
