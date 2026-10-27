@@ -168,8 +168,11 @@ final class TitleInstaller {
 
     private static JSONObject readJson(InputStream stream) throws Exception {
         try (InputStream input = stream) {
-            byte[] bytes = input.readAllBytes();
-            return new JSONObject(new String(bytes, StandardCharsets.UTF_8));
+            java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = input.read(buffer)) > 0) bytes.write(buffer, 0, read);
+            return new JSONObject(new String(bytes.toByteArray(), StandardCharsets.UTF_8));
         }
     }
 
