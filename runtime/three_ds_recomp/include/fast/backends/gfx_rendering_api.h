@@ -281,6 +281,14 @@ class GfxRenderingAPI : public ::Fast::Renderer3ds::PicaRenderBackend {
         (void)rgb;
         return false;
     }
+    // The alpha channel of the same image (one byte per pixel, top row first); false where a backend
+    // has none. The in-world HUD capture writes it beside the colour capture.
+    virtual bool ReadFramebufferAlpha8ToCPU(uint32_t width, uint32_t height, uint8_t* alpha) {
+        (void)width;
+        (void)height;
+        (void)alpha;
+        return false;
+    }
     virtual void ResolveMSAAColorBuffer(int fbIdTarger, int fbIdSrc) = 0;
     virtual std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
     GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) = 0;

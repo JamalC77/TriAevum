@@ -163,6 +163,74 @@ inline float ScreenHeight(float width, uint32_t pixelWidth, uint32_t pixelHeight
     return pixelWidth == 0U ? 0.0F : width * static_cast<float>(pixelHeight) / static_cast<float>(pixelWidth);
 }
 
+inline float WrapRadians(float angle) {
+    if (!std::isfinite(angle)) return 0.0F;
+    constexpr float kTwoPi = 6.28318530718F;
+    angle = std::fmod(angle + 3.14159265359F, kTwoPi);
+    if (angle < 0.0F) angle += kTwoPi;
+    return angle - 3.14159265359F;
+}
+
+// ---- In-world HUD (inworld-spec W4, minimal): a lazily body-locked quad in LOCAL. Its position follows
+// the head every display frame (DistanceM ahead along the HUD yaw, PitchRadians below the horizon); its
+// yaw stays put while the head turns less than DeadzoneRadians away and then catches up smoothly
+// (exponential, CatchUpSeconds) until within SettleRadians, so the hearts and rings sit in the periphery
+// instead of being glued to the face. The quad faces the head (yaw, then pitch).
+struct HudFollowConfig {
+    float DistanceM = 2.5F;
+    float PitchRadians = -0.13962634F;    // -8 deg: centred slightly below eye level
+    float DeadzoneRadians = 0.61086524F;  // 35 deg
+    float CatchUpSeconds = 0.3F;
+    float SettleRadians = 0.034906585F;   // 2 deg
+};
+
+struct HudFollow {
+    bool Valid = false;
+    bool Following = false;
+    float Yaw = 0.0F;
+    uint32_t Placements = 0;  // snaps (first frame, Reset) and catch-ups started
+
+    // The next frame snaps the HUD in front of the head (entering the world, a recenter).
+    void Reset() {
+        Valid = false;
+        Following = false;
+    }
+
+    ScreenPlacement Update(const Quat& head, const Vec3& headPosition, float dt, const HudFollowConfig& config) {
+        const float headYaw = HeadYaw(head);
+        const float safeDt = std::isfinite(dt) && dt > 0.0F ? dt : 0.0F;
+        if (!Valid || !std::isfinite(Yaw)) {
+            Yaw = headYaw;
+            Valid = true;
+            Following = false;
+            ++Placements;
+        } else {
+            const float delta = WrapRadians(headYaw - Yaw);
+            if (!Following && std::fabs(delta) > config.DeadzoneRadians) {
+                Following = true;
+                ++Placements;
+            }
+            if (Following) {
+                const float k = config.CatchUpSeconds > 0.0F ? 1.0F - std::exp(-safeDt / config.CatchUpSeconds)
+                                                             : (safeDt > 0.0F ? 1.0F : 0.0F);
+                Yaw = WrapRadians(Yaw + delta * k);
+                if (std::fabs(WrapRadians(headYaw - Yaw)) <= config.SettleRadians) Following = false;
+            }
+        }
+        const float pitch = std::isfinite(config.PitchRadians) ? config.PitchRadians : 0.0F;
+        const float distance = std::isfinite(config.DistanceM) ? config.DistanceM : 0.0F;
+        ScreenPlacement placement;
+        placement.YawRadians = Yaw;
+        const float sy = std::sin(Yaw * 0.5F), cy = std::cos(Yaw * 0.5F);
+        const float sp = std::sin(pitch * 0.5F), cp = std::cos(pitch * 0.5F);
+        placement.Orientation = {cy * sp, sy * cp, -sy * sp, cy * cp};  // RotY(yaw) * RotX(pitch)
+        const float horizontal = std::cos(pitch) * distance;
+        placement.Position = {headPosition.X - std::sin(Yaw) * horizontal, headPosition.Y + std::sin(pitch) * distance,
+                              headPosition.Z - std::cos(Yaw) * horizontal};
+        return placement;
+    }
+};
+
 // ---- The display clock's tick (inworld-spec §3.4): display periods since the session began, from the
 // runtime's predicted display times, not a count of xrWaitFrame calls. A late wait that skips periods
 // advances the tick by the periods that passed (counted in Skipped); a stopped session (Pause) does not

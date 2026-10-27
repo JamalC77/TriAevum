@@ -350,6 +350,7 @@ class GfxRenderingAPIVulkan final : public GfxRenderingAPI,
     void ClearFramebuffer(bool color, bool depth) override;
     void ReadFramebufferToCPU(int fbId, uint32_t width, uint32_t height, uint16_t* rgba16Buf) override;
     bool ReadFramebufferRgb8ToCPU(uint32_t width, uint32_t height, uint8_t* rgb) override;
+    bool ReadFramebufferAlpha8ToCPU(uint32_t width, uint32_t height, uint8_t* alpha) override;
     // The presented swapchain image as 8-bit RGBA (or BGRA); empty when none.
     std::vector<uint8_t> ReadSwapchainRgba8(uint32_t& width, uint32_t& height, bool& bgra);
     void ResolveMSAAColorBuffer(int fbIdTarget, int fbIdSrc) override;

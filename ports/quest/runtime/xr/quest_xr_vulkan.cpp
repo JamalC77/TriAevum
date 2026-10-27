@@ -2,7 +2,8 @@
 // publication, the copy into the swapchain on the XR queue, the timelines and the XR queue lock.
 // q3-spec §4.1, §5. In-world mode (inworld-spec §2.4, §3.3): three targets per frame slot (panel,
 // eye L, eye R), stereo publications that carry their eye poses, the eye swapchain (arraySize 2) and
-// the static fade swapchain.
+// the static fade swapchain. The HUD (W4, minimal): the panel of a stereo publication with panelValid
+// is copied into its own swapchain in the same submit as the eyes.
 #include "quest_xr_internal.h"
 
 #include <algorithm>
@@ -42,6 +43,7 @@ struct SwapchainState {
 SwapchainState gQuad;  // Q3 screen / cinema picture
 SwapchainState gEye;   // in-world: eye L -> layer 0, eye R -> layer 1
 SwapchainState gFade;  // in-world: static 16-layer array of (0, 0, 0, k/15)
+SwapchainState gHud;   // in-world: the HUD over transparent (premultiplied alpha), panel extent
 constexpr uint32_t kFadeLevels = 16;
 VkFormat gSwapchainFormat = VK_FORMAT_UNDEFINED;
 VkFormat gTargetFormat = VK_FORMAT_R8G8B8A8_UNORM;
@@ -130,7 +132,7 @@ void WaitCopyTimeline(uint64_t value, const char* what) {
     gStats.CopyWaitMsMax = std::max(gStats.CopyWaitMsMax, waitedMs);
 }
 
-void ClearCopying(const std::array<int, 2>& images, size_t count) {
+void ClearCopying(const int* images, size_t count) {
     {
         std::lock_guard lock(gSink);
         for (size_t i = 0; i < count; ++i)
@@ -270,6 +272,7 @@ bool SubmitCopy(CopySlot& slot, uint64_t renderValue, uint64_t* signalled) {
             // Nothing will recover: stop showing the layers and end the run instead of looping.
             gQuad.Released = false;
             gEye.Released = false;
+            gHud.Released = false;
             BeginExit("device_lost");
         }
         return false;
@@ -336,6 +339,9 @@ VkExtent2D EyeSwapchainExtent() { return gEye.Extent; }
 bool EyeReleased() { return gEye.Released.load(); }
 XrSwapchain FadeSwapchain() { return gFade.Handle; }
 uint32_t FadeLevels() { return kFadeLevels; }
+XrSwapchain HudSwapchain() { return gHud.Handle; }
+VkExtent2D HudSwapchainExtent() { return gHud.Extent; }
+bool HudReleased() { return gHud.Handle != XR_NULL_HANDLE && gHud.Released.load(); }
 VkSemaphore RenderTimeline() { return gRenderTimeline; }
 VkSemaphore CopyTimeline() { return gCopyTimeline; }
 
@@ -379,6 +385,15 @@ void CreateWorldSwapchains() {
     // rendered per frame (cleared once, on the XR thread, by PrepareFadeSwapchain).
     CreateSwapchain(gFade, "fade", {4, 4}, kFadeLevels, XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT);
     XRLOG("TRIAEVUM_XR_SWAPCHAIN fade=4x4 array=%u images=%zu", kFadeLevels, gFade.Images.size());
+    // The HUD: the panel's extent and format (the sRGB swapchain receives the UNORM panel's encoded
+    // bytes unchanged, like the quad). The panel holds premultiplied colour in the encoded space.
+    if (HudEnabled()) {
+        CreateSwapchain(gHud, "hud", PanelExtent(), 1);
+        XRLOG("TRIAEVUM_XR_SWAPCHAIN hud=%ux%u format=%d images=%zu alpha=premultiplied", gHud.Extent.width,
+              gHud.Extent.height, static_cast<int>(gSwapchainFormat), gHud.Images.size());
+    } else {
+        XRLOG("TRIAEVUM_XR_SWAPCHAIN hud=off (TRIAEVUM_XR_HUD=0)");
+    }
 }
 
 bool PrepareFadeSwapchain() {
@@ -415,7 +430,7 @@ void CreateCopyResources() {
     pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pool.queueFamilyIndex = g.QueueFamily;
     Require(vkCreateCommandPool(g.Device, &pool, nullptr, &gCommandPool), "vkCreateCommandPool(xr)");
-    for (SwapchainState* swapchain : {&gQuad, &gEye, &gFade}) {
+    for (SwapchainState* swapchain : {&gQuad, &gEye, &gFade, &gHud}) {
         swapchain->Slots.assign(swapchain->Images.size(), {});
         for (auto& slot : swapchain->Slots) {
             VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -549,19 +564,23 @@ void PublishStereo(uint32_t slot, uint64_t renderValue, const Fast::StereoViews&
     gLatest.Serial = ++gSerial;
     gLatest.Kind = PublicationKind::Stereo;
     gLatest.Views = views;
-    gLatest.PanelValid = panelValid;
+    gLatest.PanelValid = panelValid && gHud.Handle != XR_NULL_HANDLE;
     if (views.RigEpoch > gPublishedRigEpoch.load()) gPublishedRigEpoch.store(views.RigEpoch);
     ++gStats.Publications;
     ++gStats.StereoPublications;
+    if (gLatest.PanelValid) ++gStats.HudPublications;
 }
 
 void CopyLatest(uint64_t tick) {
     auto& g = G();
     Publication publication;
-    std::array<int, 2> sources{-1, -1};
-    std::array<VkImage, 2> images{};
-    std::array<VkExtent2D, 2> extents{};
+    // Sources [0, count) go to `swapchain` (the eyes, or the panel); for a stereo pair with panelValid
+    // the slot's panel follows at index count (= 2) and goes to the HUD swapchain.
+    std::array<int, 3> sources{-1, -1, -1};
+    std::array<VkImage, 3> images{};
+    std::array<VkExtent2D, 3> extents{};
     size_t count = 0;
+    bool hud = false;
     SwapchainState* swapchain = &gQuad;
     {
         std::lock_guard lock(gSink);
@@ -583,81 +602,108 @@ void CopyLatest(uint64_t tick) {
                 return;
             }
             sources = {TargetIndex(publication.Slot, Fast::kXrViewEyeLeft),
-                       TargetIndex(publication.Slot, Fast::kXrViewEyeRight)};
+                       TargetIndex(publication.Slot, Fast::kXrViewEyeRight), -1};
             count = 2;
             swapchain = &gEye;
+            hud = publication.PanelValid && gHud.Handle != XR_NULL_HANDLE;
+            if (hud) sources[2] = TargetIndex(publication.Slot, Fast::kXrViewPanel);
         } else {
             sources[0] = TargetIndex(publication.Slot, Fast::kXrViewPanel);
             count = 1;
         }
-        for (size_t i = 0; i < count; ++i) {
+        const size_t total = count + (hud ? 1U : 0U);
+        for (size_t i = 0; i < total; ++i) {
             if (sources[i] < 0 || static_cast<size_t>(sources[i]) >= gTargets.size()) {
+                for (size_t j = 0; j < i; ++j) gTargets[sources[j]].Copying = false;
                 gShownSerial = publication.Serial;
                 return;
             }
             Target& target = gTargets[sources[i]];
             target.Copying = true;
+            const VkExtent2D destination = i < count ? swapchain->Extent : gHud.Extent;
             images[i] = target.Image;
-            extents[i] = {std::min(target.Extent.width, swapchain->Extent.width),
-                          std::min(target.Extent.height, swapchain->Extent.height)};
+            extents[i] = {std::min(target.Extent.width, destination.width),
+                          std::min(target.Extent.height, destination.height)};
         }
     }
+    size_t total = count + (hud ? 1U : 0U);
     const int index = AcquireAndWait(*swapchain);
     if (index < 0) {
-        ClearCopying(sources, count);
+        ClearCopying(sources.data(), total);
         return;
+    }
+    int hudIndex = -1;
+    if (hud) {
+        hudIndex = AcquireAndWait(gHud);
+        if (hudIndex < 0) {
+            // The eyes go on without it; the HUD keeps its last image (an acquired one stays pending).
+            ClearCopying(&sources[count], 1);
+            hud = false;
+            total = count;
+            std::lock_guard lock(gSink);
+            ++gStats.HudSkips;
+        }
     }
     CopySlot& slot = swapchain->Slots[static_cast<size_t>(index)];
     VkCommandBuffer command = BeginSlot(slot);
     const VkImage destination = swapchain->Images[static_cast<size_t>(index)].image;
-    // A: the renderer's targets (left in PRESENT_SRC by their scanouts) become copy sources; the
-    //    render-timeline wait (TRANSFER stage) orders them after the frame.
-    for (size_t i = 0; i < count; ++i)
+    const VkImage hudDestination = hud ? gHud.Images[static_cast<size_t>(hudIndex)].image : VK_NULL_HANDLE;
+    // A: the renderer's targets (left in PRESENT_SRC by their scanouts and overlay passes) become copy
+    //    sources; the render-timeline wait (TRANSFER stage) orders them after the frame.
+    for (size_t i = 0; i < total; ++i)
         Barrier(command, images[i], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0,
                 VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-    // B: the swapchain image's previous contents are discarded (every layer).
+    // B: the swapchain images' previous contents are discarded (every layer).
     Barrier(command, destination, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
             VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
             swapchain->ArraySize);
-    // Same-size formats (UNORM target into its sRGB twin): the encoded bytes pass unchanged. Eye i goes
-    // to layer i.
-    for (size_t i = 0; i < count; ++i) {
+    if (hud)
+        Barrier(command, hudDestination, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    // Same-size formats (UNORM target into its sRGB twin): the encoded bytes pass unchanged, alpha too.
+    // Eye i goes to layer i; the panel of a pair to the HUD image.
+    for (size_t i = 0; i < total; ++i) {
         VkImageCopy copy{};
         copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, static_cast<uint32_t>(i), 1};
+        copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, i < count ? static_cast<uint32_t>(i) : 0U, 1};
         copy.extent = {extents[i].width, extents[i].height, 1};
-        vkCmdCopyImage(command, images[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination,
-                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        vkCmdCopyImage(command, images[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       i < count ? destination : hudDestination, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     }
     // C: the targets go back to the layout the renderer's passes expect.
-    for (size_t i = 0; i < count; ++i)
+    for (size_t i = 0; i < total; ++i)
         Barrier(command, images[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, 0, 0,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     // D: a released color swapchain image is in COLOR_ATTACHMENT_OPTIMAL (XR_KHR_vulkan_enable).
     Barrier(command, destination, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
             swapchain->ArraySize);
+    if (hud)
+        Barrier(command, hudDestination, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     vkEndCommandBuffer(command);
 
     uint64_t signalValue = 0;
     if (!SubmitCopy(slot, publication.RenderValue, &signalValue)) {
-        ClearCopying(sources, count);
-        // A released colour image must be written and in COLOR_ATTACHMENT_OPTIMAL: keep this one
-        // acquired and waited, and retry the copy next display frame (no new acquire or wait).
+        ClearCopying(sources.data(), total);
+        // A released colour image must be written and in COLOR_ATTACHMENT_OPTIMAL: keep these acquired
+        // and waited, and retry the copy next display frame (no new acquire or wait).
         return;
     }
     static const bool releaseWait = EnvFlag("TRIAEVUM_XR_RELEASE_WAIT");
     if (releaseWait) vkWaitForFences(g.Device, 1, &slot.Fence, VK_TRUE, UINT64_MAX);
     ReleaseImage(*swapchain);
+    if (hud) ReleaseImage(gHud);
     {
         std::lock_guard lock(gSink);
-        for (size_t i = 0; i < count; ++i) {
+        for (size_t i = 0; i < total; ++i) {
             Target& target = gTargets[sources[i]];
             target.LastCopyValue = signalValue;
             target.Copying = false;
         }
         gShownSerial = publication.Serial;
         ++gStats.Copies;
+        if (hud) ++gStats.HudCopies;
         if (publication.Kind == PublicationKind::Stereo) {
             ++gStats.StereoCopies;
             // Shown latency: ticks from the renderer's pace tick to this first display.
@@ -682,6 +728,13 @@ void CopyLatest(uint64_t tick) {
               static_cast<unsigned long long>(publication.RenderValue), index,
               publication.Kind == PublicationKind::Stereo ? "stereo" : "panel");
         NoteFirstImage();
+    }
+    static bool hudLogged = false;
+    if (hud && !hudLogged) {
+        hudLogged = true;
+        XRLOG("TRIAEVUM_XR_HUD first_copy serial=%llu xr_image=%d w=%u h=%u",
+              static_cast<unsigned long long>(publication.Serial), hudIndex, extents[count].width,
+              extents[count].height);
     }
 }
 
@@ -728,6 +781,7 @@ void DestroyQuadSwapchain() {
     DestroySwapchain(gQuad);
     DestroySwapchain(gEye);
     DestroySwapchain(gFade);
+    DestroySwapchain(gHud);
     gHasShownViews = false;
 }
 
@@ -735,7 +789,7 @@ void DestroyVulkanObjects() {
     if (!Requested()) return;
     auto& g = G();
     if (g.Device == VK_NULL_HANDLE) return;
-    for (SwapchainState* swapchain : {&gQuad, &gEye, &gFade}) {
+    for (SwapchainState* swapchain : {&gQuad, &gEye, &gFade, &gHud}) {
         for (auto& slot : swapchain->Slots)
             if (slot.Fence != VK_NULL_HANDLE) vkDestroyFence(g.Device, slot.Fence, nullptr);
         swapchain->Slots.clear();

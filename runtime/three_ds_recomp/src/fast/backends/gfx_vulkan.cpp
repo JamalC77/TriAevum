@@ -194,6 +194,12 @@ void GfxRenderingAPIVulkan::SetUseAlpha(bool useAlpha) {
         mBlendState.DestRgb = GfxNativeBlendFactor::OneMinusSourceAlpha;
         mBlendState.SourceAlpha = GfxNativeBlendFactor::SourceAlpha;
         mBlendState.DestAlpha = GfxNativeBlendFactor::OneMinusSourceAlpha;
+#if defined(TRIAEVUM_QUEST_OPENXR)
+        // In-world: the panel is the HUD quad's image over a transparent clear, so its alpha must be the
+        // coverage ("over": a + d(1 - a), as ImGui's pipeline writes), not a^2. Colour is unchanged; the
+        // opaque layers (eyes, the cinema quad) ignore alpha.
+        if (mXrWorld) mBlendState.SourceAlpha = GfxNativeBlendFactor::One;
+#endif
     }
 }
 
@@ -951,6 +957,26 @@ bool GfxRenderingAPIVulkan::ReadFramebufferRgb8ToCPU(uint32_t width, uint32_t he
     return !pixels.empty() &&
            Renderer::CopyScaledFramebufferRgb8(pixels, copyWidth, copyHeight, bgra,
                                                {rgb, static_cast<size_t>(width) * height * 3u}, width, height);
+}
+
+bool GfxRenderingAPIVulkan::ReadFramebufferAlpha8ToCPU(uint32_t width, uint32_t height, uint8_t* alpha) {
+    if (alpha == nullptr || width == 0 || height == 0)
+        return false;
+    uint32_t copyWidth = 0, copyHeight = 0;
+    bool bgra = false;
+    const auto pixels = ReadSwapchainRgba8(copyWidth, copyHeight, bgra);
+    if (pixels.empty() || copyWidth == 0 || copyHeight == 0 ||
+        static_cast<uint64_t>(copyWidth) * copyHeight * 4u > pixels.size())
+        return false;
+    // Alpha is byte 3 in RGBA8 and BGRA8 alike; nearest sampling like the colour readback.
+    for (uint32_t y = 0; y < height; ++y) {
+        const uint64_t sourceY = static_cast<uint64_t>(y) * copyHeight / height;
+        for (uint32_t x = 0; x < width; ++x) {
+            const uint64_t sourceX = static_cast<uint64_t>(x) * copyWidth / width;
+            alpha[static_cast<size_t>(y) * width + x] = pixels[(sourceY * copyWidth + sourceX) * 4u + 3u];
+        }
+    }
+    return true;
 }
 
 void GfxRenderingAPIVulkan::ResolveMSAAColorBuffer(int, int) {

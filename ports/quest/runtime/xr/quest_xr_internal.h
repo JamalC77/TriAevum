@@ -108,7 +108,8 @@ bool QuadReleased();
 // XR thread, each display frame with shouldRender; `tick` = this display frame's tick (shown latency).
 void CopyLatest(uint64_t tick);
 void DestroyQuadSwapchain();       // StopSession (all swapchains)
-// In-world mode (inworld-spec §3.3): the eye swapchain (arraySize 2) and the static fade array.
+// In-world mode (inworld-spec §3.3): the eye swapchain (arraySize 2), the static fade array and, unless
+// TRIAEVUM_XR_HUD=0, the HUD swapchain (panel extent) the panel of each stereo pair is copied into.
 void CreateWorldSwapchains();      // StartSession, after CreateQuadSwapchain, before CreateCopyResources
 bool PrepareFadeSwapchain();       // XR thread: clears the fade levels once; true when usable
 XrSwapchain EyeSwapchain();
@@ -116,11 +117,17 @@ VkExtent2D EyeSwapchainExtent();
 bool EyeReleased();
 XrSwapchain FadeSwapchain();
 uint32_t FadeLevels();
+XrSwapchain HudSwapchain();        // XR_NULL_HANDLE when the HUD is off
+VkExtent2D HudSwapchainExtent();
+bool HudReleased();                // a HUD image was copied and released (the layer may show it)
 bool ShownViews(Fast::StereoViews* views);  // XR thread: the poses of the pair on the eye swapchain
 uint32_t LatestPublishedRigEpoch();         // any thread: the highest RigEpoch PublishStereo received
 struct SinkStats {
     uint64_t Publications = 0, Copies = 0, StaleDisplayFrames = 0, IncompleteSkips = 0, PublicationsDropped = 0,
              SwapchainWaitTimeouts = 0, StereoPublications = 0, StereoCopies = 0;
+    // In-world HUD: stereo publications that carried their panel, HUD images copied with a pair, and
+    // pairs whose HUD copy was skipped (its swapchain image was not ready; the last HUD stays).
+    uint64_t HudPublications = 0, HudCopies = 0, HudSkips = 0;
     double CopyWaitMsMax = 0.0;
 };
 SinkStats TakeSinkStats();

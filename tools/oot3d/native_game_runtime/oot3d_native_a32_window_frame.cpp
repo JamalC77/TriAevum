@@ -334,7 +334,10 @@ bool NativeA32WindowSession::RunFrame() {
       }
       picaPresentationScheduler.BeginPresentation(presentationSerial);
       api.StartDrawToFramebuffer(0, 1.0F);
-      api.SetClearColor(0.0F, 0.0F, 0.0F, 1.0F);
+      // In-world: the panel (the image StartFrame selects) is cleared transparent, so a world frame's
+      // panel is the HUD over alpha 0, the HUD quad's image (W4, minimal). The eyes and the cinema
+      // quad are opaque layers: their alpha is ignored.
+      api.SetClearColor(0.0F, 0.0F, 0.0F, xrWorld != nullptr ? 0.0F : 1.0F);
       api.ClearFramebuffer(true, true);
       api.SetViewport(0, 0, static_cast<int>(width), static_cast<int>(height));
       api.SetScissor(0, 0, static_cast<int>(width), static_cast<int>(height));
@@ -659,6 +662,7 @@ bool NativeA32WindowSession::RunFrame() {
       return;
     }
     uint32_t captureWidth = width, captureHeight = height;
+    std::filesystem::path xrAlphaPath;  // in-world HUD capture: its alpha beside the colour BMP
 #if defined(TRIAEVUM_QUEST_OPENXR)
     if (xrWorld != nullptr &&
         (!screenshotState.ForcedPath.empty() ||
@@ -678,6 +682,12 @@ bool NativeA32WindowSession::RunFrame() {
         captureWidth = eye.width;
         captureHeight = eye.height;
       }
+      // The HUD panel of a world frame is premultiplied colour over alpha 0: the colour BMP shows it
+      // composited over black, the alpha goes to <path>.alpha.bmp (grey = alpha) for a halo check.
+      if (view == Fast::kXrViewPanel && xrRenderState.World && !screenshotState.ForcedPath.empty()) {
+        xrAlphaPath = screenshotState.ForcedPath;
+        xrAlphaPath += ".alpha.bmp";
+      }
       Oot3dNativeGame::XrWorldLog(
           "TRIAEVUM_XR_CAPTURE view=%s requested=%s selected=%d world_frame=%d eyes_drawn=%d w=%u h=%u path=%s",
           view == Fast::kXrViewEyeLeft ? "left" : view == Fast::kXrViewEyeRight ? "right" : "panel",
@@ -690,6 +700,31 @@ bool NativeA32WindowSession::RunFrame() {
         hostArgs, api, captureWidth, captureHeight,
         static_cast<uint32_t>(presentationSerial), screenshotState,
         capturedTemporalSample ? &*capturedTemporalSample : nullptr);
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    if (!xrAlphaPath.empty()) {
+      std::vector<uint8_t> alpha(static_cast<size_t>(captureWidth) * captureHeight);
+      if (api.ReadFramebufferAlpha8ToCPU(captureWidth, captureHeight, alpha.data())) {
+        std::vector<uint8_t> grey(alpha.size() * 3U);
+        size_t covered = 0, opaque = 0;
+        uint64_t sum = 0;
+        for (size_t i = 0; i < alpha.size(); ++i) {
+          grey[i * 3U] = grey[i * 3U + 1U] = grey[i * 3U + 2U] = alpha[i];
+          covered += alpha[i] != 0U ? 1U : 0U;
+          opaque += alpha[i] == 255U ? 1U : 0U;
+          sum += alpha[i];
+        }
+        WriteBmpFromRgb8Framebuffer(xrAlphaPath, captureWidth, captureHeight, grey);
+        Oot3dNativeGame::XrWorldLog(
+            "TRIAEVUM_XR_CAPTURE alpha path=%s pixels=%zu covered=%zu opaque=%zu mean_alpha=%.2f",
+            xrAlphaPath.string().c_str(), alpha.size(), covered, opaque,
+            alpha.empty() ? 0.0 : static_cast<double>(sum) / static_cast<double>(alpha.size()));
+      } else {
+        Oot3dNativeGame::XrWorldLog("TRIAEVUM_XR_CAPTURE alpha path=%s unavailable", xrAlphaPath.string().c_str());
+      }
+    }
+#else
+    (void)xrAlphaPath;
+#endif
     capturedTemporalSample.reset();
     const auto waitStart = std::chrono::steady_clock::now();
     CpuProbe::Scope cpuPacing(CpuProbe::Phase::Pacing);
@@ -3140,7 +3175,7 @@ bool NativeA32WindowSession::ExecuteXrEyes(const Oot3dNativeGame::Oot3dPicaVisua
         throw std::runtime_error("native PICA in-world eye pass failed: " + renderError);
       }
     }
-    // Overlays (TopScreen HUD, ImGui) draw on the panel, unpublished in a world frame until W4.
+    // Overlays (TopScreen HUD, ImGui) draw on the transparent panel; the pair carries it as the HUD.
     api.SelectXrView(Fast::kXrViewPanel);
     views.Valid = true;
     api.SetXrStereoViews(views);

@@ -81,7 +81,11 @@ VkExtent2D EyeExtent();
 // Fast::kXrView*), extents {panel, eye, eye}. WaitTargetFree takes the image index.
 void AttachViewTargets(const VkImage* images, uint32_t slots, const VkExtent2D extents[3]);
 // Both eyes of `slot` with the poses they were rendered for (the projection layer shows exactly these).
+// `panelValid`: the slot's panel holds this frame's HUD over transparent (premultiplied alpha); it is
+// copied with the pair into the HUD swapchain and shown as a quad over the world (W4, minimal).
 void PublishStereo(uint32_t slot, uint64_t renderValue, const Fast::StereoViews& views, bool panelValid);
+// The in-world HUD quad (TRIAEVUM_XR_HUD, default on). Valid before init; any thread.
+bool HudEnabled();
 // The panel of `slot` (cinema picture on the quad).
 void PublishPanel(uint32_t slot, uint64_t renderValue);
 // Median display ticks from a pair's PaceTick to its first display (default 2 until measured).

@@ -4272,10 +4272,10 @@ bool GfxRenderingAPIVulkan::PrepareOverlay(
     }
     bool overlayOnCurrentImage = mNativePicaPresentedThisFrame;
 #if defined(TRIAEVUM_QUEST_OPENXR)
-    // In-world: a world frame's panel was cleared to opaque black by the frame-start clear pass
+    // In-world: a world frame's panel was cleared to transparent black by the frame-start clear pass
     // (ClearFramebuffer on the panel, the image StartFrame selects) and nothing scans out to it, so the
-    // overlays (TopScreen HUD, ImGui) load black and draw over it. It is not published before W4 (the
-    // dev lab's "panel" capture reads it); re-scanning a display into it would only cost.
+    // overlays (TopScreen HUD, ImGui) load it and draw over it; the pair publishes it as the HUD quad's
+    // image (premultiplied alpha). Re-scanning a display into it would cover the world.
     if (mXrWorld && mXrWorldFrame && mXrView == kXrViewPanel) overlayOnCurrentImage = true;
 #endif
     if (overlayOnCurrentImage) {

@@ -1,6 +1,6 @@
 // TriAevum Quest immersive mode: OpenXR instance and session, the XR frame thread (events, state
 // machine, quad layer, screen placement), performance/refresh/thread hints, pause notes and exit.
-// q3-spec §4.2, §4.6, §6.
+// q3-spec §4.2, §4.6, §6. In-world: the layer machine, the projection layer and the HUD quad (W4, minimal).
 #include "quest_xr_internal.h"
 #include "quest_xr_input_logic.h"
 
@@ -177,6 +177,92 @@ struct LayerMachine {
     double HoldUntil = 0.0;
 };
 LayerMachine gLayers;  // XR thread only
+
+// ---- in-world HUD (W4, minimal): a lazily body-locked quad in LOCAL over the projection layer, showing
+// the panel of the latest pair (the TopScreen HUD and ImGui over transparent, premultiplied alpha).
+struct HudLayerConfig {
+    Logic::HudFollowConfig Follow;
+    float WidthM = 2.2F;
+};
+const HudLayerConfig& HudConfig() {
+    static const HudLayerConfig config = [] {
+        constexpr double kToRadians = 3.14159265358979323846 / 180.0;
+        HudLayerConfig c;
+        c.WidthM = static_cast<float>(std::clamp(EnvDouble("TRIAEVUM_XR_HUD_WIDTH_M", 2.2), 0.3, 8.0));
+        c.Follow.DistanceM = static_cast<float>(std::clamp(EnvDouble("TRIAEVUM_XR_HUD_DISTANCE_M", 2.5), 0.5, 10.0));
+        c.Follow.PitchRadians =
+            static_cast<float>(std::clamp(EnvDouble("TRIAEVUM_XR_HUD_PITCH_DEG", -8.0), -45.0, 30.0) * kToRadians);
+        c.Follow.DeadzoneRadians =
+            static_cast<float>(std::clamp(EnvDouble("TRIAEVUM_XR_HUD_FOLLOW_DEG", 35.0), 0.0, 90.0) * kToRadians);
+        const VkExtent2D panel = PanelExtent();
+        XRLOG("TRIAEVUM_XR_HUD config width_m=%.2f height_m=%.3f distance_m=%.2f pitch_deg=%.1f follow_deg=%.1f "
+              "space=LOCAL blend=premultiplied",
+              c.WidthM, Logic::ScreenHeight(c.WidthM, panel.width, panel.height), c.Follow.DistanceM,
+              c.Follow.PitchRadians / kToRadians, c.Follow.DeadzoneRadians / kToRadians);
+        return c;
+    }();
+    return config;
+}
+Logic::HudFollow gHudFollow;               // XR thread only
+Logic::ScreenPlacement gHudPose;           // XR thread only
+bool gHudPoseValid = false;                // XR thread only
+std::atomic<bool> gHudReset{true};         // the next HUD frame snaps in front of the head
+std::atomic<const char*> gHudResetReason{"enter"};
+uint64_t gHudShownFrames = 0;              // XR thread, 5 s window
+uint32_t gHudPlacementsLogged = 0;         // XR thread, 5 s window
+double gHudLastFollowLog = -10.0;
+
+void ResetHud(const char* reason) {
+    gHudResetReason.store(reason);
+    gHudReset.store(true);
+}
+
+// The HUD quad for this display frame (XR thread). False until a head pose was located once.
+bool PlaceHud(XrTime displayTime, double dt, XrCompositionLayerQuad* quad) {
+    auto& g = G();
+    const HudLayerConfig& config = HudConfig();
+    XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+    constexpr XrSpaceLocationFlags kValid = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+    if (XR_SUCCEEDED(xrLocateSpace(g.ViewSpace, g.LocalSpace, displayTime, &location)) &&
+        (location.locationFlags & kValid) == kValid) {
+        const char* reason = "follow";
+        if (gHudReset.exchange(false)) {
+            gHudFollow.Reset();
+            reason = gHudResetReason.load();
+        }
+        const uint32_t before = gHudFollow.Placements;
+        const auto& o = location.pose.orientation;
+        const auto& p = location.pose.position;
+        gHudPose = gHudFollow.Update({o.x, o.y, o.z, o.w}, {p.x, p.y, p.z}, static_cast<float>(dt), config.Follow);
+        gHudPoseValid = true;
+        if (gHudFollow.Placements != before) {
+            ++gHudPlacementsLogged;
+            const double now = NowSeconds();
+            if (std::string_view(reason) != "follow" || now - gHudLastFollowLog >= 1.0) {
+                if (std::string_view(reason) == "follow") gHudLastFollowLog = now;
+                XRLOG("TRIAEVUM_XR_HUD event=place reason=%s yaw_deg=%.1f pos=%.2f,%.2f,%.2f", reason,
+                      gHudPose.YawRadians * 57.2957795F, gHudPose.Position.X, gHudPose.Position.Y,
+                      gHudPose.Position.Z);
+            }
+        }
+    }
+    if (!gHudPoseValid) return false;
+    const VkExtent2D extent = HudSwapchainExtent();
+    // Premultiplied alpha (no XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT): the panel is cleared to
+    // (0, 0, 0, 0) and every overlay blends colour SRC_ALPHA / ONE_MINUS_SRC_ALPHA and alpha ONE /
+    // ONE_MINUS_SRC_ALPHA, which over a transparent clear yields colour * alpha with the coverage in alpha.
+    quad->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    quad->space = g.LocalSpace;
+    quad->eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    quad->subImage.swapchain = HudSwapchain();
+    quad->subImage.imageRect = {{0, 0}, {static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height)}};
+    quad->subImage.imageArrayIndex = 0;
+    quad->pose.orientation = {gHudPose.Orientation.X, gHudPose.Orientation.Y, gHudPose.Orientation.Z,
+                              gHudPose.Orientation.W};
+    quad->pose.position = {gHudPose.Position.X, gHudPose.Position.Y, gHudPose.Position.Z};
+    quad->size = {config.WidthM, Logic::ScreenHeight(config.WidthM, extent.width, extent.height)};
+    return true;
+}
 
 const char* PhaseName(LayerMachine::Phase phase) {
     switch (phase) {
@@ -439,6 +525,19 @@ void LogStats(FrameStats& frames) {
           static_cast<unsigned long long>(sink.StereoPublications), static_cast<unsigned long long>(sink.StereoCopies),
           LayerModeName(gLayers.Shown), LayerModeName(gLayers.Target), gLayers.Alpha, PhaseName(gLayers.Step),
           static_cast<unsigned long long>(TakeSkippedTicks()));
+    if (WorldRequested()) {
+        // placed = snaps and catch-ups started, published = pairs that carried their HUD, copies = HUD
+        // images copied with a pair, skips = pairs whose HUD copy found no ready image, shown_frames =
+        // display frames with the HUD layer.
+        XRLOG("TRIAEVUM_XR_HUD enabled=%d placed=%u published=%llu copies=%llu skips=%llu shown_frames=%llu "
+              "released=%d yaw_deg=%.1f following=%d",
+              HudEnabled() ? 1 : 0, gHudPlacementsLogged, static_cast<unsigned long long>(sink.HudPublications),
+              static_cast<unsigned long long>(sink.HudCopies), static_cast<unsigned long long>(sink.HudSkips),
+              static_cast<unsigned long long>(gHudShownFrames), HudReleased() ? 1 : 0,
+              gHudPoseValid ? gHudPose.YawRadians * 57.2957795 : 0.0, gHudFollow.Following ? 1 : 0);
+        gHudPlacementsLogged = 0;
+        gHudShownFrames = 0;
+    }
     frames = {};
 }
 
@@ -483,6 +582,7 @@ void UpdateLayers(double dt) {
                 XRLOG("TRIAEVUM_XR_LAYER shown=%s from=%s", LayerModeName(m.Target), LayerModeName(m.Shown));
             }
             m.Shown = m.Target;
+            if (m.Shown == LayerMode::World) ResetHud("enter");  // the HUD starts in front of the head
             if (m.Shown == LayerMode::Cinema) {
                 gPlaced = false;  // the screen is placed again on each Cinema entry (§1)
                 gPlaceAfter = 0;
@@ -627,7 +727,8 @@ void XrThreadMain() {
         XrCompositionLayerProjectionView projectionViews[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
                                                                {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
         XrCompositionLayerQuad fade{XR_TYPE_COMPOSITION_LAYER_QUAD};
-        const XrCompositionLayerBaseHeader* layers[3] = {};
+        XrCompositionLayerQuad hud{XR_TYPE_COMPOSITION_LAYER_QUAD};
+        const XrCompositionLayerBaseHeader* layers[4] = {};
         uint32_t layerCount = 0;
         const auto addQuad = [&] {
             const VkExtent2D extent = QuadExtent();
@@ -666,6 +767,11 @@ void XrThreadMain() {
                 projection.viewCount = 2;
                 projection.views = projectionViews;
                 layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection);
+                // The HUD over the world (under the fade): hearts, rings and rupees of the shown pair's frame.
+                if (HudEnabled() && HudReleased() && PlaceHud(frameState.predictedDisplayTime, period, &hud)) {
+                    layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&hud);
+                    ++gHudShownFrames;
+                }
             } else if (gLayers.Shown == LayerMode::Cinema && QuadReleased() && gPlaced) {
                 addQuad();
             }
@@ -743,6 +849,7 @@ const char* SessionStateName(int state) {
 void RequestRecenter() { gRecenterRequested = true; }
 
 void NoteWorldRecenter(const char* reason) {
+    ResetHud("recenter");
     const uint32_t count = ++gWorldRecenters;
     XRLOG("TRIAEVUM_XR_RECENTER world=1 reason=%s pending=%u", reason, count);
 }
@@ -774,6 +881,15 @@ VkExtent2D EyeExtent() {
         return VkExtent2D{dimension("TRIAEVUM_XR_EYE_WIDTH", 1024.0), dimension("TRIAEVUM_XR_EYE_HEIGHT", 1104.0)};
     }();
     return extent;
+}
+
+bool HudEnabled() {
+    static const bool enabled = [] {
+        const bool on = EnvFlag("TRIAEVUM_XR_HUD", true);
+        XRLOG("TRIAEVUM_XR_HUD select enabled=%d", on ? 1 : 0);
+        return on;
+    }();
+    return enabled;
 }
 
 bool WorldRequested() {

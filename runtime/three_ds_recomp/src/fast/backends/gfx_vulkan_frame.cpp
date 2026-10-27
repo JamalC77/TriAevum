@@ -1069,10 +1069,13 @@ void GfxRenderingAPIVulkan::FinishRender() {
         if (mXrWorld) {
             // In-world: both eyes scanned out this frame -> the pair with its poses; a world frame
             // without a pair publishes nothing (the last pair stays, timewarped); otherwise the panel.
+            // A pair carries its panel: the frame-start clear left it transparent and only the
+            // overlays (TopScreen HUD, ImGui) drew on it, so it is the HUD quad's image (W4, minimal).
             const uint32_t slot = mCurrentImage / kXrViewCount;
             if (mXrViewPresented[kXrViewEyeLeft] && mXrViewPresented[kXrViewEyeRight] &&
                 mXrStereoViews.Valid) {
-                TriAevumQuestXr::PublishStereo(slot, mXrRenderValue, mXrStereoViews, false);
+                TriAevumQuestXr::PublishStereo(slot, mXrRenderValue, mXrStereoViews,
+                                               TriAevumQuestXr::HudEnabled());
             } else if (!mXrWorldFrame) {
                 TriAevumQuestXr::PublishPanel(slot, mXrRenderValue);
             }

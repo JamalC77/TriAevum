@@ -1,5 +1,5 @@
-// quest_xr_logic_tests: the stick-click chords, the press latch and the screen placement of the
-// Quest immersive mode (quest_xr_input_logic.h). Title-free; runs on the headset from
+// quest_xr_logic_tests: the stick-click chords, the press latch, the screen placement and the in-world
+// HUD's lazy follow of the Quest immersive mode (quest_xr_input_logic.h). Title-free; runs on the headset from
 // quest-tools-arm64.zip (run_all.sh) or on any host.
 #include "quest_xr_input_logic.h"
 
@@ -156,6 +156,88 @@ void Placement() {
     CHECK(Near(ScreenHeight(3.0F, 1280, 720), 1.6875F));
 }
 
+// v' = q * v * q^-1
+Vec3 RotateBy(const Quat& q, const Vec3& v) {
+    const float tx = 2.0F * (q.Y * v.Z - q.Z * v.Y), ty = 2.0F * (q.Z * v.X - q.X * v.Z),
+                tz = 2.0F * (q.X * v.Y - q.Y * v.X);
+    return {v.X + q.W * tx + (q.Y * tz - q.Z * ty), v.Y + q.W * ty + (q.Z * tx - q.X * tz),
+            v.Z + q.W * tz + (q.X * ty - q.Y * tx)};
+}
+
+float Deg(float degrees) { return degrees * 3.14159265F / 180.0F; }
+
+void HudFollowTests() {
+    const HudFollowConfig config;
+    const float dt = 1.0F / 90.0F;
+    {  // The first frame snaps in front of the head: 2.5 m out along the yaw, 8 deg below eye level, facing it.
+        HudFollow hud;
+        const Vec3 head{0.1F, 1.6F, 0.2F};
+        const auto p = hud.Update(YawPitch(Deg(30.0F), Deg(-20.0F)), head, dt, config);
+        CHECK(hud.Valid && hud.Placements == 1U && !hud.Following);
+        CHECK(Near(p.YawRadians, Deg(30.0F), 1e-4F));
+        const Vec3 offset{p.Position.X - head.X, p.Position.Y - head.Y, p.Position.Z - head.Z};
+        CHECK(Near(std::sqrt(offset.X * offset.X + offset.Y * offset.Y + offset.Z * offset.Z), 2.5F, 1e-4F));
+        CHECK(Near(offset.Y, -2.5F * std::sin(Deg(8.0F)), 1e-4F));  // head pitch does not move it
+        // Its -Z (into the quad) points from the head to its centre: the front face looks at the head.
+        const Vec3 forward = RotateBy(p.Orientation, {0.0F, 0.0F, -1.0F});
+        CHECK(Near(forward.X, offset.X / 2.5F, 1e-4F) && Near(forward.Y, offset.Y / 2.5F, 1e-4F) &&
+              Near(forward.Z, offset.Z / 2.5F, 1e-4F));
+        const Vec3 up = RotateBy(p.Orientation, {0.0F, 1.0F, 0.0F});
+        CHECK(up.Y > 0.99F);  // no roll, a small tilt
+    }
+    {  // Turns inside the 35 deg dead zone leave the yaw alone; the position still follows the head.
+        HudFollow hud;
+        hud.Update(YawPitch(0.0F, 0.0F), Vec3{}, dt, config);
+        for (int frame = 0; frame < 90; ++frame) {
+            const float yaw = Deg(30.0F) * std::sin(frame * 0.2F);
+            const auto p = hud.Update(YawPitch(yaw, 0.0F), Vec3{0.5F, 1.7F, -0.3F}, dt, config);
+            CHECK(Near(p.YawRadians, 0.0F) && !hud.Following);
+            CHECK(Near(p.Position.X, 0.5F, 1e-4F) && Near(p.Position.Z, -0.3F - 2.5F * std::cos(Deg(8.0F)), 1e-4F));
+        }
+        CHECK(hud.Placements == 1U);
+    }
+    {  // A 50 deg turn: the catch-up starts, approaches without overshoot, and settles within 2 deg in ~1 s.
+        HudFollow hud;
+        hud.Update(YawPitch(0.0F, 0.0F), Vec3{}, dt, config);
+        float previous = 0.0F;
+        int settledFrame = -1;
+        for (int frame = 0; frame < 180; ++frame) {
+            const auto p = hud.Update(YawPitch(Deg(50.0F), 0.0F), Vec3{}, dt, config);
+            CHECK(p.YawRadians >= previous - 1e-6F && p.YawRadians <= Deg(50.0F) + 1e-5F);
+            if (frame == 0) CHECK(hud.Placements == 2U && p.YawRadians > 0.0F && p.YawRadians < Deg(5.0F));
+            previous = p.YawRadians;
+            if (!hud.Following && settledFrame < 0) settledFrame = frame;
+        }
+        CHECK(settledFrame > 45 && settledFrame < 120);
+        CHECK(std::fabs(previous - Deg(50.0F)) <= Deg(2.0F));
+        CHECK(hud.Placements == 2U);
+    }
+    {  // Across the +-180 deg seam: 20 deg apart is inside the dead zone; 40 deg catches up the short way.
+        HudFollow hud;
+        hud.Update(YawPitch(Deg(170.0F), 0.0F), Vec3{}, dt, config);
+        hud.Update(YawPitch(Deg(-170.0F), 0.0F), Vec3{}, dt, config);
+        CHECK(!hud.Following && Near(hud.Yaw, Deg(170.0F), 1e-4F));
+        for (int frame = 0; frame < 200; ++frame) {
+            hud.Update(YawPitch(Deg(-150.0F), 0.0F), Vec3{}, dt, config);
+            CHECK(std::fabs(hud.Yaw) >= Deg(149.0F));  // never through 0
+        }
+        CHECK(std::fabs(WrapRadians(hud.Yaw - Deg(-150.0F))) <= Deg(2.0F) && !hud.Following);
+    }
+    {  // Reset snaps the next frame to the head; a bad dt freezes a catch-up instead of jumping.
+        HudFollow hud;
+        hud.Update(YawPitch(0.0F, 0.0F), Vec3{}, dt, config);
+        hud.Update(YawPitch(Deg(90.0F), 0.0F), Vec3{}, NAN, config);
+        CHECK(hud.Following && Near(hud.Yaw, 0.0F));
+        hud.Update(YawPitch(Deg(90.0F), 0.0F), Vec3{}, -1.0F, config);
+        CHECK(Near(hud.Yaw, 0.0F));
+        hud.Reset();
+        const auto p = hud.Update(YawPitch(Deg(-120.0F), 0.0F), Vec3{}, dt, config);
+        CHECK(Near(p.YawRadians, Deg(-120.0F), 1e-4F) && !hud.Following && hud.Placements == 3U);
+    }
+    CHECK(Near(WrapRadians(Deg(190.0F)), Deg(-170.0F), 1e-4F) && Near(WrapRadians(Deg(-190.0F)), Deg(170.0F), 1e-4F));
+    CHECK(WrapRadians(NAN) == 0.0F);
+}
+
 }  // namespace
 
 void DisplayTicks() {
@@ -182,6 +264,7 @@ int main() {
     TapsAndChords();
     LatchAndPulse();
     Placement();
+    HudFollowTests();
     DisplayTicks();
     if (failures != 0) {
         std::printf("quest_xr_logic_tests: %d failure(s)\n", failures);
