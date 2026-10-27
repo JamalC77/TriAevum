@@ -1005,6 +1005,9 @@ class GfxRenderingAPIVulkan final : public GfxRenderingAPI,
     bool EnsureAndroidSurface();
     void DropAndroidSurface(const char* reason);
     void NoteAndroidSurfaceLost(const char* where);
+    // True when the window is minimized or the surface reports VK_ERROR_SURFACE_LOST_KHR (NRI
+    // folds that into OUT_OF_DATE). Every other NRI failure stays an error.
+    bool AndroidSurfaceGone();
 #endif
     QueueFamilies FindQueueFamilies(VkPhysicalDevice device) const;
     SwapchainSupport QuerySwapchainSupport(VkPhysicalDevice device) const;

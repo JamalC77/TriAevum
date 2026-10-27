@@ -165,10 +165,11 @@ PollNativeA32Input(Fast::Fast3dWindow &window,
       controls.CancelBindingCapture();
   }
 #if defined(TRIAEVUM_QUEST_OPENXR)
-  // Withheld while a host GUI is up, like the SDL controller.
+  // Withheld while a host GUI is up, like the SDL controller. The device enablement below admits
+  // the Touch snapshot whenever it is active, so a pad disabled in Controls is withheld here.
   LusHostButtonSource buttonSource(
       window, keyboardCaptured, mouseCaptured,
-      !hostGuiVisible ? selectedController.Controller : nullptr,
+      !hostGuiVisible && config.ControllerEnabled ? selectedController.Controller : nullptr,
       triggerThreshold, xrActive && !hostGuiVisible ? &xrPad : nullptr);
   const ThreeDsRecomp::Input::HostDeviceEnablement enabledDevices{
       config.KeyboardEnabled,

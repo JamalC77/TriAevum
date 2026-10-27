@@ -120,5 +120,9 @@ void LogInteractionProfiles();
 
 // quest_xr_runtime.cpp
 void RequestRecenter();
+// Ends the run: Exiting/Stop, SDL_QUIT to the game loop, the 15 s quit watchdog (any thread).
+void BeginExit(const char* reason);
+// The first game image reached the quad: the immersive start worked (removes the start marker).
+void NoteFirstImage();
 
 }  // namespace TriAevumQuestXr

@@ -57,7 +57,8 @@ uint64_t gShownSerial = 0;
 SinkStats gStats;
 
 // ---- XR thread only
-int gPendingAcquire = -1;  // acquired, xrWaitSwapchainImage not yet successful
+int gPendingAcquire = -1;    // acquired and not yet released
+bool gPendingWaited = false;  // xrWaitSwapchainImage succeeded for gPendingAcquire
 uint64_t gCopyValue = 0;
 bool gFirstImageLogged = false;
 
@@ -344,19 +345,23 @@ void CopyLatest() {
             return;
         }
         gPendingAcquire = static_cast<int>(index);
+        gPendingWaited = false;
     }
-    XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-    wait.timeout = 100'000'000;  // 100 ms
-    const XrResult waited = xrWaitSwapchainImage(gSwapchain, &wait);
-    if (waited == XR_TIMEOUT_EXPIRED || XR_FAILED(waited)) {
-        if (waited != XR_TIMEOUT_EXPIRED)
-            XRWARN("TRIAEVUM_XR_ERROR call=xrWaitSwapchainImage result=%d", static_cast<int>(waited));
-        {
-            std::lock_guard lock(gSink);
-            ++gStats.SwapchainWaitTimeouts;
+    if (!gPendingWaited) {
+        XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+        wait.timeout = 100'000'000;  // 100 ms
+        const XrResult waited = xrWaitSwapchainImage(gSwapchain, &wait);
+        if (waited == XR_TIMEOUT_EXPIRED || XR_FAILED(waited)) {
+            if (waited != XR_TIMEOUT_EXPIRED)
+                XRWARN("TRIAEVUM_XR_ERROR call=xrWaitSwapchainImage result=%d", static_cast<int>(waited));
+            {
+                std::lock_guard lock(gSink);
+                ++gStats.SwapchainWaitTimeouts;
+            }
+            ClearCopying(publication.Image);
+            return;
         }
-        ClearCopying(publication.Image);
-        return;
+        gPendingWaited = true;
     }
     const uint32_t index = static_cast<uint32_t>(gPendingAcquire);
     CopySlot& slot = gCopySlots[index];
@@ -418,13 +423,13 @@ void CopyLatest() {
         vkDestroyFence(g.Device, slot.Fence, nullptr);
         vkCreateFence(g.Device, &fence, nullptr, &slot.Fence);
         ClearCopying(publication.Image);
-        // Keep the acquire/wait/release order intact: release the (unchanged) image.
-        XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        {
-            QueueLock lock("xr");
-            xrReleaseSwapchainImage(gSwapchain, &release);
+        // A released colour image must be written and in COLOR_ATTACHMENT_OPTIMAL: keep this one
+        // acquired and waited, and retry the copy next display frame (no new acquire or wait).
+        if (submitted == VK_ERROR_DEVICE_LOST) {
+            // Nothing will recover: stop showing the quad and end the run instead of looping.
+            gQuadReleased = false;
+            BeginExit("device_lost");
         }
-        gPendingAcquire = -1;
         return;
     }
     gCopyValue = signalValue;
@@ -439,6 +444,7 @@ void CopyLatest() {
     if (XR_FAILED(released))
         XRWARN("TRIAEVUM_XR_ERROR call=xrReleaseSwapchainImage result=%d", static_cast<int>(released));
     gPendingAcquire = -1;
+    gPendingWaited = false;
     {
         std::lock_guard lock(gSink);
         Target& target = gTargets[publication.Image];
@@ -454,6 +460,7 @@ void CopyLatest() {
         XRLOG("TRIAEVUM_XR_FIRST_IMAGE serial=%llu render_value=%llu xr_image=%u",
               static_cast<unsigned long long>(publication.Serial),
               static_cast<unsigned long long>(publication.RenderValue), index);
+        NoteFirstImage();
     }
 }
 

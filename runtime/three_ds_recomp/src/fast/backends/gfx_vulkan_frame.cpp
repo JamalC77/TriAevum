@@ -747,16 +747,17 @@ void GfxRenderingAPIVulkan::StartFrame() {
                 mNriSwapchain.Acquire(mCurrentFrame, mCurrentImage);
             if (result ==
                 Oot3d::NriSwapchainOperationResult::OutOfDate) {
+#if defined(__ANDROID__)
+                // NRI reports VK_ERROR_SURFACE_LOST_KHR as OUT_OF_DATE: a gone surface is a pause.
+                if (AndroidSurfaceGone()) {
+                    NoteAndroidSurfaceLost("acquire");
+                    return;
+                }
+#endif
                 mSwapchainDirty = true;
                 // Let the host pump window events before retrying acquisition.
                 return;
             }
-#if defined(__ANDROID__)
-            if (result != Oot3d::NriSwapchainOperationResult::Success) {
-                NoteAndroidSurfaceLost("acquire");
-                return;
-            }
-#endif
             if (result !=
                 Oot3d::NriSwapchainOperationResult::Success) {
                 throw std::runtime_error(
@@ -1010,11 +1011,13 @@ void GfxRenderingAPIVulkan::FinishRender() {
     } else if (mNriSwapchain.Active()) {
         const auto result = mNriSwapchain.Present(mCurrentImage);
         if (result == Oot3d::NriSwapchainOperationResult::OutOfDate) {
-            mSwapchainDirty = true;
 #if defined(__ANDROID__)
-        } else if (result != Oot3d::NriSwapchainOperationResult::Success) {
-            NoteAndroidSurfaceLost("present");
+            // NRI reports VK_ERROR_SURFACE_LOST_KHR as OUT_OF_DATE: a gone surface is a pause.
+            if (AndroidSurfaceGone())
+                NoteAndroidSurfaceLost("present");
+            else
 #endif
+            mSwapchainDirty = true;
         } else if (result !=
                    Oot3d::NriSwapchainOperationResult::Success) {
             throw std::runtime_error(

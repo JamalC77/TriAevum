@@ -103,22 +103,42 @@ std::atomic<bool> gGuestPaused{false};
 std::atomic<uint64_t> gGuestRefreshesWhilePaused{0};
 std::atomic<bool> gRecenterRequested{false};
 
-// ---- watchdog: no shutdown wait may hang the process (q3-spec §4.6, §6.6)
-void ArmWatchdog(const char* stage) {
-    static std::atomic<bool> armed{false};
-    if (armed.exchange(true)) return;
-    std::thread([stage] {
-        std::this_thread::sleep_for(std::chrono::seconds(15));
-        XRLOG("TRIAEVUM_XR_EXIT stage=watchdog armed_at=%s", stage);
+// ---- watchdog: no XR shutdown wait may hang the process (q3-spec §4.6, §6.6). One at a time;
+// StopSession disarms it once the XR objects are gone, so the renderer's own shutdown work (the
+// preparation join and drain, StorePipelineCache) runs under the longer renderer watchdog only.
+constexpr int kWatchdogExitCode = 3;  // a forced exit is visible in the exit status
+std::atomic<uint64_t> gWatchdogGeneration{0};
+std::atomic<bool> gWatchdogArmed{false};
+
+void ArmWatchdog(const char* stage, int seconds = 15) {
+    if (gWatchdogArmed.exchange(true)) return;
+    const uint64_t generation = ++gWatchdogGeneration;
+    XRLOG("TRIAEVUM_XR_WATCHDOG armed stage=%s seconds=%d", stage, seconds);
+    std::thread([stage, seconds, generation] {
+        std::this_thread::sleep_for(std::chrono::seconds(seconds));
+        if (!gWatchdogArmed.load() || gWatchdogGeneration.load() != generation) return;
+        XRERR("TRIAEVUM_XR_EXIT stage=watchdog armed_at=%s seconds=%d exit_code=%d", stage, seconds,
+              kWatchdogExitCode);
         std::fflush(nullptr);
-        _exit(0);
+        _exit(kWatchdogExitCode);
     }).detach();
+}
+
+void DisarmWatchdog() {
+    ++gWatchdogGeneration;
+    if (gWatchdogArmed.exchange(false)) XRLOG("TRIAEVUM_XR_WATCHDOG disarmed");
 }
 
 void PushQuit() {
     SDL_Event quit{};
     quit.type = SDL_QUIT;
     if (SDL_PushEvent(&quit) < 0) XRWARN("TRIAEVUM_XR_EXIT push_quit_failed error=\"%s\"", SDL_GetError());
+}
+
+void RemoveStartMarker() {
+    std::error_code ignored;
+    if (std::filesystem::remove(ExternalPath("logs/xr-start-failed.txt"), ignored))
+        XRLOG("TRIAEVUM_XR_START_MARKER removed (the immersive start completed)");
 }
 
 // ---- screen (XR thread only)
@@ -219,6 +239,10 @@ void ChangeState(XrSessionState next) {
         if (XR_SUCCEEDED(result)) {
             g.Running = true;
             OnSessionRunning();
+        } else {
+            // No further READY follows: end the run (summary written) and let the launcher ask.
+            NoteStartFailure(Format("xrBeginSession failed: XrResult %d", static_cast<int>(result)).c_str());
+            BeginExit("begin_failed");
         }
         break;
     }
@@ -238,16 +262,7 @@ void ChangeState(XrSessionState next) {
     }
     case XR_SESSION_STATE_EXITING:
     case XR_SESSION_STATE_LOSS_PENDING:
-        g.Focused = false;
-        g.Exiting = true;
-        g.Stop = true;
-        if (!g.ShutdownRequested.load()) {
-            // Quit from the system menu (or a lost session): the game loop ends through SDL_QUIT,
-            // writes its summary, and Shutdown destroys the XR objects (StopSession).
-            PushQuit();
-            XRLOG("TRIAEVUM_XR_EXIT stage=quit_event state=%s", SessionStateName(next));
-            ArmWatchdog("quit_event");
-        }
+        BeginExit(SessionStateName(next));
         break;
     default:
         break;
@@ -261,13 +276,7 @@ void PollEvents() {
         switch (event.type) {
         case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
             XRWARN("TRIAEVUM_XR_EVENT instance_loss_pending");
-            g.Exiting = true;
-            g.Stop = true;
-            if (!g.ShutdownRequested.load()) {
-                PushQuit();
-                XRLOG("TRIAEVUM_XR_EXIT stage=quit_event state=instance_loss_pending");
-                ArmWatchdog("instance_loss");
-            }
+            BeginExit("instance_loss_pending");
             break;
         case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED:
             ChangeState(reinterpret_cast<const XrEventDataSessionStateChanged&>(event).state);
@@ -460,6 +469,21 @@ const char* SessionStateName(int state) {
 
 void RequestRecenter() { gRecenterRequested = true; }
 
+void BeginExit(const char* reason) {
+    auto& g = G();
+    g.Focused = false;
+    g.Exiting = true;
+    g.Stop = true;
+    if (g.ShutdownRequested.load()) return;
+    // Quit from the system menu, a lost session or a fatal XR error: the game loop ends through
+    // SDL_QUIT, writes its summary, and Shutdown destroys the XR objects (StopSession).
+    PushQuit();
+    XRLOG("TRIAEVUM_XR_EXIT stage=quit_event state=%s", reason);
+    ArmWatchdog("quit_event");
+}
+
+void NoteFirstImage() { RemoveStartMarker(); }
+
 bool Requested() {
     static const bool requested = [] {
         const bool enabled = EnvFlag("TRIAEVUM_XR");
@@ -480,6 +504,14 @@ VkExtent2D PanelExtent() {
     return extent;
 }
 
+void NoteStartPending() {
+    const std::string path = ExternalPath("logs/xr-start-failed.txt");
+    std::error_code error;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), error);
+    std::ofstream marker(path, std::ios::trunc);
+    marker << "pending: the immersive start did not complete (no game image reached the headset)\n";
+}
+
 void NoteStartFailure(const char* reason) {
     XRERR("TRIAEVUM_XR_ERROR stage=start reason=\"%s\"", reason);
     const std::string path = ExternalPath("logs/xr-start-failed.txt");
@@ -492,6 +524,9 @@ void NoteStartFailure(const char* reason) {
 void CreateInstance() {
     auto& g = G();
     if (g.Instance != XR_NULL_HANDLE) return;
+    // Sentinel: replaced by the reason on a known failure, removed at the first image. A throw, a
+    // crash or a hang anywhere before that makes the next launch ask (TriAevumLauncherActivity).
+    NoteStartPending();
     auto* env = static_cast<JNIEnv*>(SDL_AndroidGetJNIEnv());
     if (env == nullptr || env->GetJavaVM(&g.Vm) != JNI_OK) Fail("no JavaVM from SDL");
     auto activity = static_cast<jobject>(SDL_AndroidGetActivity());
@@ -699,8 +734,6 @@ void StartSession(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice
         Fail(error.what());
     }
     XRLOG("TRIAEVUM_XR_SESSION created queue_family=%u renderer_queue=0 xr_queue=%u", queueFamily, xrQueueIndex);
-    std::error_code ignored;
-    std::filesystem::remove(ExternalPath("logs/xr-start-failed.txt"), ignored);
     g.Thread = std::thread(XrThreadMain);
 }
 
@@ -719,9 +752,11 @@ void RegisterThread(ThreadRole role, int tid) {
 
 bool RendererMayRun() {
     const auto& g = G();
+    // TRIAEVUM_XR_RUN_UNFOCUSED=1 (automated device runs): the renderer and the guest run whatever
+    // the session state, headset off included; unshown frames are dropped (WaitTargetFree).
     static const bool runUnfocused = EnvFlag("TRIAEVUM_XR_RUN_UNFOCUSED");
-    return g.Session != XR_NULL_HANDLE && g.Running.load() && (g.Focused.load() || runUnfocused) &&
-           !g.Exiting.load() && !g.Stop.load() && !g.SessionStopped.load();
+    if (g.Exiting.load() || g.Stop.load() || g.SessionStopped.load()) return false;
+    return runUnfocused || (g.Running.load() && g.Focused.load());
 }
 
 void StopSession() {
@@ -757,6 +792,11 @@ void StopSession() {
         XRLOG("TRIAEVUM_XR_EXIT stage=session_destroyed result=%d", static_cast<int>(result));
         g.Session = XR_NULL_HANDLE;
     }
+    // The XR waits are over. The renderer's shutdown (preparation join and drain, the pipeline
+    // cache store) runs as on the panel, bounded only by a separate, generous watchdog.
+    DisarmWatchdog();
+    ArmWatchdog("renderer_shutdown",
+                static_cast<int>(std::clamp(EnvDouble("TRIAEVUM_XR_SHUTDOWN_WATCHDOG_S", 120.0), 15.0, 3600.0)));
     // The XrInstance stays: the process leaves through _exit (TriAevumSdlActivity.onDestroy).
 }
 

@@ -1776,6 +1776,24 @@ void GfxRenderingAPIVulkan::NoteAndroidSurfaceLost(const char* where) {
     }
 }
 
+bool GfxRenderingAPIVulkan::AndroidSurfaceGone() {
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    if (mXrPresent) {
+        return false;
+    }
+#endif
+    auto* window = static_cast<SDL_Window*>(mWindowBackend->GetNativeWindow());
+    if (window != nullptr && (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED) != 0U) {
+        return true;
+    }
+    if (mSurface == VK_NULL_HANDLE || mSurfaceLost.load()) {
+        return true;
+    }
+    VkSurfaceCapabilitiesKHR capabilities{};
+    return vkGetPhysicalDeviceSurfaceCapabilitiesKHR(mPhysicalDevice, mSurface, &capabilities) ==
+           VK_ERROR_SURFACE_LOST_KHR;
+}
+
 void GfxRenderingAPIVulkan::DropAndroidSurface(const char* reason) {
     WaitForAllPresents();
     StopPresentWorker();
