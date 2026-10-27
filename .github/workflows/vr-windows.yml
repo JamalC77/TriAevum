@@ -25,7 +25,7 @@ env:
   VCPKG_REF: 2026.10.16
   LLVM_ROOT: C:\tools\llvm-22.1.6
   VULKAN_SDK: C:\VulkanSDK\1.4.350.0
-  VCPKG_ROOT: C:\tools\vcpkg
+  TRI_VCPKG_ROOT: C:\tools\vcpkg
   VCPKG_DEFAULT_BINARY_CACHE: C:\tools\vcpkg-bincache
   VCPKG_BINARY_SOURCES: clear;files,C:\tools\vcpkg-bincache,readwrite
   VCPKG_DEFAULT_TRIPLET: x64-windows-static
@@ -39,7 +39,10 @@ env:
 
 jobs:
   host-runtime:
-    runs-on: windows-latest
+    # windows-2022 carries Visual Studio 2022 17.14 with MSVC 14.44, the
+    # toolset the release was built with; windows-latest now ships VS 2026
+    # (MSVC 14.51).
+    runs-on: windows-2022
     timeout-minutes: 330
     defaults:
       run:
@@ -144,9 +147,9 @@ jobs:
       - name: Prepare vcpkg ${{ env.VCPKG_REF }}
         run: |
           $ErrorActionPreference = 'Stop'
-          git clone --depth 1 --branch $env:VCPKG_REF https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
+          git clone --depth 1 --branch $env:VCPKG_REF https://github.com/microsoft/vcpkg.git $env:TRI_VCPKG_ROOT
           if ($LASTEXITCODE) { throw 'vcpkg clone failed' }
-          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+          & "$env:TRI_VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
           if ($LASTEXITCODE) { throw 'vcpkg bootstrap failed' }
           New-Item -ItemType Directory -Force $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
 
@@ -180,15 +183,17 @@ jobs:
       - name: Install vcpkg static dependencies
         run: |
           $ErrorActionPreference = 'Stop'
+          # msvc-dev-cmd points VCPKG_ROOT at Visual Studio's manifest-only copy.
+          $env:VCPKG_ROOT = $env:TRI_VCPKG_ROOT
           $packages = $env:VCPKG_PACKAGES -split ' '
-          & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet x64-windows-static --host-triplet x64-windows-static @packages
+          & "$env:TRI_VCPKG_ROOT\vcpkg.exe" install --triplet x64-windows-static --host-triplet x64-windows-static @packages
           if ($LASTEXITCODE) {
-            Get-ChildItem "$env:VCPKG_ROOT\buildtrees" -Recurse -Filter '*-err.log' -ErrorAction SilentlyContinue |
+            Get-ChildItem "$env:TRI_VCPKG_ROOT\buildtrees" -Recurse -Filter '*-err.log' -ErrorAction SilentlyContinue |
               ForEach-Object { "==== $($_.FullName)"; Get-Content $_.FullName -Tail 60 }
             throw 'vcpkg install failed'
           }
-          & "$env:VCPKG_ROOT\vcpkg.exe" list
-          Remove-Item -Recurse -Force "$env:VCPKG_ROOT\buildtrees", "$env:VCPKG_ROOT\downloads" -ErrorAction SilentlyContinue
+          & "$env:TRI_VCPKG_ROOT\vcpkg.exe" list
+          Remove-Item -Recurse -Force "$env:TRI_VCPKG_ROOT\buildtrees", "$env:TRI_VCPKG_ROOT\downloads" -ErrorAction SilentlyContinue
 
       - name: Save vcpkg binary cache
         if: steps.vcpkg-cache.outputs.cache-hit != 'true'
@@ -215,12 +220,13 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $env:OOT3D_LLVM_ROOT = $env:LLVM_ROOT
+          $env:VCPKG_ROOT = $env:TRI_VCPKG_ROOT
           $sccache = (Get-Command sccache -ErrorAction Stop).Source
           & $sccache --start-server
           $ninja = Join-Path '${{ steps.vs.outputs.path }}' 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe'
           if (-not (Test-Path $ninja)) { $ninja = (Get-Command ninja -ErrorAction Stop).Source }
           $src = $env:GITHUB_WORKSPACE.Replace('\', '/')
-          $vcpkg = $env:VCPKG_ROOT.Replace('\', '/')
+          $vcpkg = $env:TRI_VCPKG_ROOT.Replace('\', '/')
           $llvm = $env:LLVM_ROOT.Replace('\', '/')
           $arguments = @(
             '-S', $src, '-B', $env:BUILD_DIR, '-G', 'Ninja',
@@ -256,6 +262,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $start = Get-Date
+          $env:VCPKG_ROOT = $env:TRI_VCPKG_ROOT
           cmake --build $env:BUILD_DIR --target triaevum_public_runtime --parallel 4
           if ($LASTEXITCODE) { throw 'Build failed' }
           "Build took $([int]((Get-Date) - $start).TotalMinutes) min"
@@ -319,7 +326,10 @@ jobs:
 
       - name: Stop compiler cache
         if: always()
-        run: sccache --show-stats; sccache --stop-server; exit 0
+        continue-on-error: true
+        run: |
+          if (Get-Command sccache -ErrorAction SilentlyContinue) { sccache --show-stats; sccache --stop-server }
+          exit 0
 
       - name: Save compiler cache
         if: always() && steps.sccache-cache.outcome == 'success'
