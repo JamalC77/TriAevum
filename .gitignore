@@ -471,3 +471,6 @@ _packages
 /clang-format
 /clang-format.exe
 *.o2r
+
+# Quest hello build output (ports/quest/hello/build.sh)
+/dist/
