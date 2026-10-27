@@ -73,7 +73,7 @@ button) also re-places the screen.
 | Key | Values |
 |---|---|
 | `TRIAEVUM_QUEST_MODE` | `vr` (default), `panel` (flat panel, the Q2 behaviour), `ask` (two buttons) |
-| `TRIAEVUM_XR_REFRESH` | display refresh request, default 72 (72/80/90/120 on Quest 3) |
+| `TRIAEVUM_XR_REFRESH` | display refresh request, default 72 (90 in the in-world mode; 72/80/90/120 on Quest 3) |
 | `TRIAEVUM_XR_SCREEN_WIDTH_M`, `TRIAEVUM_XR_SCREEN_DISTANCE_M` | screen width (default 3.0) and distance (default 2.5) in metres |
 | `TRIAEVUM_XR_PANEL_WIDTH`, `TRIAEVUM_XR_PANEL_HEIGHT` | render-target extent, default 1280x720 |
 | `TRIAEVUM_XR_SWAPCHAIN_FORMAT` | force a `VkFormat` number for the quad (default: first of RGBA8/BGRA8 sRGB) |
@@ -91,6 +91,82 @@ override (`adb shell am broadcast -a com.oculus.vrpowermanager.prox_close`; undo
 
 `TriAevum.quest.host.json` (`{"maximum_surface_short_edge": 720}`) still sizes the flat panel's
 surface. `QUEST_OPENXR=0 bash tools/quest/build_quest.sh` builds a panel-only APK for bisecting.
+
+## In-world mode (first light, opt-in)
+
+The life-size stereo world of `quest-research/inworld-spec.md` (W1 "first light"). It is **opt-in**
+until it is verified on the headset; without it the immersive mode is the screen above, unchanged.
+Add to `<ext>/triaevum-env.txt`:
+
+```
+TRIAEVUM_XR_VIEW=world
+```
+
+- Gameplay shows the world at life size (33 game units per metre) around you, in stereo, with your
+  real head motion (6DoF) and a level horizon. When the world first appears (and after every
+  recenter, door or scene change), Link stands at the centre of your play area (STAGE) facing away
+  from you; walk around him. The game camera itself is still the game's (mode R is W2), so things
+  behind that unseen camera can be missing and billboards face it.
+- The left stick moves Link relative to that game camera; the right stick does nothing while the world
+  shows (it becomes snap turn in W2). If Link runs more than 3.5 m from you (or 2 m past the play
+  area), a short blink puts him 1 m ahead of you along his run; standing still far from the centre
+  re-centres him with a blink. Holding both stick clicks for ~1 s re-places the world around Link
+  (60 ms buzz on both hands); in world mode it no longer moves the screen.
+- Menus, pause, text boxes, F1, cutscenes, first person, crawl spaces, fixed-camera rooms and Epona
+  fade (150 ms through black) to the screen of the Q3 mode, placed again in front of you each time;
+  doors and scene changes go black, then place the world behind Link again.
+- The display runs at 90 Hz (unless `TRIAEVUM_XR_REFRESH` is set) and each 30 Hz eye pair is shown
+  for exactly 3 display frames. The game's frame-rate setting should stay Original (30).
+
+| Key (in-world) | Values |
+|---|---|
+| `TRIAEVUM_XR_VIEW` | `world` turns the mode on (`TRIAEVUM_XR_WORLD=1` too); anything else: the screen |
+| `TRIAEVUM_XR_EYE_WIDTH`, `TRIAEVUM_XR_EYE_HEIGHT` | eye image extent, default 1024x1104 (the log shows the runtime's recommended size) |
+| `TRIAEVUM_XR_WORLD_SCALE` | game units per metre, 25-45, default 33 |
+| `TRIAEVUM_XR_LEASH_M` | leash before a blink, default 3.5 m |
+| `TRIAEVUM_XR_NS1_NATIVE=0` | the canonical replay follows the eye size instead of the native 400x240 |
+| `TRIAEVUM_XR_WORLD_SPACE=local_floor` | skip STAGE (default: STAGE with bounds >= 1x1 m, else LOCAL_FLOOR, else LOCAL) |
+| `TRIAEVUM_XR_SKY_PCS` | sky scope PCs (comma list); default: every atmosphere scope but precipitation and kankyo effects, when camera-centred |
+| `TRIAEVUM_XR_UI_CINEMA=0` | do not switch to the screen for non-HUD PICA UI (bring-up) |
+| `TRIAEVUM_XR_FORCE_WORLD=1` | ignore every screen trigger except the session and the player (bring-up only) |
+| `TRIAEVUM_XR_VIEW_TRACE=1` | log the draw classes per scene (any mode, no rendering change; the W0 trace) |
+
+Developer builds (`TRIAEVUM_DEV_LAB`): the `capture` op takes an optional `"view"`:
+
+```json
+{"id": 1, "op": "capture", "path": "/sdcard/Android/data/org.triaevum.quest/files/logs/left.bmp", "view": "left"}
+{"id": 2, "op": "capture", "path": "/sdcard/Android/data/org.triaevum.quest/files/logs/right.bmp", "view": "right"}
+{"id": 3, "op": "capture", "path": "/sdcard/Android/data/org.triaevum.quest/files/logs/panel.bmp", "view": "panel"}
+```
+
+`left`/`right` write the eye image (eye extent) of a world frame, `panel` the panel/HUD image (the
+cinema picture, or in a world frame the HUD overlays over black); without `view` a world frame gives
+the left eye, otherwise the panel. An eye asked for in a non-world frame falls back to the panel
+(`TRIAEVUM_XR_CAPTURE view=panel requested=left world_frame=0`). `--screenshot` captures the left
+eye of world frames.
+
+In-world log lines (tag `TriAevumXR` and `native-stderr.log`):
+
+| Line | Meaning |
+|---|---|
+| `TRIAEVUM_XR_VIEW_SELECT view=world` | the mode is on |
+| `TRIAEVUM_XR_WORLD space=STAGE bounds=WxD ... recommended=WxH` | world space, play area, the runtime's eye size |
+| `TRIAEVUM_XR_SWAPCHAIN eye=WxH array=2`, `TRIAEVUM_XR_SWAPCHAIN fade=4x4`, `TRIAEVUM_XR_FADE ready`, `TRIAEVUM_XR_TARGETS slots=2 views=3` | eye and fade swapchains, renderer targets |
+| `TRIAEVUM_XR_REFRESH ... requested=90` | the 90 Hz default |
+| `TRIAEVUM_XR_NAMESPACES ns1=400x240 ... ns3=WxH ns4=WxH` | per-namespace extents (set once) |
+| `TRIAEVUM_XR_CAMERA state=world\|cinema\|black owner=native blockers=0x.. (names)` | every state change and its reason |
+| `TRIAEVUM_XR_LAYER request= / shown=` | the compositor's layer mode (fades) |
+| `TRIAEVUM_XR_RIG event=place\|recenter\|door\|blink\|idle\|floor ... dist_m= epoch=` | rig changes; `event=status` every 5 s while the world shows |
+| `TRIAEVUM_XR_STATS ... stereo_publications= stereo_copies= layer=world` | ~150 pairs and ~450 display frames per 5 s at 90 Hz |
+| `TRIAEVUM_XR_TICK pairs= late_pairs= overruns= beats= lat_ticks= horizon_ms_mean= pacer_fallbacks=` | the 3:1 lock (`beats=0`, `late_pairs` < 1%) |
+| `TRIAEVUM_XR_VIEW full= sky= ui= ... fallback= mirrored= C= detR= detV=` | draw classes of the eye passes (every 5 s) |
+| `TRIAEVUM_XR_FLAGS reason=edge flags1= flags2= setting=` | player flag and camera setting edges (decomp numbering check) |
+| `TRIAEVUM_XR_CAPTURE view= requested= w= h= path=` | a capture |
+
+On a PC (no headset), `TRIAEVUM_XR_PREVIEW=left|right` shows one eye in the desktop window
+(`TRIAEVUM_XR_PREVIEW_HEAD=identity` (default, must equal the mono picture), `sweep90`, `sweep180`, or
+`yaw,x,y,z` relative to the game camera); `oot3d_xr_world_logic_tests` and `oot3d_xr_math_tests` run
+the pure parts anywhere.
 
 ## Title pairing
 
