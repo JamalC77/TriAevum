@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -66,6 +67,11 @@ class NativeRenderCommandStream final {
     // command, and a Run command in worker mode.
     [[nodiscard]] bool InSynchronousCommand() const noexcept;
     [[nodiscard]] uint64_t ExecutedCommands() const noexcept;
+    // Time blocked since the last take of each (worker mode): the submitter waiting for the worker
+    // (frame backpressure, Run, Drain, WaitForFramesInFlight), and the worker waiting for commands. Each
+    // is taken by its own thread.
+    [[nodiscard]] uint64_t TakeSubmitterWaitNs() noexcept;
+    [[nodiscard]] uint64_t TakeWorkerIdleNs() noexcept;
 
   private:
     struct Entry {
@@ -93,6 +99,8 @@ class NativeRenderCommandStream final {
     std::exception_ptr mFailure;
     uint64_t mExecuted = 0U;
     uint64_t mSubmitted = 0U;
+    std::atomic<uint64_t> mSubmitterWaitNs{0};
+    std::atomic<uint64_t> mWorkerIdleNs{0};
 };
 
 } // namespace Oot3dNativeGame

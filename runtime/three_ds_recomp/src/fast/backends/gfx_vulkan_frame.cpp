@@ -246,6 +246,20 @@ void GfxRenderingAPIVulkan::StartFrame() {
     if (!mInitialized || mFrameActive || mFrameSubmitted) {
         return;
     }
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    // In-world: the whole StartFrame for TRIAEVUM_XR_PERF (worker start=), early returns included.
+    struct XrStartTimer {
+        bool Enabled;
+        std::chrono::steady_clock::time_point Start = std::chrono::steady_clock::now();
+        ~XrStartTimer() {
+            if (Enabled)
+                TriAevumQuestXr::PerfNote(TriAevumQuestXr::PerfPhase::WorkerStart,
+                                          std::chrono::duration<double, std::milli>(
+                                              std::chrono::steady_clock::now() - Start)
+                                              .count());
+        }
+    } xrStartTimer{mXrWorld};
+#endif
     // Guest completion survives presentations. A visual replay, however, must
     // capture this sample's source image again instead of reusing alpha zero.
     std::erase_if(mHandledNativePicaTextureCopies,
@@ -716,9 +730,18 @@ void GfxRenderingAPIVulkan::StartFrame() {
     PrewarmNativePicaPipelines();
     markStart(2);
 
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    const auto fenceStart = std::chrono::steady_clock::now();
+#endif
     CheckVk(vkWaitForFences(mDevice, 1, &mInFlightFences[mCurrentFrame], VK_TRUE,
                             std::numeric_limits<uint64_t>::max()),
             "vkWaitForFences");
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    if (mXrWorld)
+        TriAevumQuestXr::PerfNote(
+            TriAevumQuestXr::PerfPhase::WorkerFence,
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fenceStart).count());
+#endif
     markStart(3);
     // A fence handle is reused for another submission below. Retire all image
     // references to its completed submission before resetting it; otherwise a
@@ -770,10 +793,15 @@ void GfxRenderingAPIVulkan::StartFrame() {
         }
         if (mXrWorld) {
             // Every image of the slot (panel, eyes): its last copy must be done; the GPU wait
-            // below takes the latest copy value.
+            // below takes the latest copy value. (With the in-frame copy the pair's copies are in the
+            // slot's own last submission, which the frame fence above covered.)
+            const auto targetStart = std::chrono::steady_clock::now();
             for (uint32_t view = 0; view < kXrViewCount; ++view)
                 xrCopyWaitValue = std::max(
                     xrCopyWaitValue, TriAevumQuestXr::WaitTargetFree(mCurrentFrame * kXrViewCount + view));
+            TriAevumQuestXr::PerfNote(
+                TriAevumQuestXr::PerfPhase::WorkerTargetFree,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - targetStart).count());
             BeginXrViewFrame();
         } else {
         // The slot's private target: its last copy into the quad must be done (normally long
@@ -997,6 +1025,10 @@ void GfxRenderingAPIVulkan::EndFrame() {
     if (!mFrameActive) {
         return;
     }
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    const auto xrEndStart = std::chrono::steady_clock::now();
+    mXrFrameCopyToken = 0;
+#endif
     StoreDlssFeatureRecord();
     if (mOot3dShadow2dPassActive) {
         EndOot3dShadow2dDepthEncodePass();
@@ -1037,6 +1069,15 @@ void GfxRenderingAPIVulkan::EndFrame() {
                          mSwapchainFormat, mSwapchainExtent, mCurrentFrame, mCurrentImage,
                          mFrameCounter, mNativePicaPresentedThisFrame);
     mDiagnostics.RecordPicaSceneFrame(sceneFrameStats);
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    // In-world: a frame that drew a pair copies it into the XR thread's held swapchain images inside this
+    // very submission (FinishRender publishes it with the token); without a held image the XR queue copies
+    // it after the frame, as before.
+    if (mXrWorld && mXrViewPresented[kXrViewEyeLeft] && mXrViewPresented[kXrViewEyeRight] &&
+        mXrStereoViews.Valid)
+        mXrFrameCopyToken = TriAevumQuestXr::RecordFrameCopy(mCommandBuffers[mCurrentFrame], mCurrentFrame,
+                                                             TriAevumQuestXr::HudEnabled());
+#endif
     mGpuProfiler.EndFrame(mCurrentFrame, mCommandBuffers[mCurrentFrame]);
     CheckVk(vkEndCommandBuffer(mCommandBuffers[mCurrentFrame]), "vkEndCommandBuffer");
 
@@ -1054,6 +1095,12 @@ void GfxRenderingAPIVulkan::EndFrame() {
     mGpuCopySubmittedFrames[mCurrentFrame] = mFrameCounter;
     mFrameActive = false;
     mFrameSubmitted = true;
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    if (mXrWorld)
+        TriAevumQuestXr::PerfNote(
+            TriAevumQuestXr::PerfPhase::WorkerSubmit,
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - xrEndStart).count());
+#endif
 }
 
 void GfxRenderingAPIVulkan::FinishRender() {
@@ -1072,12 +1119,14 @@ void GfxRenderingAPIVulkan::FinishRender() {
             // A pair carries its panel: the frame-start clear left it transparent and only the
             // overlays (TopScreen HUD, ImGui) drew on it, so it is the HUD quad's image (W4, minimal).
             const uint32_t slot = mCurrentImage / kXrViewCount;
+            const uint64_t frameCopy = std::exchange(mXrFrameCopyToken, uint64_t{0});
             if (mXrViewPresented[kXrViewEyeLeft] && mXrViewPresented[kXrViewEyeRight] &&
                 mXrStereoViews.Valid) {
                 TriAevumQuestXr::PublishStereo(slot, mXrRenderValue, mXrStereoViews,
-                                               TriAevumQuestXr::HudEnabled());
-            } else if (!mXrWorldFrame) {
-                TriAevumQuestXr::PublishPanel(slot, mXrRenderValue);
+                                               TriAevumQuestXr::HudEnabled(), frameCopy);
+            } else {
+                TriAevumQuestXr::AbandonFrameCopy(frameCopy, mXrRenderValue);
+                if (!mXrWorldFrame) TriAevumQuestXr::PublishPanel(slot, mXrRenderValue);
             }
         } else {
         // Immersive mode: hand the finished target to the XR thread (copied when GPU-complete).

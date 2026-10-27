@@ -4,7 +4,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <vector>
 
 namespace TriAevumQuestXr::Logic {
 
@@ -405,6 +408,144 @@ struct DisplayTickClock {
         return Tick;
     }
     void Pause() { Running = false; }
+};
+
+// ---- Phase timing (TRIAEVUM_XR_PERF): a histogram of 0.25 ms buckets up to 128 ms (the last bucket is
+// open), from which the 5 s window's p95 is read. The runtime keeps one per phase in atomics; these are
+// the bucket index and the percentile over a plain copy of the counts.
+constexpr double kPerfBucketMs = 0.25;
+constexpr size_t kPerfBuckets = 512;
+
+inline size_t PerfBucket(double milliseconds) {
+    if (!(milliseconds > 0.0)) return 0;
+    const double bucket = std::floor(milliseconds / kPerfBucketMs);
+    return bucket >= static_cast<double>(kPerfBuckets - 1) ? kPerfBuckets - 1 : static_cast<size_t>(bucket);
+}
+
+// The upper edge of the bucket where the cumulative count reaches `fraction` of `total`, never above the
+// window's maximum (the open last bucket reports the maximum). 0 for an empty window.
+inline double PerfPercentileMs(const uint32_t* counts, size_t buckets, uint64_t total, double fraction,
+                               double maxMs) {
+    if (total == 0U || counts == nullptr || buckets == 0U) return 0.0;
+    const double wanted = std::clamp(fraction, 0.0, 1.0) * static_cast<double>(total);
+    uint64_t cumulative = 0;
+    for (size_t i = 0; i < buckets; ++i) {
+        cumulative += counts[i];
+        if (static_cast<double>(cumulative) >= wanted && cumulative != 0U) {
+            if (i + 1 == buckets) return maxMs;
+            return std::min(static_cast<double>(i + 1) * kPerfBucketMs, maxMs);
+        }
+    }
+    return maxMs;
+}
+
+// ---- The in-frame copy's swapchain images (in-world, TRIAEVUM_XR_FRAME_COPY): the XR thread acquires and
+// waits one image ahead (Ready); the renderer claims it at the end of a frame that drew a pair and records
+// the copy into that frame's own command buffer (Claimed); the frame's publication commits it with the
+// frame's render value (Written); the XR thread releases it once the render timeline reached that value.
+// OpenXR waits and releases images in acquire order, so the queue is oldest first and only its front is
+// ever released. A claim that was never committed (an older claim when a newer one commits) becomes an
+// orphan: it is released only in the same pass as a later image, so its content is never the one shown.
+template <typename Payload>
+class HeldImageQueue {
+  public:
+    enum class Stage : uint8_t { Unwaited, Ready, Claimed, Written };
+    struct Entry {
+        int Index = -1;
+        Stage State = Stage::Unwaited;
+        uint64_t Token = 0;
+        uint64_t RenderValue = 0;
+        bool Orphan = false;
+        Payload Data{};
+    };
+
+    explicit HeldImageQueue(size_t capacity = 2) : mCapacity(std::max<size_t>(1, capacity)) {}
+    void SetCapacity(size_t capacity) { mCapacity = std::max<size_t>(1, capacity); }
+    size_t Capacity() const { return mCapacity; }
+    size_t Size() const { return mEntries.size(); }
+    bool HasState(Stage state) const {
+        return std::any_of(mEntries.begin(), mEntries.end(), [state](const Entry& e) { return e.State == state; });
+    }
+    bool HasUnwaited() const { return HasState(Stage::Unwaited); }
+    bool HasReady() const { return HasState(Stage::Ready); }
+    // One image ahead: acquire only with nothing unwaited, nothing ready and room left.
+    bool NeedsAcquire() const { return !HasUnwaited() && !HasReady() && mEntries.size() < mCapacity; }
+    void Acquired(int index) {
+        Entry entry;
+        entry.Index = index;
+        mEntries.push_back(entry);
+    }
+    // The oldest unwaited image is ready (xrWaitSwapchainImage returned).
+    bool Waited() {
+        for (auto& e : mEntries)
+            if (e.State == Stage::Unwaited) {
+                e.State = Stage::Ready;
+                return true;
+            }
+        return false;
+    }
+    // The ready image's index, now claimed by `token` (non-zero); -1 when none is ready.
+    int Claim(uint64_t token) {
+        if (token == 0U) return -1;
+        for (auto& e : mEntries)
+            if (e.State == Stage::Ready) {
+                e.State = Stage::Claimed;
+                e.Token = token;
+                return e.Index;
+            }
+        return -1;
+    }
+    // The claim of `token` was written by a submission that signals `renderValue` (0: already complete).
+    // With `orphanOlder` (the renderer, whose claims commit in order), older claims become orphans of the
+    // same value: their content is no publication's.
+    bool Commit(uint64_t token, uint64_t renderValue, const Payload& data, bool orphanOlder = true) {
+        bool found = false;
+        for (auto& e : mEntries) {
+            if (e.State != Stage::Claimed) continue;
+            if (e.Token == token) {
+                e.State = Stage::Written;
+                e.RenderValue = renderValue;
+                e.Data = data;
+                found = true;
+                break;
+            }
+            if (!orphanOlder) continue;
+            e.State = Stage::Written;
+            e.RenderValue = renderValue;
+            e.Orphan = true;
+        }
+        return found;
+    }
+    // The claim of `token` will not be published (a failed copy, a frame without its pair): an orphan,
+    // complete once the timeline reaches `renderValue`.
+    bool Abandon(uint64_t token, uint64_t renderValue) {
+        for (auto& e : mEntries)
+            if (e.State == Stage::Claimed && e.Token == token) {
+                e.State = Stage::Written;
+                e.RenderValue = renderValue;
+                e.Orphan = true;
+                return true;
+            }
+        return false;
+    }
+    // Pops what may be released now, oldest first: the written front entries whose render value the
+    // timeline reached (`completed`), without a trailing orphan.
+    std::vector<Entry> TakeReleasable(uint64_t completed) {
+        size_t count = 0;
+        while (count < mEntries.size() && mEntries[count].State == Stage::Written &&
+               mEntries[count].RenderValue <= completed)
+            ++count;
+        while (count != 0U && mEntries[count - 1].Orphan) --count;
+        std::vector<Entry> out(mEntries.begin(), mEntries.begin() + static_cast<std::ptrdiff_t>(count));
+        mEntries.erase(mEntries.begin(), mEntries.begin() + static_cast<std::ptrdiff_t>(count));
+        return out;
+    }
+    void Clear() { mEntries.clear(); }
+    const std::deque<Entry>& Entries() const { return mEntries; }
+
+  private:
+    size_t mCapacity;
+    std::deque<Entry> mEntries;
 };
 
 }  // namespace TriAevumQuestXr::Logic

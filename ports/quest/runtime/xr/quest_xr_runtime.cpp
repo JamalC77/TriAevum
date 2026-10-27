@@ -8,7 +8,12 @@
 
 #include <pthread.h>
 #include <sched.h>
+#include <sys/resource.h>
+#include <time.h>
 #include <unistd.h>
+
+#include <array>
+#include <cerrno>
 
 #include <algorithm>
 #include <cmath>
@@ -80,8 +85,24 @@ const char* ThreadTypeName(XrAndroidThreadTypeKHR type) {
     }
 }
 
+// Max intensity (default): the guest, the render worker and the XR thread at nice -10 besides the runtime's
+// thread hints, so shader preparation, audio and logging never preempt the frame path.
+// TRIAEVUM_XR_THREAD_NICE=<-20..0> (0: unchanged).
+void ApplyThreadNice(const char* role, int tid) {
+    static const int nice = static_cast<int>(std::clamp(EnvDouble("TRIAEVUM_XR_THREAD_NICE", -10.0), -20.0, 0.0));
+    if (nice == 0) return;
+    errno = 0;
+    const int result = setpriority(PRIO_PROCESS, static_cast<id_t>(tid), nice);
+    const int error = result != 0 ? errno : 0;
+    errno = 0;
+    const int now = getpriority(PRIO_PROCESS, static_cast<id_t>(tid));
+    XRLOG("TRIAEVUM_XR_THREAD_NICE role=%s tid=%d requested=%d result=%d errno=%d now=%d", role, tid, nice, result,
+          error, errno == 0 ? now : 99);
+}
+
 void ApplyThreadHint(XrAndroidThreadTypeKHR type, int tid) {
     auto& g = G();
+    if (WorldRequested()) ApplyThreadNice(ThreadTypeName(type), tid);
     if (g.SetApplicationThread == nullptr || g.Session == XR_NULL_HANDLE) {
         XRLOG("TRIAEVUM_XR_THREAD role=%s tid=%d result=unsupported", ThreadTypeName(type), tid);
         return;
@@ -386,11 +407,19 @@ void OnSessionRunning() {
               static_cast<int>(result), current);
     }
     if (g.SetPerformanceLevel != nullptr) {
-        const XrResult cpu =
-            g.SetPerformanceLevel(g.Session, XR_PERF_SETTINGS_DOMAIN_CPU_EXT, XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
-        const XrResult gpu =
-            g.SetPerformanceLevel(g.Session, XR_PERF_SETTINGS_DOMAIN_GPU_EXT, XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
-        XRLOG("TRIAEVUM_XR_PERF cpu=%d gpu=%d level=sustained_high", static_cast<int>(cpu), static_cast<int>(gpu));
+        // In-world: BOOST (max clocks) by default; TRIAEVUM_XR_PERF_LEVEL=sustained_high restores the old level.
+        // The Q3 screen keeps SUSTAINED_HIGH.
+        const char* requested = std::getenv("TRIAEVUM_XR_PERF_LEVEL");
+        const std::string_view level = requested != nullptr && *requested != '\0'
+                                           ? std::string_view(requested)
+                                           : std::string_view(WorldRequested() ? "boost" : "sustained_high");
+        const bool boost = level == "boost";
+        const XrPerfSettingsLevelEXT value =
+            boost ? XR_PERF_SETTINGS_LEVEL_BOOST_EXT : XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT;
+        const XrResult cpu = g.SetPerformanceLevel(g.Session, XR_PERF_SETTINGS_DOMAIN_CPU_EXT, value);
+        const XrResult gpu = g.SetPerformanceLevel(g.Session, XR_PERF_SETTINGS_DOMAIN_GPU_EXT, value);
+        XRLOG("TRIAEVUM_XR_PERF cpu=%d gpu=%d level=%s", static_cast<int>(cpu), static_cast<int>(gpu),
+              boost ? "boost" : "sustained_high");
     }
     static bool affinityLogged = false;
     if (!affinityLogged) {
@@ -519,6 +548,83 @@ struct FrameStats {
     float WallFadeMax = 0.0F;
 };
 
+// ---- TRIAEVUM_XR_PERF: per-phase histograms (any thread adds; the XR thread reads and resets them every
+// 5 s). A sample racing the reset lands in either window.
+constexpr size_t kPerfPhases = static_cast<size_t>(PerfPhase::Count);
+struct PerfSlot {
+    std::atomic<uint64_t> Count{0};
+    std::atomic<uint64_t> SumUs{0};
+    std::atomic<uint64_t> MaxUs{0};
+    std::array<std::atomic<uint32_t>, Logic::kPerfBuckets> Buckets{};
+};
+std::array<PerfSlot, kPerfPhases> gPerf;
+
+struct PerfSummary {
+    uint64_t Count = 0;
+    double Mean = 0.0, P95 = 0.0, Max = 0.0, Sum = 0.0;
+};
+
+PerfSummary TakePerf(PerfPhase phase) {
+    auto& slot = gPerf[static_cast<size_t>(phase)];
+    std::array<uint32_t, Logic::kPerfBuckets> counts{};
+    for (size_t i = 0; i < counts.size(); ++i) counts[i] = slot.Buckets[i].exchange(0);
+    PerfSummary out;
+    out.Count = slot.Count.exchange(0);
+    out.Sum = static_cast<double>(slot.SumUs.exchange(0)) / 1000.0;
+    out.Max = static_cast<double>(slot.MaxUs.exchange(0)) / 1000.0;
+    if (out.Count == 0U) return {};
+    out.Mean = out.Sum / static_cast<double>(out.Count);
+    uint64_t bucketed = 0;
+    for (uint32_t c : counts) bucketed += c;
+    out.P95 = Logic::PerfPercentileMs(counts.data(), counts.size(), bucketed, 0.95, out.Max);
+    return out;
+}
+
+// mean/p95/max in ms, then x and the sample count.
+std::string PerfText(const PerfSummary& s) {
+    return Format("%.1f/%.1f/%.1fx%llu", s.Mean, s.P95, s.Max, static_cast<unsigned long long>(s.Count));
+}
+
+void LogPerf(const SinkStats& sink) {
+    if (!PerfEnabled()) return;
+    const auto t = [](PerfPhase phase) { return PerfText(TakePerf(phase)); };
+    // Guest thread: one host frame, the guest refreshes in it, its waits for the render worker, its CPU.
+    const std::string guestFrame = t(PerfPhase::GuestFrame), update = t(PerfPhase::GuestUpdate),
+                      streamWait = t(PerfPhase::GuestStreamWait), guestCpu = t(PerfPhase::GuestCpu);
+    XRLOG("TRIAEVUM_XR_PERF thread=guest frame=%s update=%s stream_wait=%s cpu=%s", guestFrame.c_str(),
+          update.c_str(), streamWait.c_str(), guestCpu.c_str());
+    const std::string workerFrame = t(PerfPhase::WorkerFrame), start = t(PerfPhase::WorkerStart),
+                      fence = t(PerfPhase::WorkerFence), targetFree = t(PerfPhase::WorkerTargetFree),
+                      ns1 = t(PerfPhase::WorkerNs1), eyeL = t(PerfPhase::WorkerEyeLeft),
+                      eyeR = t(PerfPhase::WorkerEyeRight), ui = t(PerfPhase::WorkerUi),
+                      tickWait = t(PerfPhase::WorkerTickWait), submit = t(PerfPhase::WorkerSubmit),
+                      workerCpu = t(PerfPhase::WorkerCpu), idle = t(PerfPhase::WorkerIdle);
+    XRLOG("TRIAEVUM_XR_PERF thread=worker frame=%s start=%s fence=%s target_free=%s ns1=%s eye_l=%s eye_r=%s "
+          "ui=%s tick_wait=%s submit=%s cpu=%s idle=%s",
+          workerFrame.c_str(), start.c_str(), fence.c_str(), targetFree.c_str(), ns1.c_str(), eyeL.c_str(),
+          eyeR.c_str(), ui.c_str(), tickWait.c_str(), submit.c_str(), workerCpu.c_str(), idle.c_str());
+    const std::string waitFrame = t(PerfPhase::XrWaitFrame), beginFrame = t(PerfPhase::XrBeginFrame),
+                      endFrame = t(PerfPhase::XrEndFrame), acquire = t(PerfPhase::XrAcquire),
+                      waitImage = t(PerfPhase::XrWaitImage), release = t(PerfPhase::XrRelease),
+                      xrSubmit = t(PerfPhase::XrSubmit), xrCpu = t(PerfPhase::XrCpu);
+    XRLOG("TRIAEVUM_XR_PERF thread=xr wait_frame=%s begin_frame=%s end_frame=%s acquire=%s wait_image=%s "
+          "release=%s submit=%s cpu=%s",
+          waitFrame.c_str(), beginFrame.c_str(), endFrame.c_str(), acquire.c_str(), waitImage.c_str(),
+          release.c_str(), xrSubmit.c_str(), xrCpu.c_str());
+    const std::string holdXr = t(PerfPhase::LockHoldXr), holdRenderer = t(PerfPhase::LockHoldRenderer),
+                      waitXr = t(PerfPhase::LockWaitXr), waitRenderer = t(PerfPhase::LockWaitRenderer),
+                      shown = t(PerfPhase::PairShown);
+    XRLOG("TRIAEVUM_XR_PERF thread=sink lock_hold_xr=%s lock_hold_renderer=%s lock_wait_xr=%s "
+          "lock_wait_renderer=%s pair_shown=%s frame_copy=%d frame_copies=%llu frame_copy_misses=%llu "
+          "queue_copies=%llu held_image_waits=%llu orphans=%llu held_acquire_failures=%llu held_wait_timeouts=%llu",
+          holdXr.c_str(), holdRenderer.c_str(), waitXr.c_str(), waitRenderer.c_str(), shown.c_str(),
+          FrameCopyEnabled() ? 1 : 0, static_cast<unsigned long long>(sink.FrameCopies),
+          static_cast<unsigned long long>(sink.FrameCopyMisses), static_cast<unsigned long long>(sink.QueueCopies),
+          static_cast<unsigned long long>(sink.HeldImageWaits), static_cast<unsigned long long>(sink.FrameCopyOrphans),
+          static_cast<unsigned long long>(sink.HeldAcquireFailures),
+          static_cast<unsigned long long>(sink.HeldWaitTimeouts));
+}
+
 void LogStats(FrameStats& frames) {
     const auto& g = G();
     const SinkStats sink = TakeSinkStats();
@@ -555,6 +661,7 @@ void LogStats(FrameStats& frames) {
     if (WorldRequested())
         XRLOG("TRIAEVUM_XR_OVERLAY wall_fade_frames=%llu wall_fade_max=%.2f",
               static_cast<unsigned long long>(frames.WallFadeFrames), frames.WallFadeMax);
+    if (WorldRequested()) LogPerf(sink);
     frames = {};
 }
 
@@ -678,6 +785,7 @@ void XrThreadMain() {
     XRLOG("TRIAEVUM_XR_THREAD_START tid=%d", gettid());
     const bool world = WorldRequested();
     FrameStats frames;
+    double lastCpuMs = -1.0;
     double nextStats = NowSeconds() + kStatsPeriodSeconds;
     bool wasFocused = false;
     bool tickValid = false;
@@ -701,7 +809,14 @@ void XrThreadMain() {
         XrFrameState frameState{XR_TYPE_FRAME_STATE};
         auto start = std::chrono::steady_clock::now();
         XrResult result = xrWaitFrame(g.Session, &waitInfo, &frameState);
-        frames.WaitFrameMsMax = std::max(frames.WaitFrameMsMax, MillisecondsSince(start));
+        const double waitMs = MillisecondsSince(start);
+        frames.WaitFrameMsMax = std::max(frames.WaitFrameMsMax, waitMs);
+        if (world) {
+            PerfNote(PerfPhase::XrWaitFrame, waitMs);
+            const double cpu = ThreadCpuMs();
+            if (lastCpuMs >= 0.0) PerfNote(PerfPhase::XrCpu, cpu - lastCpuMs);
+            lastCpuMs = cpu;
+        }
         if (XR_FAILED(result)) {
             XRWARN("TRIAEVUM_XR_ERROR call=xrWaitFrame result=%d", static_cast<int>(result));
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -716,7 +831,9 @@ void XrThreadMain() {
             XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
             result = xrBeginFrame(g.Session, &beginInfo);
         }
-        frames.BeginFrameMsMax = std::max(frames.BeginFrameMsMax, MillisecondsSince(start));
+        const double beginMs = MillisecondsSince(start);
+        frames.BeginFrameMsMax = std::max(frames.BeginFrameMsMax, beginMs);
+        if (world) PerfNote(PerfPhase::XrBeginFrame, beginMs);
         if (XR_FAILED(result)) {
             XRWARN("TRIAEVUM_XR_ERROR call=xrBeginFrame result=%d", static_cast<int>(result));
             continue;
@@ -820,10 +937,12 @@ void XrThreadMain() {
         endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
         endInfo.layerCount = layerCount;
         endInfo.layers = layerCount != 0U ? layers : nullptr;
+        start = std::chrono::steady_clock::now();
         {
             QueueLock lock("xr");
             result = xrEndFrame(g.Session, &endInfo);
         }
+        if (world) PerfNote(PerfPhase::XrEndFrame, MillisecondsSince(start));
         if (XR_FAILED(result)) XRWARN("TRIAEVUM_XR_ERROR call=xrEndFrame result=%d", static_cast<int>(result));
         ++frames.DisplayFrames;
     }
@@ -1432,6 +1551,30 @@ void RequestBlink(uint32_t rigEpoch, uint32_t fadeMs) {
 
 void Pulse(int hand, uint32_t milliseconds) {
     Haptic(hand == 0 || hand == 2, hand == 1 || hand == 2, static_cast<int>(milliseconds));
+}
+
+bool PerfEnabled() {
+    static const bool enabled = WorldRequested() && EnvFlag("TRIAEVUM_XR_PERF", true);
+    return enabled;
+}
+
+void PerfNote(PerfPhase phase, double milliseconds) {
+    const auto index = static_cast<size_t>(phase);
+    if (index >= kPerfPhases || !std::isfinite(milliseconds) || milliseconds < 0.0 || !PerfEnabled()) return;
+    auto& slot = gPerf[index];
+    const auto us = static_cast<uint64_t>(std::llround(milliseconds * 1000.0));
+    slot.Count.fetch_add(1, std::memory_order_relaxed);
+    slot.SumUs.fetch_add(us, std::memory_order_relaxed);
+    uint64_t max = slot.MaxUs.load(std::memory_order_relaxed);
+    while (us > max && !slot.MaxUs.compare_exchange_weak(max, us, std::memory_order_relaxed)) {
+    }
+    slot.Buckets[Logic::PerfBucket(milliseconds)].fetch_add(1, std::memory_order_relaxed);
+}
+
+double ThreadCpuMs() {
+    timespec now{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now) != 0) return 0.0;
+    return static_cast<double>(now.tv_sec) * 1000.0 + static_cast<double>(now.tv_nsec) * 1e-6;
 }
 
 void SetWallFade(float alpha) { gWallFade.store(std::isfinite(alpha) ? std::clamp(alpha, 0.0F, 1.0F) : 0.0F); }

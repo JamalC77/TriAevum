@@ -1248,6 +1248,7 @@ class GfxRenderingAPIVulkan final : public GfxRenderingAPI,
     Oot3d::PresentationPicture mXrPanelPicture{};
     StereoViews mXrStereoViews{};
     bool mXrWorldFrame = false;  // SetXrStereoViews this frame
+    uint64_t mXrFrameCopyToken = 0;  // EndFrame recorded the pair's in-frame copy (FinishRender publishes it)
     std::array<bool, 8> mXrNamespaceExtentSet{};
     std::array<Oot3d::RenderExtent, 8> mXrNamespaceExtents{};
     // The camera-dependent effects the world mode turned off for rendering (bits; logged on change).

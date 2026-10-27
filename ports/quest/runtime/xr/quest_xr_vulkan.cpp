@@ -3,7 +3,11 @@
 // q3-spec §4.1, §5. In-world mode (inworld-spec §2.4, §3.3): three targets per frame slot (panel,
 // eye L, eye R), stereo publications that carry their eye poses, the eye swapchain (arraySize 2) and
 // the static fade swapchain. The HUD (W4, minimal): the panel of a stereo publication with panelValid
-// is copied into its own swapchain in the same submit as the eyes.
+// is copied into its own swapchain in the same submit as the eyes. The in-frame copy (default on,
+// TRIAEVUM_XR_FRAME_COPY=0: the XR queue copies as before): the XR thread holds an acquired, waited eye (and
+// HUD) image ahead; the renderer records a pair's copies into its own frame submission (queue 0), and the XR
+// thread releases the images once the render timeline reached that frame. The XR queue then only carries a
+// release sync, so its copies can no longer queue behind the next frame's rendering.
 #include "quest_xr_internal.h"
 #include "quest_xr_input_logic.h"
 
@@ -12,6 +16,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdlib>
+#include <ctime>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -70,6 +75,7 @@ struct Publication {
     PublicationKind Kind = PublicationKind::Panel;
     Fast::StereoViews Views{};
     bool PanelValid = false;
+    double PublishedAt = 0.0;  // NowSeconds() at the publication (just after the frame's submit)
 };
 std::mutex gSink;
 std::condition_variable gSinkChanged;
@@ -83,9 +89,15 @@ SinkStats gStats;
 std::array<uint32_t, 15> gLatency{};
 size_t gLatencyCount = 0, gLatencyNext = 0;
 PairStats gPairStats;
+// In-frame copy: the held eye and HUD images (one acquired and waited ahead), and the claim tokens.
+using HeldQueue = Logic::HeldImageQueue<Publication>;
+HeldQueue gEyeHeld;
+HeldQueue gHudHeld;
+uint64_t gFrameCopyToken = 0;
 
 // ---- XR thread only
 uint64_t gCopyValue = 0;
+std::atomic<uint64_t> gCopySubmitted{0};  // the copy timeline's last submitted value (renderer device waits)
 bool gFirstImageLogged = false;
 Fast::StereoViews gShownViews{};
 bool gHasShownViews = false;
@@ -194,10 +206,12 @@ int AcquireAndWait(SwapchainState& swapchain) {
         uint32_t index = 0;
         XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
         XrResult result;
+        const double start = NowSeconds();
         {
             QueueLock lock("xr");
             result = xrAcquireSwapchainImage(swapchain.Handle, &acquire, &index);
         }
+        PerfNote(PerfPhase::XrAcquire, (NowSeconds() - start) * 1000.0);
         if (XR_FAILED(result)) {
             XRWARN("TRIAEVUM_XR_ERROR call=xrAcquireSwapchainImage swapchain=%s result=%d", swapchain.Name,
                    static_cast<int>(result));
@@ -209,7 +223,9 @@ int AcquireAndWait(SwapchainState& swapchain) {
     if (!swapchain.PendingWaited) {
         XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
         wait.timeout = 100'000'000;  // 100 ms
+        const double start = NowSeconds();
         const XrResult waited = xrWaitSwapchainImage(swapchain.Handle, &wait);
+        PerfNote(PerfPhase::XrWaitImage, (NowSeconds() - start) * 1000.0);
         if (waited == XR_TIMEOUT_EXPIRED || XR_FAILED(waited)) {
             if (waited != XR_TIMEOUT_EXPIRED)
                 XRWARN("TRIAEVUM_XR_ERROR call=xrWaitSwapchainImage swapchain=%s result=%d", swapchain.Name,
@@ -223,19 +239,26 @@ int AcquireAndWait(SwapchainState& swapchain) {
     return swapchain.PendingAcquire;
 }
 
-void ReleaseImage(SwapchainState& swapchain) {
+// xrReleaseSwapchainImage of the oldest waited image (both acquisition modes).
+void ReleaseOldest(SwapchainState& swapchain) {
     XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     XrResult released;
+    const double start = NowSeconds();
     {
         QueueLock lock("xr");
         released = xrReleaseSwapchainImage(swapchain.Handle, &release);
     }
+    PerfNote(PerfPhase::XrRelease, (NowSeconds() - start) * 1000.0);
     if (XR_FAILED(released))
         XRWARN("TRIAEVUM_XR_ERROR call=xrReleaseSwapchainImage swapchain=%s result=%d", swapchain.Name,
                static_cast<int>(released));
+    swapchain.Released = true;
+}
+
+void ReleaseImage(SwapchainState& swapchain) {
+    ReleaseOldest(swapchain);
     swapchain.PendingAcquire = -1;
     swapchain.PendingWaited = false;
-    swapchain.Released = true;
 }
 
 // Submits `command` on queue 1 with `fence`; waits the render timeline at `renderValue` (0: none) and
@@ -259,10 +282,12 @@ bool SubmitCopy(CopySlot& slot, uint64_t renderValue, uint64_t* signalled) {
     submit.signalSemaphoreCount = 1;
     submit.pSignalSemaphores = &gCopyTimeline;
     VkResult submitted;
+    const double start = NowSeconds();
     {
         QueueLock lock("xr");
         submitted = vkQueueSubmit(g.Queue, 1, &submit, slot.Fence);
     }
+    PerfNote(PerfPhase::XrSubmit, (NowSeconds() - start) * 1000.0);
     if (submitted != VK_SUCCESS) {
         XRERR("TRIAEVUM_XR_ERROR call=vkQueueSubmit(copy) result=%d", static_cast<int>(submitted));
         // The fence stays unsignaled after a failed submit; make the slot reusable.
@@ -280,6 +305,7 @@ bool SubmitCopy(CopySlot& slot, uint64_t renderValue, uint64_t* signalled) {
         return false;
     }
     gCopyValue = signalValue;
+    gCopySubmitted.store(signalValue);
     *signalled = signalValue;
     return true;
 }
@@ -308,16 +334,191 @@ int TargetIndex(int slot, uint32_t view) {
     return gViewTargets ? slot * static_cast<int>(Fast::kXrViewCount) + static_cast<int>(view) : slot;
 }
 
+// ---- in-frame copy (XR thread): the held images
+
+// One image ahead: acquire when the queue wants one, then wait 1 ms (retried every display frame, so a
+// compositor still reading the image never stalls the frame loop).
+void PrepareHeld(SwapchainState& swapchain, HeldQueue& queue) {
+    if (swapchain.Handle == XR_NULL_HANDLE) return;
+    bool acquire = false, wait = false;
+    {
+        std::lock_guard lock(gSink);
+        acquire = queue.NeedsAcquire();
+        wait = queue.HasUnwaited();
+    }
+    if (acquire) {
+        uint32_t index = 0;
+        XrSwapchainImageAcquireInfo info{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+        XrResult result;
+        const double start = NowSeconds();
+        {
+            QueueLock lock("xr");
+            result = xrAcquireSwapchainImage(swapchain.Handle, &info, &index);
+        }
+        PerfNote(PerfPhase::XrAcquire, (NowSeconds() - start) * 1000.0);
+        if (XR_FAILED(result)) {
+            size_t held = 0, capacity = 0;
+            {
+                std::lock_guard lock(gSink);
+                held = queue.Size();
+                // A runtime that allows fewer acquired images: hold only as many as it gave.
+                if (result == XR_ERROR_CALL_ORDER_INVALID && held != 0U) queue.SetCapacity(held);
+                capacity = queue.Capacity();
+                ++gStats.HeldAcquireFailures;
+            }
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1) < 4)
+                XRWARN("TRIAEVUM_XR_FRAME_COPY acquire_failed swapchain=%s result=%d held=%zu capacity=%zu",
+                       swapchain.Name, static_cast<int>(result), held, capacity);
+            return;
+        }
+        std::lock_guard lock(gSink);
+        queue.Acquired(static_cast<int>(index));
+        wait = true;
+    }
+    if (!wait) return;
+    XrSwapchainImageWaitInfo info{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    info.timeout = 1000000;  // 1 ms
+    const double start = NowSeconds();
+    const XrResult waited = xrWaitSwapchainImage(swapchain.Handle, &info);
+    PerfNote(PerfPhase::XrWaitImage, (NowSeconds() - start) * 1000.0);
+    std::lock_guard lock(gSink);
+    if (waited == XR_SUCCESS) {
+        queue.Waited();
+    } else {
+        ++gStats.HeldWaitTimeouts;
+        if (waited != XR_TIMEOUT_EXPIRED)
+            XRWARN("TRIAEVUM_XR_ERROR call=xrWaitSwapchainImage swapchain=%s result=%d", swapchain.Name,
+                   static_cast<int>(waited));
+    }
+}
+
+// The XR queue's release sync: an empty submit that waits the render timeline at `value` (already
+// reached on the host), so the runtime's work on the binding queue is ordered after the frame's writes.
+bool SubmitReleaseSync(uint64_t value) {
+    auto& g = G();
+    VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    timeline.waitSemaphoreValueCount = 1;
+    timeline.pWaitSemaphoreValues = &value;
+    const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.pNext = &timeline;
+    submit.waitSemaphoreCount = 1;
+    submit.pWaitSemaphores = &gRenderTimeline;
+    submit.pWaitDstStageMask = &stage;
+    VkResult result;
+    const double start = NowSeconds();
+    {
+        QueueLock lock("xr");
+        result = vkQueueSubmit(g.Queue, 1, &submit, VK_NULL_HANDLE);
+    }
+    PerfNote(PerfPhase::XrSubmit, (NowSeconds() - start) * 1000.0);
+    if (result == VK_SUCCESS) return true;
+    XRERR("TRIAEVUM_XR_ERROR call=vkQueueSubmit(release_sync) result=%d", static_cast<int>(result));
+    if (result == VK_ERROR_DEVICE_LOST) {
+        gQuad.Released = false;
+        gEye.Released = false;
+        gHud.Released = false;
+        BeginExit("device_lost");
+    }
+    return false;
+}
+
+void NoteShownLatencyLocked(const Publication& publication, uint64_t tick) {
+    // Shown latency: ticks from the renderer's pace tick to this first display.
+    const uint64_t pace = publication.Views.PaceTick;
+    const uint32_t latency = tick >= pace ? static_cast<uint32_t>(std::min<uint64_t>(tick - pace, 64)) : 0U;
+    gLatency[gLatencyNext] = latency;
+    gLatencyNext = (gLatencyNext + 1) % gLatency.size();
+    gLatencyCount = std::min(gLatencyCount + 1, gLatency.size());
+    ++gPairStats.Pairs;
+    if (publication.Views.TargetTick != 0U && tick > publication.Views.TargetTick) ++gPairStats.LatePairs;
+}
+
+void NoteFirstImageOnce(const Publication& publication, int index) {
+    if (gFirstImageLogged) return;
+    gFirstImageLogged = true;
+    XRLOG("TRIAEVUM_XR_FIRST_IMAGE serial=%llu render_value=%llu xr_image=%d kind=%s",
+          static_cast<unsigned long long>(publication.Serial),
+          static_cast<unsigned long long>(publication.RenderValue), index,
+          publication.Kind == PublicationKind::Stereo ? "stereo" : "panel");
+    NoteFirstImage();
+}
+
+// Releases every held image whose frame is GPU-complete, oldest first, after one release sync; the last
+// released pair is the one on show, with its own poses.
+void ServiceHeld(uint64_t tick) {
+    auto& g = G();
+    std::vector<HeldQueue::Entry> eyes, huds;
+    {
+        std::lock_guard lock(gSink);
+        uint64_t completed = 0;
+        if (gGetSemaphoreCounterValue(g.Device, gRenderTimeline, &completed) != VK_SUCCESS) completed = 0;
+        eyes = gEyeHeld.TakeReleasable(completed);
+        huds = gHudHeld.TakeReleasable(completed);
+    }
+    if (eyes.empty() && huds.empty()) return;
+    uint64_t sync = 0;
+    for (const auto& e : eyes) sync = std::max(sync, e.RenderValue);
+    for (const auto& e : huds) sync = std::max(sync, e.RenderValue);
+    if (sync != 0U) (void)SubmitReleaseSync(sync);
+    for (size_t i = 0; i < eyes.size(); ++i) ReleaseOldest(gEye);
+    for (size_t i = 0; i < huds.size(); ++i) ReleaseOldest(gHud);
+    const HeldQueue::Entry* shown = nullptr;
+    for (auto it = eyes.rbegin(); it != eyes.rend(); ++it)
+        if (!it->Orphan) {
+            shown = &*it;
+            break;
+        }
+    const double now = NowSeconds();
+    {
+        std::lock_guard lock(gSink);
+        for (const auto& e : eyes) {
+            if (e.Orphan) {
+                ++gStats.FrameCopyOrphans;
+            } else if (&e != shown) {
+                ++gStats.PublicationsDropped;  // released in the same display frame as a newer pair: never shown
+            }
+        }
+        for (const auto& e : huds)
+            if (!e.Orphan) ++gStats.HudCopies;
+        if (shown != nullptr) {
+            ++gStats.Copies;
+            ++gStats.StereoCopies;
+            gShownSerial = std::max(gShownSerial, shown->Data.Serial);
+            NoteShownLatencyLocked(shown->Data, tick);
+        }
+    }
+    gSinkChanged.notify_all();
+    if (shown == nullptr) return;
+    gShownViews = shown->Data.Views;
+    gHasShownViews = true;
+    if (shown->Data.PublishedAt > 0.0) PerfNote(PerfPhase::PairShown, (now - shown->Data.PublishedAt) * 1000.0);
+    NoteFirstImageOnce(shown->Data, shown->Index);
+    static bool hudLogged = false;
+    if (!hudLogged && !huds.empty()) {
+        hudLogged = true;
+        XRLOG("TRIAEVUM_XR_HUD first_copy serial=%llu xr_image=%d w=%u h=%u in_frame=1",
+              static_cast<unsigned long long>(shown->Data.Serial), huds.back().Index, gHud.Extent.width,
+              gHud.Extent.height);
+    }
+}
+
 }  // namespace
 
 QueueLock::QueueLock(const char* holder) : mHolder(holder) {
+    const auto before = std::chrono::steady_clock::now();
     gQueueMutex.lock();
     mStart = std::chrono::steady_clock::now();
+    const bool renderer = holder[0] == 'r';
+    PerfNote(renderer ? PerfPhase::LockWaitRenderer : PerfPhase::LockWaitXr,
+             std::chrono::duration<double, std::milli>(mStart - before).count());
 }
 
 QueueLock::~QueueLock() {
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - mStart).count();
     gQueueMutex.unlock();
+    PerfNote(mHolder[0] == 'r' ? PerfPhase::LockHoldRenderer : PerfPhase::LockHoldXr, ms);
     if (ms > 5.0) {
         const double now = NowSeconds();
         double last = gLastLockLog.load();
@@ -328,8 +529,28 @@ QueueLock::~QueueLock() {
 
 VkResult DeviceWaitIdleLocked(VkDevice device) {
     if (!Requested()) return vkDeviceWaitIdle(device);  // the flat panel: no XR queue user
-    QueueLock lock("renderer");
-    return vkDeviceWaitIdle(device);
+    auto& g = G();
+    // Before the session (no XR thread) and after StopSession (joined, queue 1 idle) nothing else uses
+    // queue 1.
+    if (g.Queue == VK_NULL_HANDLE || g.SessionStopped.load()) return vkDeviceWaitIdle(device);
+    // Default: the renderer never touches the XR queue (so it never waits behind a blocking xrBeginFrame
+    // under the queue lock): its own queue idle, then every XR-queue copy that reads its targets.
+    // TRIAEVUM_XR_RENDERER_WAIT=device restores vkDeviceWaitIdle under the lock.
+    static const bool deviceWait = [] {
+        const char* value = std::getenv("TRIAEVUM_XR_RENDERER_WAIT");
+        const bool device = value != nullptr && std::string(value) == "device";
+        XRLOG("TRIAEVUM_XR_RENDERER_WAIT mode=%s", device ? "device" : "queue");
+        return device;
+    }();
+    if (deviceWait) {
+        QueueLock lock("renderer");
+        return vkDeviceWaitIdle(device);
+    }
+    VkQueue rendererQueue = VK_NULL_HANDLE;
+    vkGetDeviceQueue(device, g.QueueFamily, 0, &rendererQueue);
+    const VkResult result = rendererQueue != VK_NULL_HANDLE ? vkQueueWaitIdle(rendererQueue) : vkDeviceWaitIdle(device);
+    WaitCopyTimeline(gCopySubmitted.load(), "renderer_wait");
+    return result;
 }
 
 VkFormat TargetFormat() { return gTargetFormat; }
@@ -557,24 +778,145 @@ void PublishPanel(uint32_t slot, uint64_t renderValue) {
     ++gStats.Publications;
 }
 
-void PublishStereo(uint32_t slot, uint64_t renderValue, const Fast::StereoViews& views, bool panelValid) {
+void PublishStereo(uint32_t slot, uint64_t renderValue, const Fast::StereoViews& views, bool panelValid,
+                   uint64_t frameCopyToken) {
     std::lock_guard lock(gSink);
-    if (!gViewTargets || static_cast<size_t>(slot) * Fast::kXrViewCount >= gTargets.size()) return;
-    gLatest = {};
-    gLatest.Slot = static_cast<int>(slot);
-    gLatest.RenderValue = renderValue;
-    gLatest.Serial = ++gSerial;
-    gLatest.Kind = PublicationKind::Stereo;
-    gLatest.Views = views;
+    Publication publication;
+    publication.Slot = static_cast<int>(slot);
+    publication.RenderValue = renderValue;
+    publication.Kind = PublicationKind::Stereo;
+    publication.Views = views;
     // The HUD swapchain belongs to the XR thread: CopyLatest checks gHud.Handle there, not here.
-    gLatest.PanelValid = panelValid;
+    publication.PanelValid = panelValid;
+    publication.PublishedAt = NowSeconds();
+    if (!gViewTargets || static_cast<size_t>(slot) * Fast::kXrViewCount >= gTargets.size()) {
+        if (frameCopyToken != 0U) {
+            // Never left claimed: the images go with the next pair.
+            gEyeHeld.Abandon(frameCopyToken, renderValue);
+            gHudHeld.Abandon(frameCopyToken, renderValue);
+        }
+        return;
+    }
+    publication.Serial = ++gSerial;
     if (views.RigEpoch > gPublishedRigEpoch.load()) gPublishedRigEpoch.store(views.RigEpoch);
     ++gStats.Publications;
     ++gStats.StereoPublications;
-    if (gLatest.PanelValid) ++gStats.HudPublications;
+    if (publication.PanelValid) ++gStats.HudPublications;
+    if (frameCopyToken != 0U) {
+        // The pair is already in its swapchain images (this frame's submission wrote them): the XR thread
+        // releases them once the render timeline reaches renderValue. An unshown XR-queue publication
+        // before it is superseded.
+        gEyeHeld.Commit(frameCopyToken, renderValue, publication);
+        gHudHeld.Commit(frameCopyToken, renderValue, publication);
+        ++gStats.FrameCopies;
+        if (gLatest.Slot >= 0 && gLatest.Serial != gShownSerial) ++gStats.PublicationsDropped;
+        gLatest = {};
+        return;
+    }
+    gLatest = publication;
 }
 
-void CopyLatest(uint64_t tick) {
+void AbandonFrameCopy(uint64_t token, uint64_t renderValue) {
+    if (token == 0U) return;
+    std::lock_guard lock(gSink);
+    gEyeHeld.Abandon(token, renderValue);
+    gHudHeld.Abandon(token, renderValue);
+}
+
+bool FrameCopyEnabled() {
+    static const bool enabled = [] {
+        const bool on = WorldRequested() && EnvFlag("TRIAEVUM_XR_FRAME_COPY", true);
+        XRLOG("TRIAEVUM_XR_FRAME_COPY enabled=%d", on ? 1 : 0);
+        return on;
+    }();
+    return enabled;
+}
+
+uint64_t RecordFrameCopy(VkCommandBuffer command, uint32_t slot, bool hud) {
+    if (!FrameCopyEnabled() || command == VK_NULL_HANDLE) return 0;
+    uint64_t token = 0;
+    std::array<VkImage, 3> sources{};
+    std::array<VkExtent2D, 3> extents{};
+    VkImage eyeImage = VK_NULL_HANDLE, hudImage = VK_NULL_HANDLE;
+    {
+        std::lock_guard lock(gSink);
+        const size_t base = static_cast<size_t>(slot) * Fast::kXrViewCount;
+        if (!gViewTargets || gEye.Handle == XR_NULL_HANDLE || base + Fast::kXrViewCount > gTargets.size()) return 0;
+        token = ++gFrameCopyToken;
+        const int eye = gEyeHeld.Claim(token);
+        if (eye < 0 || static_cast<size_t>(eye) >= gEye.Images.size()) {
+            ++gStats.FrameCopyMisses;  // no image held ahead: the pair goes the XR queue's way
+            return 0;
+        }
+        int hudIndex = -1;
+        if (hud && gHud.Handle != XR_NULL_HANDLE) {
+            hudIndex = gHudHeld.Claim(token);
+            if (hudIndex < 0 || static_cast<size_t>(hudIndex) >= gHud.Images.size()) {
+                hudIndex = -1;
+                ++gStats.HudSkips;  // the HUD keeps its last image
+            }
+        }
+        eyeImage = gEye.Images[static_cast<size_t>(eye)].image;
+        if (hudIndex >= 0) hudImage = gHud.Images[static_cast<size_t>(hudIndex)].image;
+        const std::array<uint32_t, 3> views{Fast::kXrViewEyeLeft, Fast::kXrViewEyeRight, Fast::kXrViewPanel};
+        for (size_t i = 0; i < 3; ++i) {
+            const Target& target = gTargets[base + views[i]];
+            const VkExtent2D destination = i < 2 ? gEye.Extent : gHud.Extent;
+            sources[i] = target.Image;
+            extents[i] = {std::min(target.Extent.width, destination.width),
+                          std::min(target.Extent.height, destination.height)};
+        }
+    }
+    const size_t total = hudImage != VK_NULL_HANDLE ? 3U : 2U;
+    // A: the targets (PRESENT_SRC after this frame's scanouts and overlay passes) become copy sources once
+    //    every earlier command of the frame wrote them.
+    for (size_t i = 0; i < total; ++i)
+        Barrier(command, sources[i], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT);
+    // B: the swapchain images' previous contents are discarded (both eye layers).
+    Barrier(command, eyeImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            gEye.ArraySize);
+    if (hudImage != VK_NULL_HANDLE)
+        Barrier(command, hudImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    // Same-size formats (UNORM target into its sRGB twin): the encoded bytes pass unchanged, alpha too.
+    for (size_t i = 0; i < total; ++i) {
+        VkImageCopy copy{};
+        copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, i < 2 ? static_cast<uint32_t>(i) : 0U, 1};
+        copy.extent = {extents[i].width, extents[i].height, 1};
+        vkCmdCopyImage(command, sources[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, i < 2 ? eyeImage : hudImage,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    }
+    // C: the targets go back to the layout the renderer's passes expect (the next frame of this slot).
+    for (size_t i = 0; i < total; ++i)
+        Barrier(command, sources[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, 0,
+                VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    // D: a released color swapchain image is in COLOR_ATTACHMENT_OPTIMAL (XR_KHR_vulkan_enable).
+    Barrier(command, eyeImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            gEye.ArraySize);
+    if (hudImage != VK_NULL_HANDLE)
+        Barrier(command, hudImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        XRLOG("TRIAEVUM_XR_FRAME_COPY first slot=%u hud=%d eye=%ux%u", slot, hudImage != VK_NULL_HANDLE ? 1 : 0,
+              extents[0].width, extents[0].height);
+    }
+    return token;
+}
+
+namespace {
+
+// The XR queue's copy of the latest publication (the Q3 quad, the cinema panel, and a pair the renderer
+// could not copy in its frame), once it is GPU-complete. With the in-frame copy the eye and HUD images
+// come from the held queues and are released by ServiceHeld, in acquire order.
+void CopyQueued(uint64_t tick, bool held) {
     auto& g = G();
     Publication publication;
     // Sources [0, count) go to `swapchain` (the eyes, or the panel); for a stereo pair with panelValid
@@ -585,6 +927,8 @@ void CopyLatest(uint64_t tick) {
     size_t count = 0;
     bool hud = false;
     SwapchainState* swapchain = &gQuad;
+    uint64_t token = 0;
+    int heldIndex = -1, heldHudIndex = -1;
     {
         std::lock_guard lock(gSink);
         if (gTargets.empty() || gLatest.Slot < 0 || gLatest.Serial == gShownSerial) {
@@ -610,6 +954,23 @@ void CopyLatest(uint64_t tick) {
             swapchain = &gEye;
             hud = publication.PanelValid && gHud.Handle != XR_NULL_HANDLE;
             if (hud) sources[2] = TargetIndex(publication.Slot, Fast::kXrViewPanel);
+            if (held) {
+                // The held image ahead (none yet: PrepareHeld acquires it; retried next display frame).
+                token = ++gFrameCopyToken;
+                heldIndex = gEyeHeld.Claim(token);
+                if (heldIndex < 0) {
+                    ++gStats.HeldImageWaits;
+                    return;
+                }
+                if (hud) {
+                    heldHudIndex = gHudHeld.Claim(token);
+                    if (heldHudIndex < 0) {
+                        hud = false;
+                        sources[2] = -1;
+                        ++gStats.HudSkips;
+                    }
+                }
+            }
         } else {
             sources[0] = TargetIndex(publication.Slot, Fast::kXrViewPanel);
             count = 1;
@@ -619,6 +980,10 @@ void CopyLatest(uint64_t tick) {
             if (sources[i] < 0 || static_cast<size_t>(sources[i]) >= gTargets.size()) {
                 for (size_t j = 0; j < i; ++j) gTargets[sources[j]].Copying = false;
                 gShownSerial = publication.Serial;
+                if (token != 0U) {
+                    gEyeHeld.Abandon(token, 0);
+                    gHudHeld.Abandon(token, 0);
+                }
                 return;
             }
             Target& target = gTargets[sources[i]];
@@ -630,21 +995,24 @@ void CopyLatest(uint64_t tick) {
         }
     }
     size_t total = count + (hud ? 1U : 0U);
-    const int index = AcquireAndWait(*swapchain);
-    if (index < 0) {
-        ClearCopying(sources.data(), total);
-        return;
-    }
-    int hudIndex = -1;
-    if (hud) {
-        hudIndex = AcquireAndWait(gHud);
-        if (hudIndex < 0) {
-            // The eyes go on without it; the HUD keeps its last image (an acquired one stays pending).
-            ClearCopying(&sources[count], 1);
-            hud = false;
-            total = count;
-            std::lock_guard lock(gSink);
-            ++gStats.HudSkips;
+    int index = heldIndex;
+    int hudIndex = heldHudIndex;
+    if (token == 0U) {
+        index = AcquireAndWait(*swapchain);
+        if (index < 0) {
+            ClearCopying(sources.data(), total);
+            return;
+        }
+        if (hud) {
+            hudIndex = AcquireAndWait(gHud);
+            if (hudIndex < 0) {
+                // The eyes go on without it; the HUD keeps its last image (an acquired one stays pending).
+                ClearCopying(&sources[count], 1);
+                hud = false;
+                total = count;
+                std::lock_guard lock(gSink);
+                ++gStats.HudSkips;
+            }
         }
     }
     CopySlot& slot = swapchain->Slots[static_cast<size_t>(index)];
@@ -689,8 +1057,29 @@ void CopyLatest(uint64_t tick) {
     uint64_t signalValue = 0;
     if (!SubmitCopy(slot, publication.RenderValue, &signalValue)) {
         ClearCopying(sources.data(), total);
+        if (token != 0U) {
+            // The held images were claimed but never written: orphans, released with the next pair.
+            std::lock_guard lock(gSink);
+            gEyeHeld.Abandon(token, 0);
+            gHudHeld.Abandon(token, 0);
+        }
         // A released colour image must be written and in COLOR_ATTACHMENT_OPTIMAL: keep these acquired
         // and waited, and retry the copy next display frame (no new acquire or wait).
+        return;
+    }
+    if (token != 0U) {
+        // In acquire order behind any pair of the renderer's own frames: ServiceHeld releases it.
+        std::lock_guard lock(gSink);
+        for (size_t i = 0; i < total; ++i) {
+            Target& target = gTargets[sources[i]];
+            target.LastCopyValue = signalValue;
+            target.Copying = false;
+        }
+        gEyeHeld.Commit(token, 0, publication, false);
+        if (hud) gHudHeld.Commit(token, 0, publication, false);
+        gShownSerial = publication.Serial;
+        ++gStats.QueueCopies;
+        gSinkChanged.notify_all();
         return;
     }
     static const bool releaseWait = EnvFlag("TRIAEVUM_XR_RELEASE_WAIT");
@@ -709,35 +1098,42 @@ void CopyLatest(uint64_t tick) {
         if (hud) ++gStats.HudCopies;
         if (publication.Kind == PublicationKind::Stereo) {
             ++gStats.StereoCopies;
-            // Shown latency: ticks from the renderer's pace tick to this first display.
-            const uint64_t pace = publication.Views.PaceTick;
-            const uint32_t latency = tick >= pace ? static_cast<uint32_t>(std::min<uint64_t>(tick - pace, 64)) : 0U;
-            gLatency[gLatencyNext] = latency;
-            gLatencyNext = (gLatencyNext + 1) % gLatency.size();
-            gLatencyCount = std::min(gLatencyCount + 1, gLatency.size());
-            ++gPairStats.Pairs;
-            if (publication.Views.TargetTick != 0U && tick > publication.Views.TargetTick) ++gPairStats.LatePairs;
+            NoteShownLatencyLocked(publication, tick);
         }
     }
     gSinkChanged.notify_all();
     if (publication.Kind == PublicationKind::Stereo) {
         gShownViews = publication.Views;
         gHasShownViews = true;
+        if (publication.PublishedAt > 0.0)
+            PerfNote(PerfPhase::PairShown, (NowSeconds() - publication.PublishedAt) * 1000.0);
     }
-    if (!gFirstImageLogged) {
-        gFirstImageLogged = true;
-        XRLOG("TRIAEVUM_XR_FIRST_IMAGE serial=%llu render_value=%llu xr_image=%d kind=%s",
-              static_cast<unsigned long long>(publication.Serial),
-              static_cast<unsigned long long>(publication.RenderValue), index,
-              publication.Kind == PublicationKind::Stereo ? "stereo" : "panel");
-        NoteFirstImage();
-    }
+    NoteFirstImageOnce(publication, index);
     static bool hudLogged = false;
     if (hud && !hudLogged) {
         hudLogged = true;
         XRLOG("TRIAEVUM_XR_HUD first_copy serial=%llu xr_image=%d w=%u h=%u",
               static_cast<unsigned long long>(publication.Serial), hudIndex, extents[count].width,
               extents[count].height);
+    }
+}
+
+}  // namespace
+
+void CopyLatest(uint64_t tick) {
+    // In-frame copy: release what the renderer's frames wrote, keep an image ahead, copy what it could not,
+    // and release that too (in acquire order).
+    const bool held = FrameCopyEnabled();
+    if (held) {
+        ServiceHeld(tick);
+        PrepareHeld(gEye, gEyeHeld);
+        PrepareHeld(gHud, gHudHeld);
+    }
+    CopyQueued(tick, held);
+    if (held) {
+        ServiceHeld(tick);
+        PrepareHeld(gEye, gEyeHeld);
+        PrepareHeld(gHud, gHudHeld);
     }
 }
 
@@ -781,6 +1177,11 @@ SinkStats TakeSinkStats() {
 }
 
 void DestroyQuadSwapchain() {
+    {
+        std::lock_guard lock(gSink);
+        gEyeHeld.Clear();
+        gHudHeld.Clear();
+    }
     DestroySwapchain(gQuad);
     DestroySwapchain(gEye);
     DestroySwapchain(gFade);

@@ -83,11 +83,61 @@ void AttachViewTargets(const VkImage* images, uint32_t slots, const VkExtent2D e
 // Both eyes of `slot` with the poses they were rendered for (the projection layer shows exactly these).
 // `panelValid`: the slot's panel holds this frame's HUD over transparent (premultiplied alpha); it is
 // copied with the pair into the HUD swapchain and shown as a quad over the world (W4, minimal).
-void PublishStereo(uint32_t slot, uint64_t renderValue, const Fast::StereoViews& views, bool panelValid);
+// `frameCopyToken`: RecordFrameCopy put the pair (and the HUD) into swapchain images inside this frame's
+// own submission; the XR thread only releases them once the render timeline reaches `renderValue`.
+void PublishStereo(uint32_t slot, uint64_t renderValue, const Fast::StereoViews& views, bool panelValid,
+                   uint64_t frameCopyToken = 0);
+// The in-frame copy (TRIAEVUM_XR_FRAME_COPY, default on; 0 = the XR queue copies each pair after the frame,
+// as before). Renderer, at the end of a world frame that drew a pair, before its command buffer ends: when
+// the XR thread holds an acquired and waited eye image, records the copies of slot `slot`'s eyes (and, with
+// `hud`, its panel into a held HUD image) into `command` and returns the token to publish with (0: none
+// held, the pair goes the XR queue's way). The targets are in PRESENT_SRC before and after.
+uint64_t RecordFrameCopy(VkCommandBuffer command, uint32_t slot, bool hud);
+// A recorded frame copy whose frame published no pair (never expected): its images go with the next pair.
+void AbandonFrameCopy(uint64_t token, uint64_t renderValue);
+bool FrameCopyEnabled();  // valid before init
 // The in-world HUD quad (TRIAEVUM_XR_HUD, default on). Valid before init; any thread.
 bool HudEnabled();
 // The panel of `slot` (cinema picture on the quad).
 void PublishPanel(uint32_t slot, uint64_t renderValue);
+// ---- In-world performance (TRIAEVUM_XR_PERF, every 5 s on the XR thread; TRIAEVUM_XR_PERF=0 turns it off).
+// Durations in milliseconds, any thread, lock-free; each phase reports mean/p95/max per 5 s window.
+enum class PerfPhase : uint8_t {
+    GuestFrame,       // guest thread: one host frame (RunFrame to RunFrame)
+    GuestUpdate,      // one guest refresh (RunGuestRefresh)
+    GuestStreamWait,  // the guest blocked on the render worker (frame backpressure, synchronous commands)
+    GuestCpu,         // the guest thread's CPU time per host frame
+    WorkerFrame,      // render worker: end of frame to end of frame
+    WorkerStart,      // StartFrame
+    WorkerFence,      //   its frame-slot fence wait
+    WorkerTargetFree, //   its wait for the XR queue's last copy out of the slot's targets
+    WorkerNs1,        // the canonical namespace-1 replay of a new frame (superseded frames included)
+    WorkerEyeLeft,    // eye L: built and replayed
+    WorkerEyeRight,
+    WorkerUi,         // the TopScreen HUD / menu passes (on the panel)
+    WorkerTickWait,   // the end-of-frame wait for the pace tick (idle by design)
+    WorkerSubmit,     // EndFrame: the in-frame copy and the frame's vkQueueSubmit
+    WorkerCpu,        // the render worker's CPU time per frame
+    WorkerIdle,       // the render worker waiting for guest commands, per frame
+    XrWaitFrame,      // XR thread: xrWaitFrame
+    XrBeginFrame,     // xrBeginFrame (under the queue lock)
+    XrEndFrame,       // xrEndFrame (under the queue lock)
+    XrAcquire,        // xrAcquireSwapchainImage
+    XrWaitImage,      // xrWaitSwapchainImage
+    XrRelease,        // xrReleaseSwapchainImage
+    XrSubmit,         // the XR queue's vkQueueSubmit (copies, release syncs)
+    XrCpu,            // the XR thread's CPU time per display frame
+    LockHoldXr,       // the XR queue lock held by the XR thread
+    LockHoldRenderer, // ... by the renderer (its device waits)
+    LockWaitXr,       // waiting for the lock: the XR thread
+    LockWaitRenderer, //   the renderer
+    PairShown,        // a pair from its publication (just after the frame's submit) to its release
+    Count
+};
+bool PerfEnabled();  // in-world and TRIAEVUM_XR_PERF != 0; valid before init
+void PerfNote(PerfPhase phase, double milliseconds);
+double ThreadCpuMs();  // the calling thread's CPU time (CLOCK_THREAD_CPUTIME_ID)
+
 // Median display ticks from a pair's PaceTick to its first display (default 2 until measured).
 uint32_t ShownLatencyTicks();
 struct PairStats {

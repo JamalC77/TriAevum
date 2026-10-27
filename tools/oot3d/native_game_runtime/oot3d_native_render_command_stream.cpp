@@ -1,5 +1,6 @@
 #include "oot3d_native_render_command_stream.h"
 
+#include <chrono>
 #include <stdexcept>
 #include <utility>
 
@@ -20,7 +21,28 @@ struct CommandScope {
     }
 };
 
+// Adds the time a predicate wait blocked to `total` (nothing when the predicate already held).
+template <typename Predicate>
+void TimedWait(std::condition_variable& cv, std::unique_lock<std::mutex>& lock, Predicate predicate,
+               std::atomic<uint64_t>& total) {
+    if (predicate()) return;
+    const auto start = std::chrono::steady_clock::now();
+    cv.wait(lock, predicate);
+    total.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - start)
+                                              .count()),
+                    std::memory_order_relaxed);
+}
+
 } // namespace
+
+uint64_t NativeRenderCommandStream::TakeSubmitterWaitNs() noexcept {
+    return mSubmitterWaitNs.exchange(0);
+}
+
+uint64_t NativeRenderCommandStream::TakeWorkerIdleNs() noexcept {
+    return mWorkerIdleNs.exchange(0);
+}
 
 NativeRenderCommandStream::NativeRenderCommandStream(Mode mode,
                                                      size_t maxFramesInFlight)
@@ -71,9 +93,9 @@ void NativeRenderCommandStream::Enqueue(Command command, bool endsFrame,
     std::unique_lock lock(mMutex);
     RethrowPendingFailureLocked(lock);
     if (endsFrame) {
-        mProgress.wait(lock, [&] {
+        TimedWait(mProgress, lock, [&] {
             return mFailure != nullptr || mFramesQueued < mMaxFramesInFlight;
-        });
+        }, mSubmitterWaitNs);
         RethrowPendingFailureLocked(lock);
         ++mFramesQueued;
     }
@@ -96,18 +118,18 @@ void NativeRenderCommandStream::Run(Command command) {
 void NativeRenderCommandStream::Drain() {
     if (mMode == Mode::Inline || !mWorker.joinable()) return;
     std::unique_lock lock(mMutex);
-    mProgress.wait(lock, [&] {
+    TimedWait(mProgress, lock, [&] {
         return mFailure != nullptr || (mQueue.empty() && !mBusy);
-    });
+    }, mSubmitterWaitNs);
     RethrowPendingFailureLocked(lock);
 }
 
 void NativeRenderCommandStream::WaitForFramesInFlight(size_t frames) {
     if (mMode == Mode::Inline || !mWorker.joinable()) return;
     std::unique_lock lock(mMutex);
-    mProgress.wait(lock, [&] {
+    TimedWait(mProgress, lock, [&] {
         return mFailure != nullptr || mFramesQueued <= frames;
-    });
+    }, mSubmitterWaitNs);
     RethrowPendingFailureLocked(lock);
 }
 
@@ -142,7 +164,7 @@ void NativeRenderCommandStream::StopWorker() {
 void NativeRenderCommandStream::WorkerLoop() {
     std::unique_lock lock(mMutex);
     for (;;) {
-        mWork.wait(lock, [&] { return mStop || !mQueue.empty(); });
+        TimedWait(mWork, lock, [&] { return mStop || !mQueue.empty(); }, mWorkerIdleNs);
         if (mQueue.empty()) return;  // stopping with nothing left to run
         Entry entry = std::move(mQueue.front());
         mQueue.pop_front();

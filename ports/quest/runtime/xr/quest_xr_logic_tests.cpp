@@ -454,6 +454,116 @@ void Flicks() {
     CHECK(f.Update(NAN, NAN).Turn == 0);
 }
 
+// In-world performance: the TRIAEVUM_XR_PERF histogram buckets and percentile.
+void PerfHistogram() {
+    CHECK(PerfBucket(-1.0) == 0U && PerfBucket(0.0) == 0U && PerfBucket(NAN) == 0U);
+    CHECK(PerfBucket(0.24) == 0U && PerfBucket(0.25) == 1U && PerfBucket(10.0) == 40U);
+    CHECK(PerfBucket(1e9) == kPerfBuckets - 1);
+    uint32_t counts[kPerfBuckets] = {};
+    CHECK(PerfPercentileMs(counts, kPerfBuckets, 0, 0.95, 5.0) == 0.0);
+    // 100 samples: 95 at 10 ms, 5 at 30 ms -> p95 is the 10 ms bucket's upper edge, p99 the 30 ms one.
+    counts[PerfBucket(10.0)] = 95;
+    counts[PerfBucket(30.0)] = 5;
+    CHECK(Near(static_cast<float>(PerfPercentileMs(counts, kPerfBuckets, 100, 0.95, 30.1)), 10.25F));
+    CHECK(Near(static_cast<float>(PerfPercentileMs(counts, kPerfBuckets, 100, 0.99, 30.1)), 30.1F));
+    // Never above the window's maximum; the open last bucket reports it.
+    uint32_t open[kPerfBuckets] = {};
+    open[kPerfBuckets - 1] = 3;
+    CHECK(Near(static_cast<float>(PerfPercentileMs(open, kPerfBuckets, 3, 0.95, 250.0)), 250.0F));
+    uint32_t one[kPerfBuckets] = {};
+    one[PerfBucket(2.1)] = 1;
+    CHECK(Near(static_cast<float>(PerfPercentileMs(one, kPerfBuckets, 1, 0.95, 2.1)), 2.1F));
+}
+
+// In-world in-frame copy: the acquired eye images, oldest first.
+void HeldImages() {
+    using Queue = HeldImageQueue<int>;
+    using Stage = Queue::Stage;
+    Queue q(2);
+    CHECK(q.NeedsAcquire() && q.Claim(1) == -1);
+    q.Acquired(0);
+    CHECK(!q.NeedsAcquire() && q.HasUnwaited() && q.Claim(1) == -1);  // not waited: no claim
+    CHECK(q.Waited() && q.HasReady() && !q.NeedsAcquire());          // one ahead only
+    CHECK(q.Claim(0) == -1);                                          // token 0 is no claim
+    CHECK(q.Claim(1) == 0 && !q.HasReady() && q.NeedsAcquire());
+    q.Acquired(1);
+    CHECK(q.Waited());
+    CHECK(!q.NeedsAcquire());  // full: two held
+    // Frame 1 commits value 10; nothing releases before the timeline reaches it.
+    CHECK(q.Commit(1, 10, 100));
+    CHECK(q.TakeReleasable(9).empty());
+    auto out = q.TakeReleasable(10);
+    CHECK(out.size() == 1U && out[0].Index == 0 && out[0].Data == 100 && !out[0].Orphan);
+    CHECK(q.Size() == 1U && q.HasReady());
+    // Release order is acquire order: a later image completing first waits for the front.
+    CHECK(q.Claim(2) == 1);
+    q.Acquired(2);
+    q.Waited();
+    CHECK(q.Claim(3) == 2);
+    CHECK(q.Commit(3, 30, 300));  // frame 2's claim was never committed: an orphan of value 30
+    CHECK(q.Entries()[0].Orphan && q.Entries()[0].State == Stage::Written);
+    CHECK(q.Commit(2, 20, 200) == false);  // a late commit of an orphaned claim finds nothing
+    CHECK(q.TakeReleasable(29).empty());
+    out = q.TakeReleasable(30);  // the orphan goes only together with the image after it
+    CHECK(out.size() == 2U && out[0].Orphan && out[1].Index == 2 && out[1].Data == 300);
+    CHECK(q.Size() == 0U && q.NeedsAcquire());
+    // A trailing orphan is never released alone.
+    Queue r(2);
+    r.Acquired(5);
+    r.Waited();
+    CHECK(r.Claim(7) == 5);
+    r.Acquired(6);
+    r.Waited();
+    CHECK(r.Claim(8) == 6);
+    CHECK(r.Commit(8, 0, 1));  // value 0: written by an already complete submission (the XR-queue copy)
+    CHECK(r.Entries()[0].Orphan);
+    out = r.TakeReleasable(0);
+    CHECK(out.size() == 2U);
+    Queue t(2);
+    t.Acquired(0);
+    t.Waited();
+    t.Claim(1);
+    t.Commit(1, 5, 1);
+    t.Acquired(1);
+    t.Waited();
+    t.Claim(2);  // claimed, not yet committed
+    out = t.TakeReleasable(100);
+    CHECK(out.size() == 1U && out[0].Index == 0 && t.Size() == 1U);
+    CHECK(t.TakeReleasable(100).empty());  // a claim is not releasable
+    // The XR queue's own claim commits without orphaning an older renderer claim; both release in order.
+    Queue v(2);
+    v.Acquired(0);
+    v.Waited();
+    CHECK(v.Claim(10) == 0);  // the renderer's frame
+    v.Acquired(1);
+    v.Waited();
+    CHECK(v.Claim(11) == 1);  // the XR queue's copy of an older pair
+    CHECK(v.Commit(11, 0, 7, false) && !v.Entries()[0].Orphan && v.Entries()[0].State == Stage::Claimed);
+    CHECK(v.TakeReleasable(50).empty());  // the front is still a claim
+    CHECK(v.Commit(10, 40, 8));
+    out = v.TakeReleasable(40);
+    CHECK(out.size() == 2U && out[0].Data == 8 && out[1].Data == 7);
+    // An abandoned claim is an orphan: never released alone.
+    Queue w(2);
+    w.Acquired(3);
+    w.Waited();
+    CHECK(w.Claim(1) == 3 && w.Abandon(1, 9) && !w.Abandon(1, 9));
+    CHECK(w.TakeReleasable(100).empty() && w.Size() == 1U && w.NeedsAcquire());
+    w.Acquired(4);
+    w.Waited();
+    CHECK(w.Claim(2) == 4 && w.Commit(2, 12, 5));
+    out = w.TakeReleasable(12);
+    CHECK(out.size() == 2U && out[0].Orphan && out[1].Data == 5);
+    // Capacity 1 (a runtime that holds only one acquired image): no second acquire.
+    Queue u(1);
+    u.Acquired(0);
+    u.Waited();
+    u.Claim(1);
+    CHECK(!u.NeedsAcquire());
+    u.Commit(1, 1, 0);
+    CHECK(u.TakeReleasable(1).size() == 1U && u.NeedsAcquire());
+}
+
 int main() {
     TapsAndChords();
     DeliberateMenu();
@@ -463,6 +573,8 @@ int main() {
     HudFollowTests();
     DisplayTicks();
     Flicks();
+    PerfHistogram();
+    HeldImages();
     if (failures != 0) {
         std::printf("quest_xr_logic_tests: %d failure(s)\n", failures);
         return 1;

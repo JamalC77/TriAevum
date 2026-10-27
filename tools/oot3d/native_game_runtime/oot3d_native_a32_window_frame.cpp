@@ -243,6 +243,24 @@ bool NativeA32WindowSession::RunFrame() {
                                           lastPresentationTime)
                 .count();
   lastPresentationTime = presentationTime;
+#if defined(TRIAEVUM_QUEST_OPENXR)
+  if (xrWorld != nullptr && TriAevumQuestXr::PerfEnabled()) {
+    // TRIAEVUM_XR_PERF (guest): one host frame, its CPU, its waits for the render worker.
+    namespace Xr = TriAevumQuestXr;
+    const double cpu = Xr::ThreadCpuMs();
+    if (xrPerfGuestCpu >= 0.0) {
+      Xr::PerfNote(Xr::PerfPhase::GuestFrame,
+                   std::chrono::duration<double, std::milli>(presentationTime - xrPerfGuestFrame).count());
+      Xr::PerfNote(Xr::PerfPhase::GuestCpu, cpu - xrPerfGuestCpu);
+      Xr::PerfNote(Xr::PerfPhase::GuestStreamWait,
+                   static_cast<double>(renderStream.TakeSubmitterWaitNs()) * 1e-6);
+    } else {
+      (void)renderStream.TakeSubmitterWaitNs();
+    }
+    xrPerfGuestFrame = presentationTime;
+    xrPerfGuestCpu = cpu;
+  }
+#endif
   if (xrWorld != nullptr && hostArgs.FixedDeltaSeconds <= 0.0) {
     // In-world: eyes locked 3:1 to a 90 Hz display; this frame's presentation time comes from the
     // display ticks (p_N - p_{N-1}), so the scheduler gives exactly one guest refresh per 3 ticks
@@ -552,8 +570,16 @@ bool NativeA32WindowSession::RunFrame() {
       }
 #if defined(TRIAEVUM_QUEST_OPENXR)
       if (TriAevumQuestXr::Requested()) TriAevumQuestXr::NoteGuestRefresh();  // must stay 0 while paused
+      const auto guestRefreshStart = std::chrono::steady_clock::now();
 #endif
       RunGuestRefresh();
+#if defined(TRIAEVUM_QUEST_OPENXR)
+      if (xrWorld != nullptr)
+        TriAevumQuestXr::PerfNote(TriAevumQuestXr::PerfPhase::GuestUpdate,
+                                  std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - guestRefreshStart)
+                                      .count());
+#endif
     }
     if (presentHostFrame) {
       PresentVisualFrame(presentationElapsedSeconds, visualInterpolationAlpha);
@@ -612,11 +638,14 @@ bool NativeA32WindowSession::RunFrame() {
         n64UiRenderer.Stage(std::move(prepared));
         return;
       }
+      const auto uiStart = std::chrono::steady_clock::now();
       if (!n64UiRenderer.Render(primitives, uiRegion, canvasMode,
                                 std::move(prepared), &renderError)) {
         throw std::runtime_error("integrated N64 UI presentation failed: " +
                                  renderError);
       }
+      if (xrWorld != nullptr)
+        xrPerfUiMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - uiStart).count();
     });
   }
   // The in-game menu draws last in the UI domain, over the HUD and the
@@ -630,10 +659,13 @@ bool NativeA32WindowSession::RunFrame() {
         n64UiRenderer.Stage(std::move(prepared));
         return;
       }
+      const auto uiStart = std::chrono::steady_clock::now();
       if (!n64UiRenderer.Render(primitives, uiRegion, oot3d::ui::N64UiCanvasMode::Widescreen16x9,
                                 std::move(prepared), &renderError)) {
         throw std::runtime_error("in-game menu presentation failed: " + renderError);
       }
+      if (xrWorld != nullptr)
+        xrPerfUiMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - uiStart).count();
     });
   }
 
@@ -729,12 +761,31 @@ bool NativeA32WindowSession::RunFrame() {
     const auto waitStart = std::chrono::steady_clock::now();
     CpuProbe::Scope cpuPacing(CpuProbe::Phase::Pacing);
 #if defined(TRIAEVUM_QUEST_OPENXR)
+    if (xrWorld != nullptr && TriAevumQuestXr::PerfEnabled()) {
+      // TRIAEVUM_XR_PERF (render worker): this frame's sums, then the frame, its CPU and idle time.
+      namespace Xr = TriAevumQuestXr;
+      Xr::PerfNote(Xr::PerfPhase::WorkerNs1, std::exchange(xrPerfNs1Ms, 0.0));
+      Xr::PerfNote(Xr::PerfPhase::WorkerUi, std::exchange(xrPerfUiMs, 0.0));
+      const double cpu = Xr::ThreadCpuMs();
+      if (xrPerfWorkerCpu >= 0.0) {
+        Xr::PerfNote(Xr::PerfPhase::WorkerFrame,
+                     std::chrono::duration<double, std::milli>(waitStart - xrPerfWorkerFrame).count());
+        Xr::PerfNote(Xr::PerfPhase::WorkerCpu, cpu - xrPerfWorkerCpu);
+        Xr::PerfNote(Xr::PerfPhase::WorkerIdle,
+                     static_cast<double>(renderStream.TakeWorkerIdleNs()) * 1e-6);
+      }
+      xrPerfWorkerFrame = waitStart;
+      xrPerfWorkerCpu = cpu;
+    }
     if (xrPacing) {
       // In-world: the display clock paces the eyes (§3.4 item 3): this frame's pair is submitted
       // at its tick p_N; the realtime pacer is the fallback when the tick does not come.
       const bool reached = TriAevumQuestXr::WaitDisplayTick(xrPaceTick, 50U);
       xrWorld->NoteTickWait(reached);
       if (!reached) realtimePacer.WaitForNextRefresh();
+      TriAevumQuestXr::PerfNote(
+          TriAevumQuestXr::PerfPhase::WorkerTickWait,
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count());
     } else
 #else
     (void)xrPacing;
@@ -3117,6 +3168,8 @@ void NativeA32WindowSession::ExecuteVisualSample(const Oot3dNativeGame::Oot3dPic
   if (present) {
     capturedTemporalSample = temporalSample;
   }
+  if (xrWorld != nullptr && !present && renderTargetNamespace == kNativeDependencyRenderTargetNamespace)
+    xrPerfNs1Ms += elapsed * 1000.0;
   rendererTiming->PicaBackendSeconds += elapsed;
   rendererTiming->VisualReplaySeconds += elapsed;
 }
@@ -3183,6 +3236,7 @@ bool NativeA32WindowSession::ExecuteXrEyes(const Oot3dNativeGame::Oot3dPicaVisua
     Fast::Oot3d::GrassInteractionBridge::Instance().SelectSample(temporalSample);
     PinGpuCopyResources(sample);
     for (int eye = 0; eye < 2; ++eye) {
+      const auto eyeStart = std::chrono::steady_clock::now();
       const auto input = Oot3dNativeGame::XrViewRenderer::TrackedEye(state.Rig, views.Eye[eye]);
       const auto &eyeSample = xr.BuildEye(sample, camera, input, mirrored, eye);
       api.SelectXrView(eye == 0 ? Fast::kXrViewEyeLeft : Fast::kXrViewEyeRight);
@@ -3191,6 +3245,11 @@ bool NativeA32WindowSession::ExecuteXrEyes(const Oot3dNativeGame::Oot3dPicaVisua
               &renderError)) {
         throw std::runtime_error("native PICA in-world eye pass failed: " + renderError);
       }
+      TriAevumQuestXr::PerfNote(eye == 0 ? TriAevumQuestXr::PerfPhase::WorkerEyeLeft
+                                         : TriAevumQuestXr::PerfPhase::WorkerEyeRight,
+                                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                                          eyeStart)
+                                    .count());
     }
     // Overlays (TopScreen HUD, ImGui) draw on the transparent panel; the pair carries it as the HUD.
     api.SelectXrView(Fast::kXrViewPanel);

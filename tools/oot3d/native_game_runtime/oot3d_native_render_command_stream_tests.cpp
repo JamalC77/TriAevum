@@ -164,6 +164,28 @@ void TestSynchronousCommandsAreDistinguished() {
 
 } // namespace
 
+void TestWaitTimingIsMeasured() {
+    NativeRenderCommandStream stream(Mode::Worker, 1U);
+    // The worker idles until the first command; the submitter then waits for the slow frame.
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    stream.Submit([] { std::this_thread::sleep_for(std::chrono::milliseconds(30)); }, true);
+    stream.Submit([] {}, true);  // waits for the first frame to end
+    stream.Drain();
+    Require(stream.TakeSubmitterWaitNs() >= 15'000'000ULL, "submitter backpressure wait was not measured");
+    (void)stream.TakeWorkerIdleNs();
+    Require(stream.TakeSubmitterWaitNs() == 0U && stream.TakeWorkerIdleNs() == 0U,
+            "the take did not reset the timing");
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    stream.Submit([] {});
+    stream.Drain();
+    Require(stream.TakeWorkerIdleNs() >= 10'000'000ULL, "worker idle time was not measured");
+    NativeRenderCommandStream inlineStream(Mode::Inline);
+    inlineStream.Submit([] {}, true);
+    inlineStream.Drain();
+    Require(inlineStream.TakeSubmitterWaitNs() == 0U && inlineStream.TakeWorkerIdleNs() == 0U,
+            "an inline stream reported waits");
+}
+
 int main() {
     TestInlineRunsAtSubmission();
     TestWorkerKeepsProgramOrder();
@@ -172,6 +194,7 @@ int main() {
     TestWorkerFailureIsRethrownOnce();
     TestModeSwitchDrainsAndDestructorRunsPending();
     TestSynchronousCommandsAreDistinguished();
+    TestWaitTimingIsMeasured();
     std::cout << "oot3d_native_render_command_stream_tests: ok\n";
     return 0;
 }

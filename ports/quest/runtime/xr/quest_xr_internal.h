@@ -128,6 +128,12 @@ struct SinkStats {
     // In-world HUD: stereo publications that carried their panel, HUD images copied with a pair, and
     // pairs whose HUD copy was skipped (its swapchain image was not ready; the last HUD stays).
     uint64_t HudPublications = 0, HudCopies = 0, HudSkips = 0;
+    // The in-frame copy: pairs the renderer copied in its own frame, pairs it found no held image for (they
+    // went the XR queue's way: QueueCopies), XR-queue pairs that waited a display frame for a held image,
+    // orphaned claims, failed acquires (the capacity shrinks to what the runtime gave) and 1 ms wait
+    // timeouts of the image ahead.
+    uint64_t FrameCopies = 0, FrameCopyMisses = 0, QueueCopies = 0, HeldImageWaits = 0, FrameCopyOrphans = 0,
+             HeldAcquireFailures = 0, HeldWaitTimeouts = 0;
     double CopyWaitMsMax = 0.0;
 };
 SinkStats TakeSinkStats();

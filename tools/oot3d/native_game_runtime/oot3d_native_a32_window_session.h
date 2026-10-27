@@ -610,6 +610,14 @@ private:
   bool xrEyesDrawn = false;
   // Guest side: the FOV multiplier setting last logged as overridden (TRIAEVUM_XR_FOV).
   float xrLoggedFovSetting = -1.0F;
+  // In-world TRIAEVUM_XR_PERF: the guest's last frame start and CPU time (guest thread); the render worker's
+  // last frame end and CPU time, and this frame's namespace-1 replay and UI pass sums (render worker).
+  std::chrono::steady_clock::time_point xrPerfGuestFrame{};
+  double xrPerfGuestCpu = -1.0;
+  std::chrono::steady_clock::time_point xrPerfWorkerFrame{};
+  double xrPerfWorkerCpu = -1.0;
+  double xrPerfNs1Ms = 0.0;
+  double xrPerfUiMs = 0.0;
   // Dev lab "capture" view (left|right|panel) of the pending forced screenshot.
   std::string pendingForcedScreenshotView;
 };
