@@ -300,6 +300,8 @@ private:
   void ExecuteVisualSample(const Oot3dNativeGame::Oot3dPicaVisualFrameViewSample &sample, Oot3dNativeGame::Oot3dPicaPresentationExecutionKind kind, bool present, const Fast::Oot3d::NativeFrameTemporalSample& temporalSample, uint64_t renderTargetNamespace = kVisualInterpolationRenderTargetNamespace);
   // The in-world eye passes of a presented sample (inworld-spec §2.1); false: present it as mono.
   bool ExecuteXrEyes(const Oot3dNativeGame::Oot3dPicaVisualFrameViewSample &sample, Oot3dNativeGame::Oot3dPicaPresentationExecutionKind kind, const Fast::Oot3d::NativeFrameTemporalSample& temporalSample);
+  // Render side, at the start of each presentation command in world mode: namespace extents, world frames.
+  void BeginXrRenderCommand(const Oot3dNativeGame::XrFrameState &state);
   // Deferred: a host continuation is pending, retry at a later frame boundary. Failed: reported once; the request is
   // dropped because every retry repeats the full GPU drain and readback.
   enum class SaveStateOutcome : uint8_t { Saved, Deferred, Failed };
@@ -593,6 +595,13 @@ private:
   std::unique_ptr<Oot3dNativeGame::XrViewRenderer> xrViewRenderer;
   std::atomic<int> xrTraceScene{-1};
   std::chrono::steady_clock::time_point xrPreviewStart = std::chrono::steady_clock::now();
+  // Guest side of the immersive world mode (null otherwise): pacing, the W1 state, the rig.
+  std::unique_ptr<Oot3dNativeGame::XrWorldSession> xrWorld;
+  // Render side: the state the current render command draws with, the namespace extents set once.
+  Oot3dNativeGame::XrFrameState xrRenderState;
+  bool xrExtentsApplied = false;
+  // Dev lab "capture" view (left|right|panel) of the pending forced screenshot.
+  std::string pendingForcedScreenshotView;
 };
 
 } // namespace Oot3dA32Window

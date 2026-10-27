@@ -10,6 +10,7 @@
 #pragma once
 
 #include "oot3d_native_pica_visual_frame.h"
+#include "oot3d_native_xr_session.h"
 #include "oot3d_xr_world_logic.h"
 #include "fast/backends/stereo_views.h"
 
@@ -27,6 +28,10 @@ void XrWorldLog(const char* format, ...)
     __attribute__((format(printf, 1, 2)))
 #endif
     ;
+
+// The classifier's facts of a completed visual frame (guest thread, PresentVisualFrame): non-HUD PICA Ui
+// draws on the top target and the frame camera's mirror flag.
+XrFrameFacts CollectXrFrameFacts(const Oot3dPicaVisualFrame& frame);
 
 struct XrFrameCamera {
     bool Valid = false;

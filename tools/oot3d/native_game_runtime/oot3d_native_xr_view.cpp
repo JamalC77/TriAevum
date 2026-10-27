@@ -71,6 +71,29 @@ void XrWorldLog(const char* format, ...) {
 #endif
 }
 
+XrFrameFacts CollectXrFrameFacts(const Oot3dPicaVisualFrame& frame) {
+    XrFrameFacts facts;
+    const uint32_t top = frame.TopTransfer.InputPhysicalAddress;
+    for (const auto& plan : frame.Draws) {
+        if (plan.State.Framebuffer.ColorPhysicalAddress != top) continue;
+        if (plan.CompositionDomain == Oot3dPicaCompositionDomain::Ui) {
+            if (!facts.NonHudUi && plan.Composition.SourcePc != kOot3dGameplayHudDrawEntry) {
+                facts.NonHudUi = true;
+                facts.UiSourcePc = plan.Composition.SourcePc;
+            }
+            continue;
+        }
+        if (facts.HasCamera || plan.Composition.Layer != Oot3dPicaCompositionLayer::OpaqueWorld ||
+            !plan.LightBinding.WorldToView.has_value())
+            continue;
+        const auto projection = M::DecomposeGameProjection(ProjectionRows(plan.VertexShader.Uniforms));
+        if (!projection.Ok()) continue;
+        facts.HasCamera = true;
+        facts.Mirrored = M::MirroredFrame(projection, M::Mat4FromColumnMajor(*plan.LightBinding.WorldToView));
+    }
+    return facts;
+}
+
 std::unique_ptr<XrViewRenderer> XrViewRenderer::Create(bool world) {
     auto renderer = std::unique_ptr<XrViewRenderer>(new XrViewRenderer());
     renderer->mWorld = world;

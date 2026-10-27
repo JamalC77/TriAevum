@@ -939,11 +939,13 @@ void NativeA32WindowSession::Setup() {
   // In-world VR mode (inworld-spec): opt-in TRIAEVUM_XR_VIEW=world in the immersive activity; the PC
   // preview and the W0 trace work in any build.
   {
-    bool xrWorld = false;
+    bool worldMode = false;
 #if defined(TRIAEVUM_QUEST_OPENXR)
-    xrWorld = TriAevumQuestXr::Requested() && TriAevumQuestXr::WorldRequested();
+    worldMode = TriAevumQuestXr::Requested() && TriAevumQuestXr::WorldRequested();
 #endif
-    xrViewRenderer = Oot3dNativeGame::XrViewRenderer::Create(xrWorld);
+    xrViewRenderer = Oot3dNativeGame::XrViewRenderer::Create(worldMode);
+    xrWorld = Oot3dNativeGame::XrWorldSession::Create();
+    if (xrWorld != nullptr && xrViewRenderer != nullptr) xrViewRenderer->SetScale(xrWorld->Scale());
   }
   programPreparation =
       dynamic_cast<Fast::Renderer3ds::PicaProgramPreparationBackend *>(&api);

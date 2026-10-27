@@ -383,7 +383,9 @@ class XrWorldClassifier {
         } else {
             mUiSince = -1.0;
         }
-        const bool playerMissing = !s.PlayerValid || s.CameraStatus != 7;
+        // §4.3: "status != 7 for > 2 s without a player -> Cinema": the player decides; a camera status
+        // other than 7 alone is Held (logged, not a blocker), since its offset is still [unverified].
+        const bool playerMissing = !s.PlayerValid;
         if (playerMissing) {
             if (mNoPlayerSince < 0.0) mNoPlayerSince = s.Now;
         } else {
