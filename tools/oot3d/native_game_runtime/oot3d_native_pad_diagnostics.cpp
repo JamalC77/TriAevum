@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #if defined(__ANDROID__)
 // Weak, like the renderer's surface log: no hard liblog dependency for this unit.
@@ -26,6 +27,17 @@ enum class PadLogLevel : uint8_t { Off, Devices, Input };
 bool EnvEquals(const char* name, std::string_view value) {
     const char* set = std::getenv(name);
     return set != nullptr && std::string_view(set) == value;
+}
+
+// TRIAEVUM_PAD_LOG / TRIAEVUM_XR_INPUT_LOG set explicitly: the device table also repeats every 30 s.
+// The Android default logs it only at startup, on hot-plug events and on selection changes.
+bool Explicit() {
+    static const bool set = [] {
+        const char* pad = std::getenv("TRIAEVUM_PAD_LOG");
+        const bool padSet = pad != nullptr && *pad != '\0' && std::string_view(pad) != "0";
+        return padSet || EnvEquals("TRIAEVUM_XR_INPUT_LOG", "1");
+    }();
+    return set;
 }
 
 PadLogLevel Level() {
@@ -55,6 +67,18 @@ void PadLog(const char* format, ...) {
     if (__android_log_write != nullptr) __android_log_write(4 /* ANDROID_LOG_INFO */, "TriAevumPad", buffer);
 #endif
     std::fprintf(stderr, "%s\n", buffer);
+}
+
+#if defined(__GNUC__)
+std::string Formatted(const char* format, ...) __attribute__((format(printf, 1, 2)));
+#endif
+std::string Formatted(const char* format, ...) {
+    char buffer[768];
+    va_list arguments;
+    va_start(arguments, format);
+    std::vsnprintf(buffer, sizeof buffer, format, arguments);
+    va_end(arguments);
+    return buffer;
 }
 
 std::atomic<uint32_t> gDeviceEvents{0};
@@ -178,9 +202,12 @@ const char* SelectionResult(const PadPollFacts& facts, int joysticks) {
 }
 
 void LogDevices(const char* reason, const PadPollFacts& facts) {
+    // SDL's joystick list can change on the Android UI thread (Android_OnPadDown -> JoystickByDeviceId ->
+    // ANDROID_JoystickDetect), so the count and every index's fields are read under SDL's (recursive)
+    // joystick lock into lines that are logged after it is released: one line never mixes two devices.
+    std::vector<std::string> lines;
+    SDL_LockJoysticks();
     const int joysticks = SDL_NumJoysticks();
-    PadLog("TRIAEVUM_PAD devices reason=%s joysticks=%d port0_pads=%zu", reason, joysticks,
-           facts.Port0 != nullptr ? facts.Port0->size() : size_t{0});
     for (int index = 0; index < joysticks; ++index) {
         char guid[33] = "";
         SDL_JoystickGetGUIDString(SDL_JoystickGetDeviceGUID(index), guid, sizeof guid);
@@ -193,7 +220,8 @@ void LogDevices(const char* reason, const PadPollFacts& facts) {
             const auto found = facts.Port0->find(instance);
             if (found != facts.Port0->end()) opened = found->second;
         }
-        PadLog("TRIAEVUM_PAD joystick index=%d instance=%d name=\"%s\" guid=%s vendor=0x%04X product=0x%04X "
+        lines.push_back(Formatted(
+               "TRIAEVUM_PAD joystick index=%d instance=%d name=\"%s\" guid=%s vendor=0x%04X product=0x%04X "
                "version=0x%04X joystick_type=%d controller_type=%d is_game_controller=%d has_mapping=%d virtual=%d "
                "opened_port0=%d full_gamepad=%d",
                index, static_cast<int>(instance), Clipped(SDL_JoystickNameForIndex(index)).c_str(), guid,
@@ -203,8 +231,12 @@ void LogDevices(const char* reason, const PadPollFacts& facts) {
                static_cast<int>(SDL_JoystickGetDeviceType(index)), static_cast<int>(SDL_GameControllerTypeForIndex(index)),
                SDL_IsGameController(index) == SDL_TRUE ? 1 : 0, hasMapping ? 1 : 0,
                SDL_JoystickIsVirtual(index) == SDL_TRUE ? 1 : 0, opened != nullptr ? 1 : 0,
-               opened != nullptr && ThreeDsRecomp::Input::IsFullSdlGamepad(opened) ? 1 : 0);
+               opened != nullptr && ThreeDsRecomp::Input::IsFullSdlGamepad(opened) ? 1 : 0));
     }
+    SDL_UnlockJoysticks();
+    PadLog("TRIAEVUM_PAD devices reason=%s joysticks=%d port0_pads=%zu", reason, joysticks,
+           facts.Port0 != nullptr ? facts.Port0->size() : size_t{0});
+    for (const std::string& line : lines) PadLog("%s", line.c_str());
     if (facts.Port0 != nullptr) {
         for (const auto& [instance, controller] : *facts.Port0) {
             SDL_Joystick* joystick = controller != nullptr ? SDL_GameControllerGetJoystick(controller) : nullptr;
@@ -281,7 +313,7 @@ void ObservePadPoll(const PadPollFacts& facts) {
         if (events != seenEvents) reason = "device_event";
         else if (facts.SelectedInstance != lastSelected || facts.ControllerEnabled != lastEnabled || port0 != lastPort0)
             reason = "selection";
-        else if (now >= nextStatus) reason = "status";
+        else if (Explicit() && now >= nextStatus) reason = "status";
     }
     if (reason != nullptr) {
         LogDevices(reason, facts);
