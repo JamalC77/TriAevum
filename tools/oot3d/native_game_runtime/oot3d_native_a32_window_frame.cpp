@@ -3,6 +3,9 @@
 #include "fast/renderer3ds/pica_surface_debug.h"
 #include "oot3d/renderer/ui_presentation_layout.h"
 #include "oot3d_native_room_shadow_shell.h"
+#if defined(TRIAEVUM_QUEST_OPENXR)
+#include "quest_xr.h"
+#endif
 
 namespace Oot3dA32Window {
 
@@ -179,6 +182,12 @@ bool NativeA32WindowSession::RunFrame() {
           Fast::Oot3d::GraphicsSettingsRuntime::Instance()
               .Snapshot()
               .FrameRate);
+#if defined(TRIAEVUM_QUEST_OPENXR)
+  // Immersive mode has no swapchain: the realtime pacer is the guest's only clock.
+  if (TriAevumQuestXr::Requested())
+    TriAevumQuestXr::NotePacing(requestedPresentationPolicy.TargetRateHz,
+                                requestedPresentationPolicy.Enabled ? "paced" : "uncapped");
+#endif
   if (Fast::Oot3d::PresentationPacingPolicyChanged(
           presentationPacingPolicy, requestedPresentationPolicy)) {
     const auto requestedCompositionPolicy =
@@ -358,6 +367,14 @@ bool NativeA32WindowSession::RunFrame() {
       renderStream.Submit(beginRendererFrame);
     }
     if (!rendererFrameActive) {
+#if defined(TRIAEVUM_QUEST_OPENXR)
+      // Immersive mode: the OpenXR session is not focused (system menu, headset off). The guest
+      // is held below; on the pause edge the queued audio goes too, so the game falls silent.
+      if (TriAevumQuestXr::Requested() && TriAevumQuestXr::NoteGuestPaused(true) &&
+          audioPlayer != nullptr && audioPlayer->IsInitialized()) {
+        audioPlayer->Flush();
+      }
+#endif
       // A minimized or changing surface is not a guest/PICA failure. Keep events
       // and UI balanced, but do not consume guest time without an acquired frame.
       if (!presentationScheduler.Restore(presentationStateBeforeFrame, &error)) {
@@ -371,6 +388,9 @@ bool NativeA32WindowSession::RunFrame() {
       lastPresentationTime = std::chrono::steady_clock::now();
       return false;
     }
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    if (TriAevumQuestXr::Requested()) TriAevumQuestXr::NoteGuestPaused(false);
+#endif
     preparationStatus = programPreparation != nullptr
         ? programPreparation->PreparationStatus()
         : Fast::Renderer3ds::PicaPreparationStatus{};
@@ -512,6 +532,9 @@ bool NativeA32WindowSession::RunFrame() {
       if (!UpdateGuestServicesForRefresh(topScreenStartRoutingEligible, inputFrame)) {
         break;
       }
+#if defined(TRIAEVUM_QUEST_OPENXR)
+      if (TriAevumQuestXr::Requested()) TriAevumQuestXr::NoteGuestRefresh();  // must stay 0 while paused
+#endif
       RunGuestRefresh();
     }
     if (presentHostFrame) {

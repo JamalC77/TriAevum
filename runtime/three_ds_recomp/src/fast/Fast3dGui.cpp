@@ -608,6 +608,10 @@ void Fast3dGui::ImGuiWMNewFrame() {
                 // resize/mode transitions. Publish the native-client mapping
                 // last so ImGui always uses the renderer's layout space.
                 SyncOot3dVulkanMousePosition();
+#if defined(TRIAEVUM_QUEST_OPENXR)
+                // Immersive mode: the panel extent and the Touch controllers' gamepad navigation.
+                TriAevumQuestXr::FeedImGui(ImGui::GetIO());
+#endif
             }
 #endif
             break;

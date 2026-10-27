@@ -4,6 +4,9 @@
 #include "fast/oot3d/grass_stage_profile.h"
 #include "fast/renderer3ds/pica_surface_debug.h"
 #include "fast/renderer3ds/pica_surface_emission.h"
+#if defined(TRIAEVUM_QUEST_OPENXR)
+#include <unistd.h>
+#endif
 
 namespace Fast {
 
@@ -20,6 +23,30 @@ bool GfxRenderingAPIVulkan::ApplyPresentationSettings(
             settings.TransactionKind, false, true);
         return false;
     }
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    if (mXrPresent) {
+        // Immersive mode: the quad's target extent is fixed and the SDL window is hidden. The
+        // request is recorded as applied without window operations or a target rebuild.
+        mAppliedWindowMode = settings.WindowMode;
+        mAppliedOutputWidth = settings.Width;
+        mAppliedOutputHeight = settings.Height;
+        mAppliedVsync = settings.VSync;
+        mVsyncEnabled = settings.VSync;
+        mPresentationSettingsApplied = true;
+        mDiagnostics.SetPresentationState({
+            true,
+            mAppliedWindowMode,
+            mAppliedOutputWidth,
+            mAppliedOutputHeight,
+            mSwapchainExtent.width,
+            mSwapchainExtent.height,
+            mAppliedVsync,
+        });
+        mDiagnostics.RecordPresentationTransaction(
+            settings.TransactionKind, true, false);
+        return true;
+    }
+#endif
     // The host may already have created the requested window. Adopt that state
     // instead of destroying a usable swapchain on the first gameplay frame.
     if (!mPresentationSettingsApplied && !mSwapchainDirty &&
@@ -603,6 +630,10 @@ void GfxRenderingAPIVulkan::StartFrame() {
     mSpatialAaMode = aaPolicy.SpatialAaMode;
     if (mVsyncEnabled != graphicsSettings.VSync) {
         mVsyncEnabled = graphicsSettings.VSync;
+#if defined(TRIAEVUM_QUEST_OPENXR)
+        // No swapchain in immersive mode: the compositor paces the quad.
+        if (!mXrPresent)
+#endif
         mSwapchainDirty = true;
     }
     markStart(0);
@@ -616,6 +647,13 @@ void GfxRenderingAPIVulkan::StartFrame() {
     if (requestedSampleCount != mNativePicaSampleCount) {
         ApplyNativePicaSampleCount(requestedSampleCount);
     }
+#if defined(__ANDROID__)
+    // A lost or dropped Android surface (the Activity in the background) is a pause: no active
+    // frame, so the guest is held. Before the suboptimal check, which would query the surface.
+    if (!EnsureAndroidSurface()) {
+        return;
+    }
+#endif
     if (mPresentSwapchainDirty.exchange(false)) {
         mSwapchainDirty = true;
     }
@@ -678,12 +716,32 @@ void GfxRenderingAPIVulkan::StartFrame() {
     markStart(4);
     bool nriAcquire = false;
     VkResult acquire = VK_NOT_READY;
+    bool xrPresent = false;
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    uint64_t xrCopyWaitValue = 0;
+    if (mXrPresent) {
+        xrPresent = true;
+        if (!mXrRendererThreadRegistered) {
+            TriAevumQuestXr::RegisterThread(TriAevumQuestXr::ThreadRole::RendererWorker,
+                                            static_cast<int>(gettid()));
+            mXrRendererThreadRegistered = true;
+        }
+        if (!TriAevumQuestXr::RendererMayRun()) {
+            return;  // session not focused (or stopping): no active frame, the guest is held
+        }
+        // The slot's private target: its last copy into the quad must be done (normally long
+        // since), and an unshown publication of it is dropped.
+        xrCopyWaitValue = TriAevumQuestXr::WaitTargetFree(mCurrentFrame);
+        mCurrentImage = mCurrentFrame;
+        acquire = VK_SUCCESS;
+    }
+#endif
     if (mBenchmarkNoPresent) {
         // Private targets, one per frame in flight, guarded by the frame fence.
         mCurrentImage = mCurrentFrame;
         acquire = VK_SUCCESS;
     }
-    for (; !mBenchmarkNoPresent;) {
+    for (; !mBenchmarkNoPresent && !xrPresent;) {
         if (mNriSwapchain.Active()) {
             const auto result =
                 mNriSwapchain.Acquire(mCurrentFrame, mCurrentImage);
@@ -693,6 +751,12 @@ void GfxRenderingAPIVulkan::StartFrame() {
                 // Let the host pump window events before retrying acquisition.
                 return;
             }
+#if defined(__ANDROID__)
+            if (result != Oot3d::NriSwapchainOperationResult::Success) {
+                NoteAndroidSurfaceLost("acquire");
+                return;
+            }
+#endif
             if (result !=
                 Oot3d::NriSwapchainOperationResult::Success) {
                 throw std::runtime_error(
@@ -717,6 +781,12 @@ void GfxRenderingAPIVulkan::StartFrame() {
             mSwapchainDirty = true;
             return;
         }
+#if defined(__ANDROID__)
+        if (acquire == VK_ERROR_SURFACE_LOST_KHR) {
+            NoteAndroidSurfaceLost("acquire");
+            return;
+        }
+#endif
         break;
     }
     if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR) {
@@ -773,10 +843,18 @@ void GfxRenderingAPIVulkan::StartFrame() {
     CheckVk(vkResetFences(mDevice, 1, &mInFlightFences[mCurrentFrame]), "vkResetFences");
     CheckVk(vkResetCommandBuffer(mCommandBuffers[mCurrentFrame], 0), "vkResetCommandBuffer");
 
-    mFrameAcquirePending = !mBenchmarkNoPresent;
+    mFrameAcquirePending = !mBenchmarkNoPresent && !xrPresent;
     mFrameExternalComputeSplit = false;
     mFrameExternalWaitSemaphore = VK_NULL_HANDLE;
     mFrameExternalWaitValue = 0U;
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    if (xrPresent && xrCopyWaitValue != 0U) {
+        // The XR queue's last copy out of this target precedes this frame's writes on the GPU
+        // too (the CPU wait above only ordered the host).
+        mFrameExternalWaitSemaphore = TriAevumQuestXr::CopyTimeline();
+        mFrameExternalWaitValue = xrCopyWaitValue;
+    }
+#endif
 
     VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -900,6 +978,14 @@ void GfxRenderingAPIVulkan::EndFrame() {
     mGpuProfiler.EndFrame(mCurrentFrame, mCommandBuffers[mCurrentFrame]);
     CheckVk(vkEndCommandBuffer(mCommandBuffers[mCurrentFrame]), "vkEndCommandBuffer");
 
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    if (mXrPresent) {
+        // The XR thread copies the target once the render timeline reaches this frame's value.
+        SubmitFrameCommandBuffer(mCommandBuffers[mCurrentFrame],
+                                 mInFlightFences[mCurrentFrame],
+                                 TriAevumQuestXr::RenderTimeline(), ++mXrRenderValue);
+    } else
+#endif
     SubmitFrameCommandBuffer(mCommandBuffers[mCurrentFrame],
                              mInFlightFences[mCurrentFrame],
                              mRenderFinishedSemaphores[mCurrentImage]);
@@ -916,10 +1002,19 @@ void GfxRenderingAPIVulkan::FinishRender() {
     bool nriPresented = false;
     if (mBenchmarkNoPresent) {
         // Throughput benchmark: the frame is complete once submitted.
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    } else if (mXrPresent) {
+        // Immersive mode: hand the finished target to the XR thread (copied when GPU-complete).
+        TriAevumQuestXr::Publish(mCurrentImage, mXrRenderValue);
+#endif
     } else if (mNriSwapchain.Active()) {
         const auto result = mNriSwapchain.Present(mCurrentImage);
         if (result == Oot3d::NriSwapchainOperationResult::OutOfDate) {
             mSwapchainDirty = true;
+#if defined(__ANDROID__)
+        } else if (result != Oot3d::NriSwapchainOperationResult::Success) {
+            NoteAndroidSurfaceLost("present");
+#endif
         } else if (result !=
                    Oot3d::NriSwapchainOperationResult::Success) {
             throw std::runtime_error(
@@ -957,6 +1052,10 @@ void GfxRenderingAPIVulkan::FinishRender() {
             mSwapchainDirty = true;
         } else if (present == VK_SUBOPTIMAL_KHR) {
             mSwapchainSuboptimal.store(true);
+#if defined(__ANDROID__)
+        } else if (present == VK_ERROR_SURFACE_LOST_KHR) {
+            NoteAndroidSurfaceLost("present");
+#endif
         } else if (present != VK_SUCCESS) {
             CheckVk(present, "vkQueuePresentKHR");
         }

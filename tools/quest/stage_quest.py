@@ -3,7 +3,8 @@
 
 Never packages a title module or game data: the title is side-loaded (TitleInstaller) and data is
 pushed by the user. Checks every library is AArch64, 16 KiB aligned and depends only on packaged or
-platform libraries.
+platform libraries. With --openxr (the default build) the Khronos OpenXR loader is packaged for the
+immersive activity and quest_xr_logic_tests joins the tools; --no-openxr is the panel-only build.
 """
 import argparse
 import platform
@@ -39,6 +40,10 @@ TOOLS = [
     "rt/product/oot3d_native_a32_vfp_fast_tests",
     "rt/product/oot3d_native_a32_runtime_tests",
 ]
+# Immersive mode (QUEST_OPENXR=1): the loader from the AAR (ports/quest/runtime/CMakeLists.txt) and
+# the chord/placement logic tests.
+OPENXR_APK_LIBS = {"libopenxr_loader.so": "rt/openxr/libopenxr_loader.so"}
+OPENXR_TOOLS = ["rt/product/quest_xr_logic_tests"]
 # The synthetic title: one generated function at 0x1000, built by the real Android title target.
 SYNTHETIC_TITLE = "native/libtriaevum_title_aot.so"
 TOOLS_README = """TriAevum Quest tools (arm64-v8a, title-free). Run on the headset as the shell user:
@@ -63,7 +68,7 @@ run() {
   if [ $code -eq 0 ]; then echo "PASS $1"; elif [ $code -eq 77 ]; then echo "SKIP $1"; else echo "FAIL $1 ($code)"; fail=1; fi
 }
 chmod 755 ./*_tests ./*_probe 2>/dev/null
-for t in native_presentation_policy_tests triaevum_runtime_layout_tests triaevum_input_service_tests          triaevum_audio_service_tests triaevum_filesystem_service_tests          oot3d_native_a32_vfp_fast_tests oot3d_native_a32_runtime_tests; do
+for t in native_presentation_policy_tests triaevum_runtime_layout_tests triaevum_input_service_tests          triaevum_audio_service_tests triaevum_filesystem_service_tests          oot3d_native_a32_vfp_fast_tests oot3d_native_a32_runtime_tests @EXTRA_TESTS@; do
   run ./$t
 done
 run ./triaevum_native_module_loader_tests ./triaevum_mock_module.so
@@ -120,13 +125,23 @@ def main() -> int:
     parser.add_argument("--jni", type=Path, required=True, help="output jniLibs directory")
     parser.add_argument("--assets", type=Path, required=True, help="output APK assets directory")
     parser.add_argument("--tools-zip", type=Path, required=True)
+    parser.add_argument("--openxr", dest="openxr", action="store_true", default=True,
+                        help="package the OpenXR loader and the XR logic tests (default)")
+    parser.add_argument("--no-openxr", dest="openxr", action="store_false",
+                        help="panel-only build (QUEST_OPENXR=0)")
     args = parser.parse_args()
+    apk_libs = dict(APK_LIBS)
+    tools = list(TOOLS)
+    if args.openxr:
+        apk_libs.update(OPENXR_APK_LIBS)
+        tools += OPENXR_TOOLS
+    run_all = RUN_ALL.replace("@EXTRA_TESTS@", "quest_xr_logic_tests" if args.openxr else "").replace(" ; do", "; do")
 
     jni = args.jni / "arm64-v8a"
     shutil.rmtree(args.jni, ignore_errors=True)
     jni.mkdir(parents=True)
-    allowed = PLATFORM_LIBS | set(APK_LIBS) | {"libc++_shared.so"}
-    sources = {name: args.build / rel for name, rel in APK_LIBS.items()}
+    allowed = PLATFORM_LIBS | set(apk_libs) | {"libc++_shared.so"}
+    sources = {name: args.build / rel for name, rel in apk_libs.items()}
     sources["libc++_shared.so"] = libcxx(args.ndk)
     for name, source in sources.items():
         if not source.is_file():
@@ -145,7 +160,7 @@ def main() -> int:
     staging = args.tools_zip.parent / "quest-tools-arm64"
     shutil.rmtree(staging, ignore_errors=True)
     staging.mkdir(parents=True)
-    for rel in TOOLS:
+    for rel in tools:
         source = args.build / rel
         if not source.is_file():
             raise FileNotFoundError(source)
@@ -158,9 +173,12 @@ def main() -> int:
     print(f"tool synthetic/libtriaevum_title_aot.so: needs {needed}")
     shutil.copyfile(args.title_abi, synthetic / "title-abi.json")
     shutil.copyfile(libcxx(args.ndk), staging / "libc++_shared.so")
+    if args.openxr:
+        # Tests linking the runtime library NEED it (run_all.sh puts the directory on the path).
+        shutil.copyfile(jni / "libopenxr_loader.so", staging / "libopenxr_loader.so")
     shutil.copyfile(args.title_abi, staging / "title-abi.json")
     (staging / "README.txt").write_text(TOOLS_README)
-    (staging / "run_all.sh").write_text(RUN_ALL, newline="\n")
+    (staging / "run_all.sh").write_text(run_all, newline="\n")
     args.tools_zip.unlink(missing_ok=True)
     with zipfile.ZipFile(args.tools_zip, "w", zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(p for p in staging.rglob("*") if p.is_file()):

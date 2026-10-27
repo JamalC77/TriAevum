@@ -18,6 +18,9 @@
 #include "ship/controller/controldeck/ControlDeck.h"
 #include "ship/window/FileDropMgr.h"
 #include "fast/backends/gfx_sdl.h"
+#if defined(TRIAEVUM_QUEST_OPENXR)
+#include "quest_xr.h"
+#endif
 
 #ifdef __OpenBSD__
 #include <sys/sysctl.h>
@@ -637,6 +640,17 @@ void GfxWindowBackendSDL2::SetMouseCallbacks(bool (*onMouseButtonDown)(int btn),
 }
 
 void GfxWindowBackendSDL2::GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY) {
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    if (TriAevumQuestXr::Requested()) {
+        // Immersive mode: the game renders the panel extent (the quad's), not the hidden surface's.
+        const VkExtent2D panel = TriAevumQuestXr::PanelExtent();
+        *width = panel.width;
+        *height = panel.height;
+        *posX = 0;
+        *posY = 0;
+        return;
+    }
+#endif
 #if defined(__APPLE__) || defined(__SWITCH__)
     SDL_GetWindowSize(mWnd, static_cast<int*>((void*)width), static_cast<int*>((void*)height));
 #else

@@ -8,6 +8,10 @@
 #include <new>
 #include <utility>
 #include <vector>
+#if defined(TRIAEVUM_QUEST_OPENXR)
+// vkDeviceWaitIdle through the XR queue lock (the OpenXR binding uses queue 1).
+#include "quest_xr.h"
+#endif
 
 namespace Fast::Oot3d {
 namespace {

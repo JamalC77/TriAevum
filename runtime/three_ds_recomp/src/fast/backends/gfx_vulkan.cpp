@@ -653,7 +653,9 @@ void GfxRenderingAPIVulkan::UpdateFramebufferParameters(int fbId, uint32_t width
     }
     mRequestedWidth = width;
     mRequestedHeight = height;
-    if (mInitialized) {
+    // Without a queryable surface (immersive mode: the private targets have the fixed panel extent;
+    // an Android surface dropped in the background: EnsureAndroidSurface rebuilds) nothing to compare.
+    if (mInitialized && SurfaceQueryable()) {
         // A fullscreen/mobile surface can grant a different extent from the
         // logical render request. Recreating it cannot change that constraint.
         // Real window changes still invalidate through OnResize/OUT_OF_DATE.
@@ -857,8 +859,12 @@ void GfxRenderingAPIVulkan::ClearFramebuffer(bool, bool) {
 
 std::vector<uint8_t> GfxRenderingAPIVulkan::ReadSwapchainRgba8(uint32_t& copyWidthOut, uint32_t& copyHeightOut,
                                                                bool& bgraOut) {
+    bool privateTargets = false;
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    privateTargets = mXrPresent;  // --screenshot reads the immersive mode's private target
+#endif
     if (mSwapchainExtent.width == 0 || mSwapchainExtent.height == 0 || mDevice == VK_NULL_HANDLE ||
-        (mSwapchain == VK_NULL_HANDLE && !mNriSwapchain.Active()) ||
+        (mSwapchain == VK_NULL_HANDLE && !mNriSwapchain.Active() && !privateTargets) ||
         mCurrentFramebuffer != 0) {
         return {};
     }

@@ -116,6 +116,11 @@ jobs:
         run: |
           unzip -l "${QUEST_OUT}/dist/TriAevum-Quest-arm64.apk"
           unzip -l "${QUEST_OUT}/dist/quest-tools-arm64.zip"
+          # The immersive activity's OpenXR loader is packaged; a title module never is.
+          unzip -l "${QUEST_OUT}/dist/TriAevum-Quest-arm64.apk" | grep -q 'lib/arm64-v8a/libopenxr_loader.so'
+          if unzip -l "${QUEST_OUT}/dist/TriAevum-Quest-arm64.apk" | grep -q libtriaevum_title_aot.so; then
+            echo "::error::a title module must never be packaged"; exit 1
+          fi
           sha256sum "${QUEST_OUT}"/dist/*.apk "${QUEST_OUT}"/dist/*.zip "${QUEST_OUT}"/dist/*.json
 
       - uses: actions/upload-artifact@v4

@@ -851,6 +851,9 @@ class GfxRenderingAPIVulkan final : public GfxRenderingAPI,
     void CreateSurface();
     void PickPhysicalDevice();
     void CreateLogicalDevice();
+    // The selected adapter's properties, resolve modes, alignments and the device log, shared by
+    // the surface-scored selection and the OpenXR-chosen adapter.
+    void ConfigureSelectedPhysicalDevice();
     void CreatePipelineCache();
     void StorePipelineCache();
     void CreateCommandResources();
@@ -993,6 +996,16 @@ class GfxRenderingAPIVulkan final : public GfxRenderingAPI,
     void DestroyBuffer(BufferAllocation& buffer);
     void RecreateSwapchain();
     bool SwapchainSurfaceChanged() const;
+    // False while no surface can be queried: the immersive mode has none, and on Android the
+    // surface is dropped while the Activity is in the background.
+    bool SurfaceQueryable() const;
+#if defined(__ANDROID__)
+    // Surface loss is a pause, not an error (the Activity went to the background and SDL
+    // released its ANativeWindow). Both run on the frame thread, from StartFrame.
+    bool EnsureAndroidSurface();
+    void DropAndroidSurface(const char* reason);
+    void NoteAndroidSurfaceLost(const char* where);
+#endif
     QueueFamilies FindQueueFamilies(VkPhysicalDevice device) const;
     SwapchainSupport QuerySwapchainSupport(VkPhysicalDevice device) const;
     bool DeviceSupportsSwapchain(VkPhysicalDevice device) const;
@@ -1182,6 +1195,18 @@ class GfxRenderingAPIVulkan final : public GfxRenderingAPI,
     // are never presented, so display refresh cannot pace GPU completion.
     bool mBenchmarkNoPresent = false;
     std::vector<VkDeviceMemory> mNoPresentMemories;
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    // Immersive mode (TriAevumQuestXr::Requested()): the frame renders into private targets
+    // (CreateNoPresentTargets) that the XR thread copies into the OpenXR quad swapchain.
+    bool mXrPresent = false;
+    uint32_t mXrQueueIndex = 1;
+    uint64_t mXrRenderValue = 0;
+    bool mXrRendererThreadRegistered = false;
+#endif
+#if defined(__ANDROID__)
+    std::atomic<bool> mSurfaceLost{false};
+    bool mSurfaceMinimizedLogged = false;
+#endif
     std::vector<VkImageView> mDepthImageViews;
     VkRenderPass mRenderPass = VK_NULL_HANDLE;
     VkRenderPass mOverlayRenderPass = VK_NULL_HANDLE;
@@ -1913,5 +1938,11 @@ class GfxRenderingAPIVulkan final : public GfxRenderingAPI,
 };
 
 } // namespace Fast
+
+#if defined(TRIAEVUM_QUEST_OPENXR)
+// The immersive sink, and the vkDeviceWaitIdle redirect through the XR queue lock for every
+// backend unit (gfx_vulkan*.cpp, gfx_vulkan_pica*.cpp include this header).
+#include "quest_xr.h"
+#endif
 
 #endif

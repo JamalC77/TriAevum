@@ -4,6 +4,13 @@
 #include "gfx_vulkan_internal.h"
 #include "fast/renderer3ds/vulkan_commands.h"
 #include "fast/renderer3ds/vulkan_memory_budget.h"
+#if defined(__ANDROID__)
+#include <SDL2/SDL_syswm.h>
+#include <cstdarg>
+#include <unistd.h>
+// liblog when the product links it (the Quest runtime does); a missing one only drops logcat lines.
+extern "C" int __android_log_write(int priority, const char* tag, const char* text) __attribute__((weak));
+#endif
 
 namespace Fast {
 
@@ -99,11 +106,27 @@ void GfxRenderingAPIVulkan::CreateInstance() {
         static_cast<uint32_t>(extensions.size());
     createInfo.ppEnabledExtensionNames = extensions.data();
     mVulkanValidation.ApplyTo(createInfo);
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    if (mXrPresent) {
+        // Immersive mode: the OpenXR runtime creates the instance with the extensions it needs
+        // (XR_KHR_vulkan_enable2); the SDL surface extensions stay enabled but are never used.
+        TriAevumQuestXr::CreateInstance();
+        TriAevumQuestXr::CheckVulkanApiVersion(applicationInfo.apiVersion);
+        mInstance = TriAevumQuestXr::CreateVulkanInstance(createInfo);
+        mVulkanValidation.Initialize(mInstance);
+        return;
+    }
+#endif
     CheckVk(vkCreateInstance(&createInfo, nullptr, &mInstance), "vkCreateInstance");
     mVulkanValidation.Initialize(mInstance);
 }
 
 void GfxRenderingAPIVulkan::CreateSurface() {
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    if (mXrPresent) {
+        return;  // no VkSurfaceKHR: frames go to private targets and the OpenXR quad
+    }
+#endif
     auto* window = static_cast<SDL_Window*>(mWindowBackend->GetNativeWindow());
 #ifdef _WIN32
     SDL_SysWMinfo windowInfo{};
@@ -132,6 +155,31 @@ void GfxRenderingAPIVulkan::PickPhysicalDevice() {
     std::vector<VkPhysicalDevice> devices(deviceCount);
     CheckVk(vkEnumeratePhysicalDevices(mInstance, &deviceCount, devices.data()),
             "vkEnumeratePhysicalDevices");
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    if (mXrPresent) {
+        // The runtime chooses the adapter. No surface exists, so neither the surface-scored
+        // candidate loop nor FindQueueFamilies/QuerySwapchainSupport may run.
+        mPhysicalDevice = TriAevumQuestXr::VulkanPhysicalDevice(mInstance);
+        const auto chosen = std::find(devices.begin(), devices.end(), mPhysicalDevice);
+        mVulkanAdapterCount = static_cast<uint32_t>(devices.size());
+        mVulkanAdapterIndex = chosen != devices.end() ? static_cast<uint32_t>(chosen - devices.begin()) : 0U;
+        uint32_t familyCount = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(mPhysicalDevice, &familyCount, nullptr);
+        std::vector<VkQueueFamilyProperties> families(familyCount);
+        vkGetPhysicalDeviceQueueFamilyProperties(mPhysicalDevice, &familyCount, families.data());
+        const auto graphics = std::find_if(families.begin(), families.end(), [](const VkQueueFamilyProperties& family) {
+            return (family.queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0U;
+        });
+        if (graphics == families.end()) {
+            TriAevumQuestXr::NoteStartFailure("the OpenXR Vulkan device has no graphics queue family");
+            throw std::runtime_error("the OpenXR Vulkan device has no graphics queue family");
+        }
+        mGraphicsQueueFamily = static_cast<uint32_t>(graphics - families.begin());
+        mPresentQueueFamily = mGraphicsQueueFamily;
+        ConfigureSelectedPhysicalDevice();
+        return;
+    }
+#endif
 
     std::vector<Oot3d::VulkanAdapterCandidate> candidates;
     candidates.reserve(devices.size());
@@ -215,6 +263,10 @@ void GfxRenderingAPIVulkan::PickPhysicalDevice() {
     const auto queues = FindQueueFamilies(mPhysicalDevice);
     mGraphicsQueueFamily = *queues.Graphics;
     mPresentQueueFamily = *queues.Present;
+    ConfigureSelectedPhysicalDevice();
+}
+
+void GfxRenderingAPIVulkan::ConfigureSelectedPhysicalDevice() {
     VkPhysicalDeviceProperties properties{};
     vkGetPhysicalDeviceProperties(mPhysicalDevice, &properties);
     mVulkanAdapterVendorId = properties.vendorID;
@@ -286,6 +338,24 @@ void GfxRenderingAPIVulkan::CreateLogicalDevice() {
         queueInfo.pQueuePriorities = priorities.data();
         queueInfos.push_back(queueInfo);
     }
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    if (mXrPresent) {
+        // Two queues in the graphics family: the renderer and NRI use queue 0, the OpenXR graphics
+        // binding (and the XR thread's copies) queue 1. No swapchain, no present queue.
+        if (graphicsQueueCount < 2U) {
+            const std::string reason = "XR needs 2 queues in family " + std::to_string(mGraphicsQueueFamily) +
+                                       " (offered " + std::to_string(graphicsQueueCount) + ")";
+            TriAevumQuestXr::NoteStartFailure(reason.c_str());
+            throw std::runtime_error(reason);
+        }
+        mNriSwapchainQueueEligible = false;
+        VkDeviceQueueCreateInfo queueInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+        queueInfo.queueFamilyIndex = mGraphicsQueueFamily;
+        queueInfo.queueCount = 2U;
+        queueInfo.pQueuePriorities = priorities.data();
+        queueInfos.assign(1, queueInfo);
+    }
+#endif
     uint32_t extensionCount = 0;
     CheckVk(vkEnumerateDeviceExtensionProperties(mPhysicalDevice, nullptr, &extensionCount, nullptr),
             "vkEnumerateDeviceExtensionProperties");
@@ -453,6 +523,91 @@ void GfxRenderingAPIVulkan::CreateLogicalDevice() {
         featureChain = &pipelineLibraries;
     }
     createInfo.pNext = featureChain;
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    if (mXrPresent) {
+        // xrCreateVulkanDeviceKHR appends the runtime's own extensions and feature structs. A
+        // runtime struct promoted to 1.2 beside VkPhysicalDeviceVulkan12Features is invalid usage a
+        // driver may accept silently, so the per-feature form is the default (as the hello app on this
+        // headset); the Vulkan12Features form is the fallback (TRIAEVUM_XR_SPLIT_FEATURES=0: first).
+        if (vulkan12.timelineSemaphore != VK_TRUE) {
+            TriAevumQuestXr::NoteStartFailure("the Vulkan device lacks timeline semaphores");
+            throw std::runtime_error("XR mode needs Vulkan timeline semaphores");
+        }
+        void* extensionChain = nullptr;
+        if (mSynchronization2Enabled) {
+            synchronization2.pNext = extensionChain;
+            extensionChain = &synchronization2;
+        }
+        if (mDynamicRenderingEnabled) {
+            dynamicRendering.pNext = extensionChain;
+            extensionChain = &dynamicRendering;
+        }
+        if (mGraphicsPipelineLibrariesEnabled) {
+            extendedDynamic.pNext = extensionChain;
+            extensionChain = &extendedDynamic;
+            pipelineLibraries.pNext = extensionChain;
+            extensionChain = &pipelineLibraries;
+        }
+        VkPhysicalDeviceBufferDeviceAddressFeatures bufferDeviceAddress{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
+        bufferDeviceAddress.bufferDeviceAddress = vulkan12.bufferDeviceAddress;
+        VkPhysicalDeviceTimelineSemaphoreFeatures timelineSemaphore{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+        timelineSemaphore.timelineSemaphore = vulkan12.timelineSemaphore;
+        VkPhysicalDeviceShaderFloat16Int8Features float16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
+        float16.shaderFloat16 = vulkan12.shaderFloat16;
+        VkPhysicalDeviceDescriptorIndexingFeatures descriptorIndexing{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
+        descriptorIndexing.descriptorBindingSampledImageUpdateAfterBind =
+            vulkan12.descriptorBindingSampledImageUpdateAfterBind;
+        descriptorIndexing.descriptorBindingStorageImageUpdateAfterBind =
+            vulkan12.descriptorBindingStorageImageUpdateAfterBind;
+        descriptorIndexing.descriptorBindingPartiallyBound = vulkan12.descriptorBindingPartiallyBound;
+        descriptorIndexing.runtimeDescriptorArray = vulkan12.runtimeDescriptorArray;
+        descriptorIndexing.shaderStorageBufferArrayNonUniformIndexing =
+            vulkan12.shaderStorageBufferArrayNonUniformIndexing;
+        descriptorIndexing.shaderSampledImageArrayNonUniformIndexing = vulkan12.shaderSampledImageArrayNonUniformIndexing;
+        descriptorIndexing.shaderStorageImageArrayNonUniformIndexing = vulkan12.shaderStorageImageArrayNonUniformIndexing;
+        const char* splitSetting = std::getenv("TRIAEVUM_XR_SPLIT_FEATURES");
+        const bool splitFirst = splitSetting == nullptr || std::string_view(splitSetting) != "0";
+        for (const bool split : {splitFirst, !splitFirst}) {
+            if (split) {
+                bufferDeviceAddress.pNext = extensionChain;
+                timelineSemaphore.pNext = &bufferDeviceAddress;
+                float16.pNext = &timelineSemaphore;
+                descriptorIndexing.pNext = &float16;
+                createInfo.pNext = &descriptorIndexing;
+            } else {
+                vulkan12.pNext = extensionChain;
+                createInfo.pNext = &vulkan12;
+            }
+            if (TriAevumQuestXr::TryCreateVulkanDevice(mPhysicalDevice, createInfo, split ? "split" : "vulkan12",
+                                                       &mDevice))
+                break;
+        }
+        if (mDevice == VK_NULL_HANDLE) {
+            TriAevumQuestXr::NoteStartFailure("xrCreateVulkanDeviceKHR rejected both feature chains");
+            throw std::runtime_error("xrCreateVulkanDeviceKHR rejected both feature chains (see TRIAEVUM_XR_DEVICE)");
+        }
+        mXrQueueIndex = 1U;
+        vkGetDeviceQueue(mDevice, mGraphicsQueueFamily, 0, &mGraphicsQueue);
+        mPresentQueue = mGraphicsQueue;
+        mAsyncPresentSupported = false;
+        mDiagnostics.SetVulkanAdapter({
+            mVulkanAdapterCount, mVulkanAdapterIndex,
+            mVulkanAdapterVendorId, mVulkanAdapterDeviceId,
+            mGraphicsQueueFamily, mPresentQueueFamily,
+            graphicsQueueCount,
+            2U,
+            0U,
+            false,
+            false,
+        });
+        TriAevumQuestXr::StartSession(mInstance, mPhysicalDevice, mDevice, mGraphicsQueueFamily, mXrQueueIndex);
+        TriAevumQuestXr::RegisterThread(TriAevumQuestXr::ThreadRole::ApplicationMain, static_cast<int>(gettid()));
+        return;
+    }
+#endif
     CheckVk(vkCreateDevice(mPhysicalDevice, &createInfo, nullptr, &mDevice), "vkCreateDevice");
     vkGetDeviceQueue(mDevice, mGraphicsQueueFamily, 0, &mGraphicsQueue);
     vkGetDeviceQueue(mDevice, mPresentQueueFamily,
@@ -723,6 +878,11 @@ void GfxRenderingAPIVulkan::PresentWorkerMain() {
             mPresentSwapchainDirty.store(true);
         } else if (present == VK_SUBOPTIMAL_KHR) {
             mSwapchainSuboptimal.store(true);
+#if defined(__ANDROID__)
+        } else if (present == VK_ERROR_SURFACE_LOST_KHR) {
+            // The Activity went to the background and SDL released the window: a pause.
+            NoteAndroidSurfaceLost("present");
+#endif
         } else if (present != VK_SUCCESS) {
             mPresentError.store(static_cast<int32_t>(present));
         }
@@ -921,6 +1081,11 @@ void GfxRenderingAPIVulkan::CreateSwapchainResources() {
     }
     const char* noPresent = std::getenv("TRIAEVUM_BENCHMARK_NO_PRESENT");
     mBenchmarkNoPresent = noPresent != nullptr && std::string_view(noPresent) == "1";
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    if (mXrPresent) {
+        mBenchmarkNoPresent = false;  // the immersive sink owns the private targets
+    }
+#endif
     const bool nriCreated =
         !mBenchmarkNoPresent && mNriSwapchain.Supported() &&
         mNriSwapchain.Create({
@@ -960,6 +1125,14 @@ void GfxRenderingAPIVulkan::CreateSwapchainResources() {
         for (uint32_t index = 0; index < imageCount; ++index)
             mRenderFinishedSemaphores[index] =
                 mNriSwapchain.ReleaseSemaphore(index);
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    } else if (mXrPresent) {
+        // Immersive mode: one private target per frame slot (as the no-present benchmark), in the
+        // UNORM twin of the quad swapchain's sRGB format; the XR thread copies each finished frame.
+        CreateNoPresentTargets(surfaceFormat.format, extent);
+        imageCount = static_cast<uint32_t>(mSwapchainImages.size());
+        TriAevumQuestXr::AttachTargets(mSwapchainImages.data(), imageCount, extent);
+#endif
     } else if (mBenchmarkNoPresent) {
         SPDLOG_WARN("OOT3D Vulkan benchmark no-present mode: frames are rendered "
                     "but never presented");
@@ -1166,6 +1339,11 @@ void GfxRenderingAPIVulkan::DestroySwapchainResources() {
     if (mDevice == VK_NULL_HANDLE) {
         return;
     }
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    if (mXrPresent) {
+        TriAevumQuestXr::DetachTargets();  // no copy may read the targets once they are destroyed
+    }
+#endif
     ShutdownImGuiBackend();
     DestroyPresentationPipelines();
     for (VkFramebuffer framebuffer : mSwapchainFramebuffers) {
@@ -1227,7 +1405,26 @@ void GfxRenderingAPIVulkan::DestroySwapchainResources() {
     mImagesInFlight.clear();
 }
 
+bool GfxRenderingAPIVulkan::SurfaceQueryable() const {
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    if (mXrPresent) {
+        return false;
+    }
+#endif
+#if defined(__ANDROID__)
+    if (mSurface == VK_NULL_HANDLE || mSurfaceLost.load()) {
+        return false;
+    }
+#endif
+    return true;
+}
+
 bool GfxRenderingAPIVulkan::SwapchainSurfaceChanged() const {
+    if (!SurfaceQueryable()) {
+        // No surface to query (immersive mode, or an Android surface dropped while in the
+        // background): EnsureAndroidSurface rebuilds at the granted extent.
+        return false;
+    }
     const auto support = QuerySwapchainSupport(mPhysicalDevice);
     const auto extent = ChooseExtent(support.Capabilities);
     const auto format = ChooseSurfaceFormat(support.Formats);
@@ -1299,6 +1496,27 @@ GfxRenderingAPIVulkan::FindQueueFamilies(VkPhysicalDevice device) const {
 GfxRenderingAPIVulkan::SwapchainSupport
 GfxRenderingAPIVulkan::QuerySwapchainSupport(VkPhysicalDevice device) const {
     SwapchainSupport result;
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    if (mXrPresent) {
+        // No surface in immersive mode: the private targets' fixed contract (q3-spec §4.3).
+        const VkExtent2D panel = TriAevumQuestXr::PanelExtent();
+        result.Capabilities.minImageCount = kFramesInFlight;
+        result.Capabilities.maxImageCount = kFramesInFlight;
+        result.Capabilities.currentExtent = panel;
+        result.Capabilities.minImageExtent = panel;
+        result.Capabilities.maxImageExtent = panel;
+        result.Capabilities.maxImageArrayLayers = 1;
+        result.Capabilities.supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+        result.Capabilities.currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+        result.Capabilities.supportedCompositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+        result.Capabilities.supportedUsageFlags = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                                  VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        result.Formats = {{TriAevumQuestXr::TargetFormat(), VK_COLOR_SPACE_SRGB_NONLINEAR_KHR}};
+        result.PresentModes = {VK_PRESENT_MODE_FIFO_KHR};
+        return result;
+    }
+#endif
     CheckVk(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device, mSurface, &result.Capabilities),
             "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
     uint32_t formatCount = 0;
@@ -1531,6 +1749,115 @@ void GfxRenderingAPIVulkan::ApplyDynamicViewportAndScissor() {
         vkCmdSetScissor(mCommandBuffers[mCurrentFrame], 0, 1, &clamped);
     }
 }
+
+#if defined(__ANDROID__)
+namespace {
+// TRIAEVUM_SURFACE_* lines: logcat tag TriAevum and logs/native-stderr.log.
+void LogSurfaceEvent(const char* format, ...) __attribute__((format(printf, 1, 2)));
+void LogSurfaceEvent(const char* format, ...) {
+    char text[256];
+    va_list arguments;
+    va_start(arguments, format);
+    std::vsnprintf(text, sizeof text, format, arguments);
+    va_end(arguments);
+    std::fprintf(stderr, "%s\n", text);
+    if (__android_log_write != nullptr) __android_log_write(4 /* ANDROID_LOG_INFO */, "TriAevum", text);
+}
+} // namespace
+
+void GfxRenderingAPIVulkan::NoteAndroidSurfaceLost(const char* where) {
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    if (mXrPresent) {
+        return;  // no surface and no present in immersive mode
+    }
+#endif
+    if (!mSurfaceLost.exchange(true)) {
+        LogSurfaceEvent("TRIAEVUM_SURFACE_LOST where=%s", where);
+    }
+}
+
+void GfxRenderingAPIVulkan::DropAndroidSurface(const char* reason) {
+    WaitForAllPresents();
+    StopPresentWorker();
+    CheckVk(vkDeviceWaitIdle(mDevice), "vkDeviceWaitIdle(drop Android surface)");
+    DestroySwapchainResources();
+    if (mSurface != VK_NULL_HANDLE) {
+        vkDestroySurfaceKHR(mInstance, mSurface, nullptr);
+        mSurface = VK_NULL_HANDLE;
+    }
+    mSurfaceLost = true;
+    // Stale results of the dropped swapchain must not query or rebuild a surface that is gone.
+    mSwapchainSuboptimal.store(false);
+    mPresentSwapchainDirty.store(false);
+    mSwapchainDirty = false;
+    const auto pending = static_cast<VkResult>(mPresentError.load());
+    if (pending == VK_ERROR_SURFACE_LOST_KHR || pending == VK_ERROR_OUT_OF_DATE_KHR)
+        mPresentError.store(VK_SUCCESS);
+    LogSurfaceEvent("TRIAEVUM_SURFACE_DROPPED reason=%s", reason);
+}
+
+bool GfxRenderingAPIVulkan::EnsureAndroidSurface() {
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    if (mXrPresent) {
+        return true;  // immersive mode never creates a surface on the hidden SDL window
+    }
+#endif
+    auto* window = static_cast<SDL_Window*>(mWindowBackend->GetNativeWindow());
+    if (window != nullptr && (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED) != 0U) {
+        // SDL marks the window minimized when the Activity pauses, before the surface goes away.
+        if (mSurface != VK_NULL_HANDLE) {
+            if (!mSurfaceLost.exchange(true))
+                LogSurfaceEvent("TRIAEVUM_SURFACE_LOST where=minimized");
+            DropAndroidSurface("minimized");
+        }
+        return false;
+    }
+    if (!mSurfaceLost.load() && mSurface != VK_NULL_HANDLE) {
+        return true;
+    }
+    SDL_SysWMinfo info;
+    SDL_VERSION(&info.version);
+    if (window == nullptr || SDL_GetWindowWMInfo(window, &info) != SDL_TRUE ||
+        info.info.android.window == nullptr) {
+        return false;  // SDL has no ANativeWindow yet; SDL_Vulkan_CreateSurface would not check
+    }
+    if (mSurface != VK_NULL_HANDLE) {
+        DropAndroidSurface("recreate");
+    }
+    try {
+        CreateSurface();
+    } catch (const std::exception& error) {
+        LogSurfaceEvent("TRIAEVUM_SURFACE_RECREATE_FAILED stage=surface error=\"%s\"", error.what());
+        return false;
+    }
+    VkBool32 supported = VK_FALSE;
+    if (vkGetPhysicalDeviceSurfaceSupportKHR(mPhysicalDevice, mPresentQueueFamily, mSurface, &supported) !=
+            VK_SUCCESS ||
+        supported != VK_TRUE) {
+        LogSurfaceEvent("TRIAEVUM_SURFACE_RECREATE_FAILED stage=present_support");
+        vkDestroySurfaceKHR(mInstance, mSurface, nullptr);
+        mSurface = VK_NULL_HANDLE;
+        return false;
+    }
+    mSurfaceLost = false;
+    try {
+        CreateSwapchainResources();
+    } catch (const std::exception& error) {
+        LogSurfaceEvent("TRIAEVUM_SURFACE_RECREATE_FAILED stage=swapchain error=\"%s\"", error.what());
+        DropAndroidSurface("swapchain_failed");
+        return false;
+    }
+    if (mSwapchainDirty) {
+        return false;  // a zero extent: the next frame retries through RecreateSwapchain
+    }
+    StartPresentWorker();
+    if (mNriPicaScanoutPass.Available() && !mNriPicaScanoutPass.Configure(mSwapchainFormat)) {
+        SPDLOG_WARN("OOT3D NRI scanout reconfigure failed: {}", mNriPicaScanoutPass.UnavailableReason());
+    }
+    LogSurfaceEvent("TRIAEVUM_SURFACE_RECREATED w=%u h=%u", mSwapchainExtent.width, mSwapchainExtent.height);
+    return true;
+}
+#endif
 
 } // namespace Fast
 

@@ -11,6 +11,8 @@
 #   QUEST_SKIP_APK=1  stop after staging (no JDK/Gradle needed)
 #   QUEST_DEVELOPER_TOOLS=1  personal developer build: F1 Dev Tools, warp and the TRIAEVUM_DEV_LAB
 #                     file channel (never a public build)
+#   QUEST_OPENXR=0    panel-only build for bisecting: no OpenXR loader and no immersive code; the
+#                     launcher then always starts the flat panel. Default 1.
 set -euo pipefail
 
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -18,6 +20,7 @@ ndk="${ANDROID_NDK_HOME:?Set ANDROID_NDK_HOME to Android NDK 29.0.14206865}"
 out="${QUEST_OUT:-$root/out/quest}"
 jobs="${QUEST_JOBS:-$(nproc 2>/dev/null || echo 4)}"
 python="${PYTHON:-python3}"
+openxr="${QUEST_OPENXR:-1}"
 dist="$out/dist"
 mkdir -p "$out" "$dist"
 
@@ -47,10 +50,19 @@ if [[ "${QUEST_DEVELOPER_TOOLS:-0}" == 1 ]]; then
 else
   rt_args+=(-DTRIAEVUM_DEVELOPER_TOOLS=OFF)
 fi
+rt_targets=(oot3d_native_game triaevum_title_aot_stub oot3d_native_a32_vfp_fast_tests oot3d_native_a32_runtime_tests)
+if [[ "$openxr" == 1 ]]; then
+  rt_args+=(-DTRIAEVUM_QUEST_OPENXR=ON)
+  rt_targets+=(quest_xr_logic_tests)
+  openxr_stage=--openxr
+  openxr_gradle=true
+else
+  rt_args+=(-DTRIAEVUM_QUEST_OPENXR=OFF)
+  openxr_stage=--no-openxr
+  openxr_gradle=false
+fi
 cmake -S "$root/ports/quest/runtime" -B "$out/rt" "${rt_args[@]}"
-cmake --build "$out/rt" --parallel "$jobs" --target \
-  oot3d_native_game triaevum_title_aot_stub \
-  oot3d_native_a32_vfp_fast_tests oot3d_native_a32_runtime_tests
+cmake --build "$out/rt" --parallel "$jobs" --target "${rt_targets[@]}"
 
 echo "=== Title-free probes (ports/android/native, synthetic title) ==="
 "$python" "$root/tools/quest/synthetic_title.py" --output "$out/synthetic"
@@ -65,7 +77,7 @@ cmake --build "$out/native" --parallel "$jobs" --target \
 echo "=== Staging ==="
 "$python" "$root/tools/quest/stage_quest.py" --build "$out" --ndk "$ndk" \
   --title-abi "$out/title-abi.json" --jni "$out/jni" --assets "$out/assets" \
-  --tools-zip "$dist/quest-tools-arm64.zip"
+  --tools-zip "$dist/quest-tools-arm64.zip" "$openxr_stage"
 cp "$out/title-abi.json" "$dist/title-abi.json"
 
 if [[ "${QUEST_SKIP_APK:-0}" == 1 ]]; then
@@ -80,7 +92,8 @@ test -f "$sdl_source/android-project/app/src/main/java/org/libsdl/app/SDLActivit
 gradle_args=(--no-daemon -p "$root/ports/quest"
   "-PtriaevumSdlSource=$sdl_source"
   "-PtriaevumNativeStage=$out/jni"
-  "-PtriaevumQuestAssets=$out/assets")
+  "-PtriaevumQuestAssets=$out/assets"
+  "-PtriaevumQuestOpenXr=$openxr_gradle")
 "${GRADLE:-gradle}" "${gradle_args[@]}" :app:testReleaseUnitTest :app:assembleRelease
 apk="$root/ports/quest/app/build/outputs/apk/release/app-release.apk"
 test -f "$apk"

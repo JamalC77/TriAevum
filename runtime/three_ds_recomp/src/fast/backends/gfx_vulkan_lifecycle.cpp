@@ -147,6 +147,11 @@ void GfxRenderingAPIVulkan::Init() {
             : NativePicaPreparationMode::Synchronous;
     }
 
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    // Immersive mode (TriAevumXrActivity sets TRIAEVUM_XR=1): the instance and device come from the
+    // OpenXR runtime and frames go to private targets copied into the quad (q3-spec §4).
+    mXrPresent = TriAevumQuestXr::Requested();
+#endif
     CreateInstance();
     CreateSurface();
     PickPhysicalDevice();
@@ -642,6 +647,13 @@ void GfxRenderingAPIVulkan::Shutdown() {
         return;
     }
     if (mDevice != VK_NULL_HANDLE) {
+#if defined(TRIAEVUM_QUEST_OPENXR)
+        if (mXrPresent) {
+            // Ends the session, joins the XR thread, idles queue 1 and destroys the XR objects; the
+            // timelines stay until the renderer's own submits are idle (DestroyVulkanObjects below).
+            TriAevumQuestXr::StopSession();
+        }
+#endif
         WaitForAllPresents();
         StopPresentWorker();
         vkDeviceWaitIdle(mDevice);
@@ -782,6 +794,11 @@ void GfxRenderingAPIVulkan::Shutdown() {
             vkDestroyPipelineCache(mDevice, mPipelineCache, nullptr);
             mPipelineCache = VK_NULL_HANDLE;
         }
+#if defined(TRIAEVUM_QUEST_OPENXR)
+        if (mXrPresent) {
+            TriAevumQuestXr::DestroyVulkanObjects();  // XR command pool, fences, both timelines
+        }
+#endif
         vkDestroyDevice(mDevice, nullptr);
     }
     mDiagnostics.EndFrame();

@@ -3,8 +3,37 @@
 
 #include <algorithm>
 #include <cmath>
+#if defined(TRIAEVUM_QUEST_OPENXR)
+#include "quest_xr.h"
+#endif
 
 namespace Oot3dA32Window {
+
+#if defined(TRIAEVUM_QUEST_OPENXR)
+namespace {
+// Quest Touch controllers (TriAevumQuestXr::PadSnapshot): bit i is SDL_GameControllerButton i,
+// which is also ThreeDsRecomp::Input::GamepadButton i for A..DpadRight.
+bool XrPadHeld(const TriAevumQuestXr::PadSnapshot &pad,
+               ThreeDsRecomp::Input::GamepadButton button,
+               int16_t triggerThreshold) {
+  using ThreeDsRecomp::Input::GamepadButton;
+  if (button == GamepadButton::LeftTrigger) return pad.TriggerLeft > triggerThreshold;
+  if (button == GamepadButton::RightTrigger) return pad.TriggerRight > triggerThreshold;
+  const auto index = static_cast<int>(button);
+  return index >= 0 && index < 15 && (pad.Buttons & (1U << index)) != 0U;
+}
+
+// Keeps whichever stick (SDL pad or Touch) is pushed further.
+void MergeStick(int16_t &x, int16_t &y, int16_t xrX, int16_t xrY) {
+  const int64_t sdl = int64_t{x} * x + int64_t{y} * y;
+  const int64_t xr = int64_t{xrX} * xrX + int64_t{xrY} * xrY;
+  if (xr > sdl) {
+    x = xrX;
+    y = xrY;
+  }
+}
+} // namespace
+#endif
 
 Oot3dNativeGame::NativeA32InputFrame
 PollNativeA32Input(Fast::Fast3dWindow &window,
@@ -21,6 +50,12 @@ PollNativeA32Input(Fast::Fast3dWindow &window,
                    NativeControlPollingState &pollingState) {
   using namespace Oot3dNativeGame;
   auto config = controls.Snapshot().Config;
+#if defined(TRIAEVUM_QUEST_OPENXR)
+  // Immersive mode: the Touch controllers join the selected SDL pad (both are ORed), so a
+  // Bluetooth pad keeps working. False unless the OpenXR session is focused.
+  TriAevumQuestXr::PadSnapshot xrPad{};
+  const bool xrActive = TriAevumQuestXr::TakePad(&xrPad);
+#endif
   NativeControlHostInputState host;
   if (hostGuiVisible) pollingState.PendingInputSeconds = 0.0;
   host.SamplePeriodSeconds = ThreeDsRecomp::Input::ConsumeInputPeriod(
@@ -49,6 +84,10 @@ PollNativeA32Input(Fast::Fast3dWindow &window,
   const auto selectedDevice = std::find_if(selectedController.Devices.begin(), selectedController.Devices.end(),
       [](const auto& device) { return device.Selected; });
   config = ControlsForDevice(config, selectedDevice != selectedController.Devices.end() ? &*selectedDevice : nullptr);
+#if defined(TRIAEVUM_QUEST_OPENXR)
+  if (xrActive && config.MovementStick == NativeAnalogStick::Disabled)
+    config.MovementStick = NativeAnalogStick::Left;
+#endif
   controls.ObserveDevices(std::move(selectedController.Devices));
 
   const int16_t triggerThreshold = static_cast<int16_t>(
@@ -64,6 +103,17 @@ PollNativeA32Input(Fast::Fast3dWindow &window,
         : mWindow(window), mKeyboardCaptured(keyboardCaptured),
           mMouseCaptured(mouseCaptured), mController(controller),
           mTriggerThreshold(triggerThreshold) {}
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    LusHostButtonSource(Fast::Fast3dWindow &window,
+                        bool keyboardCaptured,
+                        bool mouseCaptured,
+                        SDL_GameController *controller,
+                        int16_t triggerThreshold,
+                        const TriAevumQuestXr::PadSnapshot *xrPad)
+        : LusHostButtonSource(window, keyboardCaptured, mouseCaptured, controller, triggerThreshold) {
+      mXrPad = xrPad;
+    }
+#endif
 
     bool IsKeyboardKeyHeld(
         NativeKeyboardKey key) const noexcept override {
@@ -79,6 +129,9 @@ PollNativeA32Input(Fast::Fast3dWindow &window,
 
     bool IsGamepadButtonHeld(
         NativeGamepadButton binding) const noexcept override {
+#if defined(TRIAEVUM_QUEST_OPENXR)
+      if (mXrPad != nullptr && XrPadHeld(*mXrPad, binding, mTriggerThreshold)) return true;
+#endif
       return ThreeDsRecomp::Input::IsSdlControllerButtonHeld(mController, binding, mTriggerThreshold);
     }
 
@@ -88,12 +141,21 @@ PollNativeA32Input(Fast::Fast3dWindow &window,
     bool mMouseCaptured = false;
     SDL_GameController *mController = nullptr;
     int16_t mTriggerThreshold = 0;
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    const TriAevumQuestXr::PadSnapshot *mXrPad = nullptr;
+#endif
   };
   // Remapping observes the same physical source, before gameplay's device and
   // UI filters. It works even for a currently disabled device.
+#if defined(TRIAEVUM_QUEST_OPENXR)
+  LusHostButtonSource rawButtonSource(window, false, false,
+      selectedController.Controller,
+      triggerThreshold, xrActive ? &xrPad : nullptr);
+#else
   LusHostButtonSource rawButtonSource(window, false, false,
       selectedController.Controller,
       triggerThreshold);
+#endif
   if (hostGuiVisible) {
     controls.ObserveBindingCapture(rawButtonSource, window.IsKeyDown(Ship::LUS_KB_ESCAPE));
   } else {
@@ -102,6 +164,18 @@ PollNativeA32Input(Fast::Fast3dWindow &window,
         phase != ThreeDsRecomp::Input::BindingCapturePhase::Cancelled)
       controls.CancelBindingCapture();
   }
+#if defined(TRIAEVUM_QUEST_OPENXR)
+  // Withheld while a host GUI is up, like the SDL controller.
+  LusHostButtonSource buttonSource(
+      window, keyboardCaptured, mouseCaptured,
+      !hostGuiVisible ? selectedController.Controller : nullptr,
+      triggerThreshold, xrActive && !hostGuiVisible ? &xrPad : nullptr);
+  const ThreeDsRecomp::Input::HostDeviceEnablement enabledDevices{
+      config.KeyboardEnabled,
+      config.MouseEnabled,
+      config.ControllerEnabled || xrActive,
+  };
+#else
   LusHostButtonSource buttonSource(
       window, keyboardCaptured, mouseCaptured,
       !hostGuiVisible ? selectedController.Controller : nullptr,
@@ -111,6 +185,7 @@ PollNativeA32Input(Fast::Fast3dWindow &window,
       config.MouseEnabled,
       config.ControllerEnabled,
   };
+#endif
 
   for (size_t index = 0; index < kNativeControlActionCount; ++index) {
     if (hostGuiVisible) pollingState.PendingPressedActions[index] = false;
@@ -136,6 +211,16 @@ PollNativeA32Input(Fast::Fast3dWindow &window,
   ThreeDsRecomp::Input::SampleSdlController(
       config.ControllerEnabled ? selectedController.Controller : nullptr, host, !hostGuiVisible,
       config.ControllerTouchpadEnabled ? config.ControllerTouchpadIndex : -1, triggerThreshold);
+#if defined(TRIAEVUM_QUEST_OPENXR)
+  if (xrActive && !hostGuiVisible) {
+    // Before the pending-press bookkeeping, so ControllerPressed includes Touch presses.
+    host.ControllerButtons |= xrPad.Buttons;
+    if (xrPad.TriggerLeft > triggerThreshold) host.ControllerButtons |= std::uint32_t{1} << 30;
+    if (xrPad.TriggerRight > triggerThreshold) host.ControllerButtons |= std::uint32_t{1} << 31;
+    MergeStick(host.LeftStickX, host.LeftStickY, xrPad.LeftX, xrPad.LeftY);
+    MergeStick(host.RightStickX, host.RightStickY, xrPad.RightX, xrPad.RightY);
+  }
+#endif
   controls.ObserveMotion(host.ControllerMotion);
   pollingState.PendingControllerButtons |= host.ControllerButtons & ~pollingState.PreviousControllerButtons;
   pollingState.PreviousControllerButtons = host.ControllerButtons;
@@ -193,9 +278,35 @@ PollNativeA32Input(Fast::Fast3dWindow &window,
         pad != nullptr && SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0;
     pollingState.DevPadRightShoulder =
         pad != nullptr && SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) != 0;
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    if (xrActive) {
+      // The in-game menu and the developer pad readers see the Touch controllers too.
+      const auto xrAxis = [](int16_t value) {
+        const float normalized = static_cast<float>(value) / 32767.0F;
+        constexpr float kDeadZone = 0.2F;
+        return std::abs(normalized) < kDeadZone ? 0.0F
+            : std::clamp((normalized - std::copysign(kDeadZone, normalized)) / (1.0F - kDeadZone), -1.0F, 1.0F);
+      };
+      const auto larger = [](auto &current, float x, float y) {
+        if (x * x + y * y > current[0] * current[0] + current[1] * current[1]) {
+          current[0] = x;
+          current[1] = y;
+        }
+      };
+      larger(pollingState.DevPadLeftStick, xrAxis(xrPad.LeftX), xrAxis(xrPad.LeftY));
+      larger(pollingState.DevPadRightStick, xrAxis(xrPad.RightX), xrAxis(xrPad.RightY));
+      pollingState.DevPadLeftShoulder =
+          pollingState.DevPadLeftShoulder || (xrPad.Buttons & (1U << SDL_CONTROLLER_BUTTON_LEFTSHOULDER)) != 0U;
+      pollingState.DevPadRightShoulder =
+          pollingState.DevPadRightShoulder || (xrPad.Buttons & (1U << SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) != 0U;
+    }
+#endif
     // The in-game menu's controls, from the raw devices: the menu itself
     // decides whether they act (it is closed, or F1 owns the input).
     const auto padButton = [&](SDL_GameControllerButton which) {
+#if defined(TRIAEVUM_QUEST_OPENXR)
+      if (xrActive && (xrPad.Buttons & (1U << which)) != 0U) return true;
+#endif
       return pad != nullptr && SDL_GameControllerGetButton(pad, which) != 0;
     };
     const auto key = [&](Ship::KbScancode scancode) { return window.IsKeyDown(scancode); };
