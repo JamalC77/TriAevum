@@ -182,23 +182,32 @@ LayerMachine gLayers;  // XR thread only
 // the panel of the latest pair (the TopScreen HUD and ImGui over transparent, premultiplied alpha).
 struct HudLayerConfig {
     Logic::HudFollowConfig Follow;
-    float WidthM = 2.2F;
+    float WidthM = 1.05F;
 };
 const HudLayerConfig& HudConfig() {
     static const HudLayerConfig config = [] {
         constexpr double kToRadians = 3.14159265358979323846 / 180.0;
         HudLayerConfig c;
-        c.WidthM = static_cast<float>(std::clamp(EnvDouble("TRIAEVUM_XR_HUD_WIDTH_M", 2.2), 0.3, 8.0));
-        c.Follow.DistanceM = static_cast<float>(std::clamp(EnvDouble("TRIAEVUM_XR_HUD_DISTANCE_M", 2.5), 0.5, 10.0));
+        // Defaults follow the placement distance (the session clamps TRIAEVUM_XR_PLACE_M the same way):
+        // the HUD a little nearer than Link, ~39 deg wide, and a dead zone that keeps its edge within
+        // 40 deg of the gaze. Each knob overrides; the follow default is recomputed from the size in use.
+        const float place = static_cast<float>(std::clamp(EnvDouble("TRIAEVUM_XR_PLACE_M", 1.8), 0.8, 4.0));
+        c.Follow.DistanceM = static_cast<float>(
+            std::clamp(EnvDouble("TRIAEVUM_XR_HUD_DISTANCE_M", Logic::DefaultHudDistanceM(place)), 0.5, 10.0));
+        c.WidthM = static_cast<float>(
+            std::clamp(EnvDouble("TRIAEVUM_XR_HUD_WIDTH_M", Logic::DefaultHudWidthM(c.Follow.DistanceM)), 0.3, 8.0));
         c.Follow.PitchRadians =
             static_cast<float>(std::clamp(EnvDouble("TRIAEVUM_XR_HUD_PITCH_DEG", -8.0), -45.0, 30.0) * kToRadians);
-        c.Follow.DeadzoneRadians =
-            static_cast<float>(std::clamp(EnvDouble("TRIAEVUM_XR_HUD_FOLLOW_DEG", 35.0), 0.0, 90.0) * kToRadians);
+        const double followDefaultDeg =
+            Logic::DefaultHudDeadzoneRadians(c.WidthM, c.Follow.DistanceM) / kToRadians;
+        c.Follow.DeadzoneRadians = static_cast<float>(
+            std::clamp(EnvDouble("TRIAEVUM_XR_HUD_FOLLOW_DEG", followDefaultDeg), 0.0, 90.0) * kToRadians);
         const VkExtent2D panel = PanelExtent();
         XRLOG("TRIAEVUM_XR_HUD config width_m=%.2f height_m=%.3f distance_m=%.2f pitch_deg=%.1f follow_deg=%.1f "
-              "space=LOCAL blend=premultiplied",
+              "edge_deg=%.1f place_m=%.2f space=LOCAL blend=premultiplied",
               c.WidthM, Logic::ScreenHeight(c.WidthM, panel.width, panel.height), c.Follow.DistanceM,
-              c.Follow.PitchRadians / kToRadians, c.Follow.DeadzoneRadians / kToRadians);
+              c.Follow.PitchRadians / kToRadians, c.Follow.DeadzoneRadians / kToRadians,
+              Logic::HudHalfAngleRadians(c.WidthM, c.Follow.DistanceM) / kToRadians, place);
         return c;
     }();
     return config;

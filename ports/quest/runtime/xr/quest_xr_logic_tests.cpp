@@ -234,6 +234,39 @@ void HudFollowTests() {
         const auto p = hud.Update(YawPitch(Deg(-120.0F), 0.0F), Vec3{}, dt, config);
         CHECK(Near(p.YawRadians, Deg(-120.0F), 1e-4F) && !hud.Following && hud.Placements == 3U);
     }
+    {  // Sizing defaults: nearer than Link, ~39 deg wide, and the edge stays within 40 deg of the gaze.
+        CHECK(Near(DefaultHudDistanceM(1.8F), 1.5F));            // the default placement
+        CHECK(Near(DefaultHudDistanceM(1.0F), 1.0F) && Near(DefaultHudDistanceM(0.8F), 1.0F));
+        CHECK(Near(DefaultHudDistanceM(4.0F), 2.5F));
+        CHECK(Near(DefaultHudDistanceM(NAN), 1.5F) && Near(DefaultHudDistanceM(-1.0F), 1.5F));
+        for (float place = 0.8F; place <= 4.0F; place += 0.1F) {
+            const float distance = DefaultHudDistanceM(place);
+            if (place >= 1.3F) CHECK(distance < place);  // in front of Link wherever the clamp allows
+            const float width = DefaultHudWidthM(distance);
+            const float half = HudHalfAngleRadians(width, distance);
+            CHECK(half > Deg(18.0F) && half < Deg(21.0F));  // constant angular size
+            const float deadzone = DefaultHudDeadzoneRadians(width, distance);
+            CHECK(Near(deadzone + half, Deg(40.0F), 1e-4F));
+        }
+        // W4-minimal's old size (2.2 m at 2.5 m, 23.7 deg half) gets a 16.3 deg dead zone, not 35.
+        CHECK(Near(DefaultHudDeadzoneRadians(2.2F, 2.5F), Deg(40.0F) - std::atan(0.44F), 1e-4F));
+        CHECK(Near(DefaultHudDeadzoneRadians(8.0F, 1.0F), Deg(5.0F)));  // a huge quad: the floor
+        CHECK(HudHalfAngleRadians(1.0F, 0.0F) == 0.0F && HudHalfAngleRadians(NAN, 1.0F) == 0.0F);
+
+        // With the defaults, turning just inside the dead zone keeps the far edge within 40 deg of
+        // the gaze, and any steady turn beyond it catches up until the edge is back near the centre.
+        HudFollowConfig defaults;
+        defaults.DistanceM = DefaultHudDistanceM(1.8F);
+        const float width = DefaultHudWidthM(defaults.DistanceM);
+        const float half = HudHalfAngleRadians(width, defaults.DistanceM);
+        defaults.DeadzoneRadians = DefaultHudDeadzoneRadians(width, defaults.DistanceM);
+        HudFollow hud;
+        hud.Update(YawPitch(0.0F, 0.0F), Vec3{}, dt, defaults);
+        hud.Update(YawPitch(defaults.DeadzoneRadians - Deg(0.5F), 0.0F), Vec3{}, dt, defaults);
+        CHECK(!hud.Following && std::fabs(hud.Yaw - (defaults.DeadzoneRadians - Deg(0.5F))) + half <= Deg(40.0F));
+        for (int frame = 0; frame < 180; ++frame) hud.Update(YawPitch(Deg(60.0F), 0.0F), Vec3{}, dt, defaults);
+        CHECK(!hud.Following && std::fabs(WrapRadians(Deg(60.0F) - hud.Yaw)) <= Deg(2.0F));
+    }
     CHECK(Near(WrapRadians(Deg(190.0F)), Deg(-170.0F), 1e-4F) && Near(WrapRadians(Deg(-190.0F)), Deg(170.0F), 1e-4F));
     CHECK(WrapRadians(NAN) == 0.0F);
 }

@@ -564,7 +564,8 @@ void PublishStereo(uint32_t slot, uint64_t renderValue, const Fast::StereoViews&
     gLatest.Serial = ++gSerial;
     gLatest.Kind = PublicationKind::Stereo;
     gLatest.Views = views;
-    gLatest.PanelValid = panelValid && gHud.Handle != XR_NULL_HANDLE;
+    // The HUD swapchain belongs to the XR thread: CopyLatest checks gHud.Handle there, not here.
+    gLatest.PanelValid = panelValid;
     if (views.RigEpoch > gPublishedRigEpoch.load()) gPublishedRigEpoch.store(views.RigEpoch);
     ++gStats.Publications;
     ++gStats.StereoPublications;

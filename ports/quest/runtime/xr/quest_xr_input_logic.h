@@ -176,10 +176,38 @@ inline float WrapRadians(float angle) {
 // yaw stays put while the head turns less than DeadzoneRadians away and then catches up smoothly
 // (exponential, CatchUpSeconds) until within SettleRadians, so the hearts and rings sit in the periphery
 // instead of being glued to the face. The quad faces the head (yaw, then pitch).
+// ---- HUD sizing defaults. The quad sits a little nearer than Link (the HUD is composited over the
+// world, so stereo depth should agree: in front of Link, the usual subject), is ~39 deg wide (the
+// hearts and rings read like a TV's corners), and the follow dead zone is measured so the quad's
+// outer EDGE stays within kHudMaxEdgeFromGaze of the gaze before the catch-up starts (Quest 3's
+// horizontal half-FOV is ~50 deg; the hearts in the top-left corner must not leave it while turning).
+inline constexpr float kHudPlaceMarginM = 0.3F;           // HUD distance = place distance - this
+inline constexpr float kHudMinDefaultDistanceM = 1.0F;
+inline constexpr float kHudMaxDefaultDistanceM = 2.5F;
+inline constexpr float kHudWidthPerDistance = 0.70F;      // width / distance: ~38.6 deg wide
+inline constexpr float kHudMaxEdgeFromGazeRadians = 0.69813170F;  // 40 deg
+inline constexpr float kHudMinDeadzoneRadians = 0.08726646F;      // 5 deg
+
+// The default HUD distance for a head-to-Link placement distance (TRIAEVUM_XR_PLACE_M; 1.8 -> 1.5 m).
+inline float DefaultHudDistanceM(float placeDistanceM) {
+    const float place = std::isfinite(placeDistanceM) && placeDistanceM > 0.0F ? placeDistanceM : 1.8F;
+    return std::clamp(place - kHudPlaceMarginM, kHudMinDefaultDistanceM, kHudMaxDefaultDistanceM);
+}
+inline float DefaultHudWidthM(float distanceM) { return distanceM * kHudWidthPerDistance; }
+// Half the quad's horizontal angle seen from the head (at its centre distance).
+inline float HudHalfAngleRadians(float widthM, float distanceM) {
+    if (!(widthM > 0.0F) || !(distanceM > 0.0F)) return 0.0F;
+    return std::atan(widthM * 0.5F / distanceM);
+}
+// The centre dead zone that keeps the quad's edge within kHudMaxEdgeFromGaze of the gaze (>= 5 deg).
+inline float DefaultHudDeadzoneRadians(float widthM, float distanceM) {
+    return std::max(kHudMinDeadzoneRadians, kHudMaxEdgeFromGazeRadians - HudHalfAngleRadians(widthM, distanceM));
+}
+
 struct HudFollowConfig {
-    float DistanceM = 2.5F;
+    float DistanceM = 2.5F;               // the runtime default is DefaultHudDistanceM
     float PitchRadians = -0.13962634F;    // -8 deg: centred slightly below eye level
-    float DeadzoneRadians = 0.61086524F;  // 35 deg
+    float DeadzoneRadians = 0.61086524F;  // 35 deg (the runtime default is DefaultHudDeadzoneRadians)
     float CatchUpSeconds = 0.3F;
     float SettleRadians = 0.034906585F;   // 2 deg
 };
