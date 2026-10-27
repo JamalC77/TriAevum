@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -47,12 +47,11 @@ jobs:
             echo "::error::TRIAEVUM_QUEST_KEYSTORE_BASE64 is not set"
             exit 1
           fi
-          base64 -d <<< "${KEYSTORE_BASE64}" > "${RUNNER_TEMP}/triaevum-quest.p12"
-          echo "TRIAEVUM_QUEST_KEYSTORE_FILE=${RUNNER_TEMP}/triaevum-quest.p12" >> "${GITHUB_ENV}"
+          base64 -d <<< "${KEYSTORE_BASE64}" > "${RUNNER_TEMP}/quest-signing.p12"
+          echo "TRIAEVUM_QUEST_KEYSTORE_FILE=${RUNNER_TEMP}/quest-signing.p12" >> "${GITHUB_ENV}"
 
       - name: Build
         env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/29.0.14206865
           TRIAEVUM_QUEST_KEYSTORE_PASSWORD: ${{ secrets.TRIAEVUM_QUEST_KEYSTORE_PASSWORD }}
           TRIAEVUM_QUEST_KEY_ALIAS: ${{ secrets.TRIAEVUM_QUEST_KEY_ALIAS }}
           TRIAEVUM_QUEST_KEY_PASSWORD: ${{ secrets.TRIAEVUM_QUEST_KEY_PASSWORD }}
@@ -86,4 +85,4 @@ jobs:
 
       - name: Remove keystore
         if: always()
-        run: rm -f "${RUNNER_TEMP}/triaevum-quest.p12"
+        run: rm -f "${RUNNER_TEMP}/quest-signing.p12"

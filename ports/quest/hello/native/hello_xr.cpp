@@ -1331,7 +1331,7 @@ bool render_frame(App& a, const XrView views[2], bool updateHud) {
         copy.imageExtent = {kHudWidth, kHudHeight, 1};
         vkCmdCopyBufferToImage(s.cmd, s.staging, hb.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
         hb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        hb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        hb.dstAccessMask = 0;  // the compositor's reads are ordered by xrReleaseSwapchainImage
         hb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         hb.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         vkCmdPipelineBarrier(s.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
