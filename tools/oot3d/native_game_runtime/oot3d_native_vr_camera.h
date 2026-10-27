@@ -40,6 +40,7 @@ class VrCameraSource final : public TopScreenVrCameraSource {
     TopScreenVrCameraWrite Commit(const TopScreenCameraVec3& collided, std::uint32_t bgId) override;
     void Quake(bool active) override;
     bool Fov(float loaded, float* degrees) override;
+    float NativeLoadedFov(float loaded) override;
 
   private:
     VrCameraSource() = default;

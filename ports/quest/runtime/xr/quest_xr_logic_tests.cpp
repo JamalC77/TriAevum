@@ -200,6 +200,19 @@ void MovementStick() {
         const auto oneHand = PickMoveStick(0.9F, 0.0F, false, -0.5F, 0.5F, kInactive);
         CHECK(oneHand.Source == StickSource::Right && Near(oneHand.X, -0.5F) && Near(oneHand.Y, 0.5F));
     }
+    {  // the right stick's job: flicks (mode R / mode L) only with the left controller active, and then
+       // never movement; the native A/B baseline keeps W1's one-handed movement and never flicks
+        auto job = WorldRightStickJob(true, true, true);
+        CHECK(job.Flicks && job.Move == RightStickMove::WhenLeftInactive);
+        CHECK(PickMoveStick(0.0F, 0.0F, true, 0.9F, 0.0F, job.Move).Source == StickSource::None);
+        job = WorldRightStickJob(true, true, false);  // one controller: the right stick moves Link, no flicks
+        CHECK(!job.Flicks && job.Move == RightStickMove::WhenLeftInactive);
+        CHECK(PickMoveStick(0.0F, 0.0F, false, 0.9F, 0.0F, job.Move).Source == StickSource::Right);
+        job = WorldRightStickJob(true, false, true);  // TRIAEVUM_XR_CAMERA=native
+        CHECK(!job.Flicks && job.Move == RightStickMove::WhenLeftIdle);
+        CHECK(PickMoveStick(0.0F, 0.0F, true, 0.9F, 0.0F, job.Move).Source == StickSource::Right);
+        CHECK(!WorldRightStickJob(false, true, true).Flicks);  // the screen: Q3 mapping
+    }
     CHECK(StickIdle(0.1F, 0.1F) && !StickIdle(0.2F, 0.0F) && StickIdle(NAN, 1.0F));
     {  // the log tracker: changes only, idle is no change
         StickSourceTracker tracker;

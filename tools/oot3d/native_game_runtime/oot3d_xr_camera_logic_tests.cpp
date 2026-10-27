@@ -117,6 +117,26 @@ void TestCameraWrite() {
         CHECK(Near(ParseCullFov(nullptr), 130.0) && Near(ParseCullFov("100"), 100.0));
         CHECK(Near(ParseCullFov("200"), 150.0) && Near(ParseCullFov("10"), 60.0) && Near(ParseCullFov("x"), 130.0));
     }
+    {
+        // The cull FOV past the pitch clamp: unchanged while the eye's far edge (55 deg) stays inside
+        // limit + fov / 2, then just wide enough, capped at 150.
+        for (double pitch : {0.0, 30.0, 60.0, 70.0, -70.0}) CHECK(Near(CullFovForPitch(130.0, Deg(pitch)), 130.0, 1e-9));
+        CHECK(Near(CullFovForPitch(130.0, Deg(75)), 140.0, 1e-9) && Near(CullFovForPitch(130.0, Deg(-75)), 140.0, 1e-9));
+        CHECK(Near(CullFovForPitch(130.0, Deg(-80)), 150.0, 1e-9) && Near(CullFovForPitch(130.0, Deg(-90)), 150.0, 1e-9));
+        CHECK(Near(CullFovForPitch(100.0, Deg(-62)), 114.0, 1e-9));  // a narrower setting widens sooner
+        CHECK(Near(CullFovForPitch(150.0, Deg(-90)), 150.0, 1e-9));
+        for (double pitch = -90.0; pitch <= 90.0; pitch += 1.0) {
+            // Covered wherever the cap allows: limit + fov / 2 >= |pitch| + edge.
+            const double fov = CullFovForPitch(130.0, Deg(pitch));
+            CHECK(fov >= 130.0 && fov <= 150.0);
+            CHECK(fov >= 150.0 - 1e-9 || 60.0 + fov / 2.0 >= std::fabs(pitch) + kEyeEdgeDegrees - 1e-9);
+        }
+        CHECK(Near(CullFovForPitch(130.0, NAN), 130.0) && Near(CullFovForPitch(NAN, 0.0), 130.0));
+        GameHead down;
+        down.Valid = true;
+        down.Forward = {0, -2, 0};
+        CHECK(Near(HeadPitch(down), Deg(-90), 1e-12) && Near(HeadPitch(GameHead{}), 0.0));
+    }
     Report("camera_write");
 }
 
@@ -153,6 +173,47 @@ void TestOwner() {
         in.Setting = 0;
         in.PlayerValid = false;
         CHECK(!DecideOwner(in).Vr);
+        // The probes run over every Held row a scene entry or a door can leave behind (the walk-in's
+        // 0x20000000, status != 7 after a load, item gets, a subcamera ...), never over a screen row, a
+        // missing player, another camera or mode L.
+        struct Grant {
+            uint32_t Flags1;
+            int16_t Status, Scene, ActiveCamera, Setting;
+            uint32_t Held;
+        };
+        const Grant grants[] = {
+            {0x20000000U, 7, 1, 0, 0, kHeldCutscene}, {0, 3, 1, 0, 0, kHeldStatus},
+            {0x400U, 7, 1, 0, 0, kHeldItem},          {0x10000000U, 7, 1, 0, 0, kHeldItem},
+            {0, 7, 1, 2, 0, kHeldSecondaryCamera},    {0x20U, 7, 1, 0, 0, kHeldState},
+            {0x200U, 7, 1, 0, 0, kHeldState},         {0, 7, 1, 0, 0x14, kHeldSetting},
+            {0, 7, 0x45, 0, 0, kHeldScene},
+        };
+        for (const auto& grant : grants) {
+            auto probe = Gameplay();
+            probe.LayerWorld = false;
+            probe.Probing = true;
+            probe.Flags1 = grant.Flags1;
+            probe.Status = grant.Status;
+            probe.Scene = grant.Scene;
+            probe.ActiveCamera = grant.ActiveCamera;
+            probe.Setting = grant.Setting;
+            const auto g = DecideOwner(probe);
+            CHECK(g.Vr && g.Probe && g.Held == 0U && g.ProbeHeld == grant.Held);
+            probe.Probing = false;  // the same row without a pending placement: native
+            CHECK(!DecideOwner(probe).Vr && (DecideOwner(probe).Held & grant.Held) != 0U);
+        }
+        auto blocked = Gameplay();
+        blocked.LayerWorld = false;
+        blocked.Probing = true;
+        CHECK(DecideOwner(blocked).Probe && DecideOwner(blocked).ProbeHeld == 0U);
+        blocked.ForceHeld = true;
+        CHECK(!DecideOwner(blocked).Vr && (DecideOwner(blocked).Held & kHeldConfig) != 0U);
+        blocked.ForceHeld = false;
+        blocked.Flags1 = 0x00100000U;  // first person
+        CHECK(!DecideOwner(blocked).Vr);
+        blocked.Flags1 = 0x20000000U;
+        blocked.MainCamera = false;
+        CHECK(!DecideOwner(blocked).Vr && DecideOwner(blocked).Held == kHeldNotMain);
     }
     {
         auto in = Gameplay();
@@ -271,14 +332,54 @@ void TestCutsceneMonitor() {
         CHECK(!any);  // a still camera never trips
     }
     {
-        // 3 m in 1 s trips; it holds while the row lasts and clears with it.
+        // A camera that rests settles after 5 still updates (0.2 s): a 3 m move within 1 s then trips; it
+        // holds while the row lasts and clears with it.
         CutsceneCameraMonitor m;
+        for (int i = 0; i < 6; ++i) CHECK(!m.Update(true, i / 30.0, {0, 0, 0}, 0.0, s));
+        CHECK(m.Settled() && m.SettledStill() && Near(m.SettleSeconds(), 5.0 / 30.0, 1e-9));
         bool tripped = false;
-        for (int i = 0; i <= 30 && !tripped; ++i) tripped = m.Update(true, i / 30.0, {i * 0.1 * s, 0, 0}, 0.0, s);
-        CHECK(tripped && m.TripMovedM() > 2.0);
+        int i = 6;
+        for (; i <= 40 && !tripped; ++i) tripped = m.Update(true, i / 30.0, {(i - 5) * 0.1 * s, 0, 0}, 0.0, s);
+        CHECK(tripped && m.TripMovedM() > 2.0 && i <= 30);
         CHECK(m.Update(true, 2.0, {0, 0, 0}, 0.0, s));  // the camera stopped: still Cinema
         CHECK(!m.Update(false, 2.1, {0, 0, 0}, 0.0, s));
+        CHECK(!m.Settled());
         CHECK(!m.Update(true, 2.2, {0, 0, 0}, 0.0, s));
+    }
+    {
+        // A scripted move that never rests: the window opens 0.75 s after the row began, so 3 m/s trips
+        // about 0.7 s after that (and never during the hand-over).
+        CutsceneCameraMonitor m;
+        bool tripped = false;
+        double at = -1.0;
+        for (int i = 0; i <= 90 && !tripped; ++i) {
+            tripped = m.Update(true, i / 30.0, {i * 0.1 * s, 0, 0}, 0.0, s);
+            if (tripped) at = i / 30.0;
+        }
+        CHECK(tripped && m.Settled() && !m.SettledStill() && Near(m.SettleSeconds(), 0.75, 0.034));
+        CHECK(at > 1.3 && at < 1.6);
+    }
+    {
+        // The hand-over: the native camera swings 90 deg and travels 3 m from the head it took over toward its
+        // own view (Normal1's lerp, ~0.4 s to settle), then rests. No trip.
+        CutsceneCameraMonitor m;
+        bool any = false;
+        double yaw = 0.0, x = 0.0;
+        for (int i = 0; i < 90; ++i) {
+            yaw += (Deg(90) - yaw) * 0.25;
+            x += (3.0 * s - x) * 0.25;
+            any |= m.Update(true, i / 30.0, {x, 0, 0}, yaw, s);
+        }
+        CHECK(!any && m.Settled());
+        // A OnePoint subcamera's first cut (a jump) right after the hand-over, then still: no trip either.
+        CutsceneCameraMonitor cut;
+        any = false;
+        for (int i = 0; i < 60; ++i)
+            any |= cut.Update(true, i / 30.0, i < 2 ? M::Vec3{0, 0, 0} : M::Vec3{5 * s, 0, 2 * s}, i < 2 ? 0.0 : Deg(120), s);
+        CHECK(!any && cut.SettledStill());
+        // ... but a cut after the view settled is a scripted move.
+        for (int i = 60; i < 63; ++i) any |= cut.Update(true, i / 30.0, {-3 * s, 0, 0}, Deg(120), s);
+        CHECK(any && cut.Tripped());
     }
     {
         // A slow pan (0.5 m/s, 20 deg/s) for 10 s never trips: no 1 s window exceeds the limits.
@@ -288,18 +389,23 @@ void TestCutsceneMonitor() {
             const double t = i / 30.0;
             any |= m.Update(true, t, {0.5 * s * t, 0, 0}, Deg(20.0 * t), s);
         }
-        CHECK(!any);
+        CHECK(!any && m.Settled());
     }
     {
-        // 50 deg in half a second trips; across the +-pi seam too.
+        // 50 deg in half a second after the view settled trips; across the +-pi seam too.
         CutsceneCameraMonitor m;
+        for (int i = 0; i < 6; ++i) m.Update(true, i / 30.0, {0, 0, 0}, Deg(170), s);
+        CHECK(m.Settled());
         bool tripped = false;
-        for (int i = 0; i <= 15 && !tripped; ++i) tripped = m.Update(true, i / 30.0, {0, 0, 0}, Deg(170 + i * 50.0 / 15), s);
+        for (int i = 1; i <= 15 && !tripped; ++i)
+            tripped = m.Update(true, (5 + i) / 30.0, {0, 0, 0}, Deg(170 + i * 50.0 / 15), s);
         CHECK(tripped && m.TripTurnedDegrees() > 45.0 && m.TripTurnedDegrees() < 60.0);
         CutsceneCameraMonitor still;
         bool any = false;
-        for (int i = 0; i < 30; ++i) any |= still.Update(true, i / 30.0, {0, 0, 0}, i % 2 == 0 ? Deg(179) : Deg(-179), s);
-        CHECK(!any);  // a 2 deg wobble across the seam is not a turn
+        for (int i = 0; i < 60; ++i) any |= still.Update(true, i / 30.0, {0, 0, 0}, i % 2 == 0 ? Deg(179) : Deg(-179), s);
+        CHECK(!any && still.Settled());  // a 2 deg wobble across the seam is not a turn
+        CutsceneCameraMonitor bad;
+        CHECK(!bad.Update(true, 0.0, {NAN, 0, 0}, 0.0, s) && !bad.Settled());
     }
     Report("cutscene_cam");
 }
@@ -313,7 +419,7 @@ void TestGeometry() {
     g.Reset({0, 50, 0});
     {
         // A miss: BgCheckInfo backs the end off 1 u toward q.
-        const auto seg = g.Segment({10, 50, 0});
+        const auto seg = g.Segment({10, 50, 0}, {-40, 50, 0});
         CHECK(NearVec(seg.From, {0, 50, 0}) && NearVec(seg.To, {10, 50, 0}));
         const auto step = g.Update({10, 50, 0}, {9, 50, 0}, floorY, s);
         CHECK(step.Clear && step.Fade == 0.0 && NearVec(g.Q(), {10, 50, 0}));
@@ -352,6 +458,118 @@ void TestGeometry() {
         // Non-finite collided: treated as clear (no stuck fade from a failed read).
         g.Reset({0, 50, 0});
         CHECK(g.Update({10, 50, 0}, {NAN, 0, 0}, floorY, s).Clear);
+    }
+    // The scenes below: a house wall at x = 20 (solid beyond), Link's head at x = -40 in the open.
+    const M::Vec3 link{-40, 50, 0};
+    // BgCheckInfo against that wall: a crossing segment ends 1 u out of the wall on the side it came from, a
+    // miss 1 u short of its end.
+    const auto wall = [](const GeometrySegment& seg) {
+        const M::Vec3 d = seg.To - seg.From;
+        const double length = M::Length(d);
+        if (length < 1e-9) return seg.To;
+        const M::Vec3 dir = d * (1.0 / length);
+        if ((seg.From.X < 20.0) != (seg.To.X < 20.0)) {
+            const double hitX = seg.From.X < 20.0 ? 19.0 : 21.0;
+            return seg.From + dir * ((hitX - seg.From.X) / dir.X);
+        }
+        return seg.To - dir;
+    };
+    const auto test = [&](HeadInGeometry& geometry, const M::Vec3& head) {
+        return geometry.Update(head, wall(geometry.Segment(head, link)), floorY, s);
+    };
+    {
+        // The head inside the wall stays faded on every update: q's test fades, the rescue from Link's head
+        // (which also crosses the wall) keeps that fade, alternating.
+        HeadInGeometry h;
+        h.Reset({10, 50, 0});
+        auto step = test(h, {26, 50, 0});
+        CHECK(!step.Clear && step.Test == GeometryTest::FromQ && step.Fade > 0.0);
+        const double fade = step.Fade;
+        for (int i = 0; i < 10; ++i) {
+            step = test(h, {26, 50, 0});
+            CHECK(!step.Clear && Near(step.Fade, fade, 1e-12));
+            CHECK(step.Test == (i % 2 == 0 ? GeometryTest::FromLink : GeometryTest::FromQ));
+        }
+        CHECK(NearVec(h.Q(), {10, 50, 0}));
+        // A snap turn pivots on the head: nothing is reset, the head is still inside, still faded.
+        step = test(h, {26, 50, 0});
+        CHECK(step.Fade > 0.0);
+        // Stepping back out clears it.
+        step = test(h, {15, 50, 0});
+        CHECK(step.Clear && step.Fade == 0.0 && NearVec(h.Q(), {15, 50, 0}));
+    }
+    {
+        // A stale q (the head walked around a pillar while the host did not own the camera): q -> head
+        // crosses geometry once, the rescue from Link's head is clear next update and clears the fade.
+        HeadInGeometry h;
+        h.Reset({30, 50, 0});  // q on the far side of the wall at x = 20 ...
+        auto step = test(h, {10, 50, 0});  // ... the head back in Link's open space
+        CHECK(!step.Clear && step.Fade > 0.0);
+        step = test(h, {10, 50, 0});
+        CHECK(step.Clear && step.Test == GeometryTest::FromLink && step.Fade == 0.0 && NearVec(h.Q(), {10, 50, 0}));
+        // With the soft reseed (the session marks the first owned update after Held ones) the first test is
+        // already Link's: no dark update at all.
+        h.Reset({30, 50, 0});
+        h.ReseedSoft();
+        CHECK(h.PendingReseed() == GeometryReseed::Soft);
+        const auto seg = h.Segment({10, 50, 0}, link);
+        CHECK(NearVec(seg.From, link) && NearVec(seg.To, {10, 50, 0}));
+        step = h.Update({10, 50, 0}, wall(seg), floorY, s);
+        CHECK(step.Clear && step.Reseed == GeometryReseed::Soft && step.Fade == 0.0 && !step.ReseedHit);
+        CHECK(h.PendingReseed() == GeometryReseed::None);
+    }
+    {
+        // A soft reseed that hits keeps the last fade (0 here) and hands back to q next update.
+        HeadInGeometry h;
+        h.Reset({10, 50, 0});
+        h.ReseedSoft();
+        auto step = test(h, {26, 50, 0});
+        CHECK(!step.Clear && !step.ReseedHit && step.Fade == 0.0 && step.Test == GeometryTest::FromLink);
+        step = test(h, {26, 50, 0});
+        CHECK(step.Test == GeometryTest::FromQ && step.Fade > 0.0);
+        // ... and a fade held over Held updates survives a soft reseed that hits.
+        h.ReseedSoft();
+        const double held = h.LastFade();
+        step = test(h, {26, 50, 0});
+        CHECK(step.Test == GeometryTest::FromLink && Near(step.Fade, held, 1e-12) && held > 0.0);
+    }
+    {
+        // A blink: the hard reseed tests from Link's head. Clear: q = the head. A hit: ReseedHit (the
+        // session re-places) with the depth shown meanwhile.
+        HeadInGeometry h;
+        h.Reset({-100, 50, 0});
+        h.ReseedHard();
+        auto step = test(h, {0, 50, 0});
+        CHECK(step.Clear && step.Reseed == GeometryReseed::Hard && !step.ReseedHit && NearVec(h.Q(), {0, 50, 0}));
+        h.ReseedHard();
+        step = test(h, {30, 50, 0});  // landed 10 u inside the wall
+        CHECK(!step.Clear && step.ReseedHit && step.Reseed == GeometryReseed::Hard && step.Fade > 0.0);
+        CHECK(h.PendingReseed() == GeometryReseed::None);
+        // A hard reseed overrides a pending soft one; a soft one never downgrades a hard one.
+        h.ReseedSoft();
+        h.ReseedHard();
+        CHECK(h.PendingReseed() == GeometryReseed::Hard);
+        h.ReseedSoft();
+        CHECK(h.PendingReseed() == GeometryReseed::Hard);
+        // A placement clears everything.
+        h.Reset({0, 50, 0});
+        CHECK(h.PendingReseed() == GeometryReseed::None && h.LastFade() == 0.0);
+    }
+    {
+        // Below Link's floor wins over a clear rescue; a non-finite Link head falls back to q.
+        HeadInGeometry h;
+        h.Reset({0, 50, 0});
+        h.ReseedSoft();
+        auto step = test(h, {0, 2, 0});
+        CHECK(step.BelowFloor && step.Fade == 1.0);
+        h.Reset({0, 50, 0});
+        h.ReseedHard();
+        const auto seg = h.Segment({5, 50, 0}, {NAN, 0, 0});
+        CHECK(NearVec(seg.From, {0, 50, 0}));
+        step = h.Update({5, 50, 0}, wall(seg), floorY, s);
+        CHECK(step.Clear && step.Test == GeometryTest::FromQ);
+        CHECK(std::string_view(GeometryTestName(GeometryTest::FromLink)) == "link" &&
+              std::string_view(GeometryReseedName(GeometryReseed::Hard)) == "hard");
     }
     Report("geometry");
 }

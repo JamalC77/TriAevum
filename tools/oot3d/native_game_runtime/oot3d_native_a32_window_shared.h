@@ -573,6 +573,7 @@ struct NativeCandidateDispatchState {
   // immersive world mode with the TopScreen profile; TopScreenCamera.Vr points at it at every
   // Camera_Update entry (a savestate load resets TopScreenCamera).
   std::shared_ptr<Oot3dNativeGame::TopScreenVrCameraSource> VrCamera;
+  // Developer free camera (inactive unless F1 > Dev Tools turns it on).
   std::shared_ptr<Oot3dNativeGame::DevFreeCamera> DevFreeCamera =
       std::make_shared<Oot3dNativeGame::DevFreeCamera>();
   bool DevFreeCameraReported = false;

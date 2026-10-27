@@ -144,10 +144,15 @@ void Pulse(int hand, uint32_t milliseconds);
 // shows. Both any thread, applied on the next display frame.
 void SetWallFade(float alpha);
 void SetVignette(float strength);
-// Right stick X flicks (> 0.7, re-armed below 0.3) while the world shows, since the last take: + right,
-// - left (snap turns, §5.5). Its Y flicks press the D-pad (up / down) for the game instead (§7).
+// W2's right-stick job (§5.5, §7), set by the guest at window setup: armed in mode R and mode L, off for
+// the TRIAEVUM_XR_CAMERA=native A/B baseline (W1's right stick: it moves Link while the left stick is
+// idle). Armed, the right stick moves Link only while the left controller is inactive
+// (RightStickMove::WhenLeftInactive) and takes flicks only while it is active. Any thread.
+void SetWorldFlicks(bool armed);
+// Right stick X flicks (> 0.7, re-armed below 0.3) while the world shows and flicks are taken, since the
+// last take: + right, - left (snap turns, §5.5). Its Y flicks press the D-pad (up / down) for the game.
 int32_t TakeSnapTurns();
-// The right stick's X while the world shows (the smooth-turn option, TRIAEVUM_XR_TURN=smooth); 0 else.
+// The right stick's X while flicks are taken (the smooth-turn option, TRIAEVUM_XR_TURN=smooth); 0 else.
 float WorldTurnAxis();
 
 }  // namespace TriAevumQuestXr

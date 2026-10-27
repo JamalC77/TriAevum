@@ -51,6 +51,9 @@ class TopScreenVrCameraSource {
   // FovScalar 0x00478EB8 of the main view: the unclamped FOV while the host owned the last main-camera
   // update; `loaded` is the view's FOV as the native code loads it (the readback of play+0x198).
   virtual bool Fov(float loaded, float *degrees) = 0;
+  // When Fov declined: the value the native path resolves. A host FOV left in play+0x198 with no native
+  // camera update since (the pause screen stops Camera_Update) is replaced by the last native one.
+  virtual float NativeLoadedFov(float loaded) { return loaded; }
 };
 
 enum class TopScreenCameraGuestPhase : std::uint8_t {

@@ -12,6 +12,10 @@
 //    Camera_Update (VrCameraSource, oot3d_native_vr_camera.h) the owner decision of §4.3, the camera write
 //    from the head predicted for T_N, the head-in-geometry segment and its wall fade, the placement probes
 //    that hold a placement in Black, the cutscene-camera motion test, R_always for the actor culling.
+//    Every rig change (turns, recenters, the placement a probe run chose, following Link, the floor) is
+//    applied there too, before the head is computed (§4.5), so the frame a camera write culled is drawn
+//    with the same rig; StampFrame then publishes (rig, epoch) with the frame. Without the hook (W1's
+//    TRIAEVUM_XR_CAMERA=native, mode L) StampFrame applies them as in W1.
 //  - The stick (§7): the Circle Pad of each guest refresh rotated from the camera yaw to psi_ref.
 //  - The frame state each render command is drawn with, and TRIAEVUM_XR_TICK / _CAMWRITE every 5 s.
 #pragma once
@@ -115,8 +119,12 @@ class XrWorldSession {
     // The update's BgCheck result: the collided end of the segment Begin returned.
     void CommitCameraUpdate(const XrMath::Vec3& collided);
     void NoteCameraQuake(bool active);
-    // FovScalar of the main view: the cull FOV while the head owned the last main-camera update.
+    // FovScalar of the main view: the cull FOV while the head owned the last main-camera update and the
+    // hook still runs (the world shows).
     bool CameraFov(float loaded, float* degrees);
+    // The FovScalar's loaded value for the native path: a cull FOV the host left in play+0x198 with no
+    // native camera update since (the pause screen stops Camera_Update) becomes the last native FOV.
+    float NativeLoadedFov(float loaded);
 
     // §7: the Circle Pad of one guest refresh (SampleGuestRefreshInput), rotated in place.
     void RotateStick(const XrGuestSnapshot& snapshot, bool ocarina, int16_t& x, int16_t& y);
@@ -147,12 +155,14 @@ class XrWorldSession {
     void StartPlacement(const XrGuestSnapshot& snapshot, const char* reason, double now);
     void FinishPendingPlacement(const XrGuestSnapshot& snapshot, double now, bool force);
     void ApplyRigInputs(const XrGuestSnapshot& snapshot, double now, double dt);
+    // Following Link (§5.3) and the floor (§5.4): at Camera_Update while the hook runs, else at the stamp.
+    void FollowLink(const XrGuestSnapshot& snapshot, double dt, bool frozen);
     void BumpEpoch(const char* event, double distanceM);
     void LogRig(const char* event, double distanceM);
     void LogFlags(const XrGuestSnapshot& snapshot, const char* reason);
     void LogDecision(const XrCamera::OwnerDecision& decision, const XrGuestSnapshot& snapshot,
                      const XrCameraGuest& camera);
-    void SetWallFade(double fade);
+    void SetWallFade(double fade, const char* cause);
     void SetVignette(double strength);
     void PublishActorHead(bool valid, const XrMath::Vec3& head);
     XrMath::Vec3 LinkVrWorld(const XrGuestSnapshot& snapshot, bool floor) const;
@@ -160,6 +170,7 @@ class XrWorldSession {
     bool HeadAt(int64_t displayTimeNs, XrMath::Pose* head) const;
     bool HookLive(double now) const { return mModeR && mLastCameraUpdate >= 0.0 && now - mLastCameraUpdate < 0.25; }
     double ProbeLengthM() const;
+    XrMath::Vec3 LinkHeadGame(const XrGuestSnapshot& snapshot) const;
 
     XrFrameState mState;
     XrWorld::XrTickPacer mPacer;
@@ -169,6 +180,10 @@ class XrWorldSession {
     XrWorld::XrWorldState mRequested = XrWorld::XrWorldState::Cinema;
     bool mRigValid = false;
     XrMath::Rig mRig;
+    uint32_t mRigEpoch = 0;  // the rig's epoch; published as mState.RigEpoch with mRig at the stamp
+    // The classifier's last state and blockers (StampFrame), for the decisions taken at Camera_Update.
+    XrWorld::XrWorldState mClassifierState = XrWorld::XrWorldState::Cinema;
+    uint32_t mClassifierBlockers = 0;
     XrMath::TetherConfig mTether;
     XrMath::TetherState mTetherState;
     XrMath::FloorConfig mFloorConfig;
@@ -211,20 +226,29 @@ class XrWorldSession {
     XrCamera::OwnerDecision mDecision;
     bool mDecisionLogged = false;
     XrCamera::OwnerDecision mLoggedDecision;
-    bool mOwnedLast = false;            // the last main-camera update was head-owned (FovScalar)
+    bool mOwnedLast = false;            // the last main-camera update was head-owned (FovScalar); cleared
+                                        // when the world stops showing or the hook stops running
+    bool mLastUpdateHeadOwned = false;  // ... the same, never cleared by the stamp (the soft reseed)
+    XrGuestSnapshot mCameraSnapshot;    // the snapshot of the running Camera_Update
     bool mFirstWriteLogged = false;
     XrCamera::CameraWrite mWrite;
     XrCamera::GameHead mHeadGame;
     XrMath::Vec3 mProbeFrom;
     int mProbeIndex = -1;
     XrCamera::HeadInGeometry mGeometry;
-    uint32_t mGeometryEpoch = UINT32_MAX;
+    bool mGeometryResetPending = true;  // a placement: q restarts at the next written head (§4.4)
     double mWallFade = 0.0;
+    double mWriteFov = XrCamera::kDefaultCullFovDegrees;  // the FOV of the last head write (pitch-widened)
+    float mLastHostFov = 0.0F;                             // ... as written to play+0x198
+    float mNativeFov = 0.0F;                               // the last native FOV the FovScalar loaded
+    bool mNativeFovValid = false, mFovRestoring = false;
     XrCamera::PlacementProbes mProbes;
     struct PendingPlacement {
         bool Active = false;
         const char* Reason = "";
         double Since = 0.0;
+        uint32_t HeldBypassed = 0;  // Held reasons the probes ran over (§4.4: they never wait for them)
+        uint32_t HeldUpdates = 0;
     } mPending;
     XrCamera::CutsceneCameraMonitor mCutsceneMonitor;
     bool mCutsceneMoving = false;
@@ -241,8 +265,9 @@ class XrWorldSession {
     // 5 s counters.
     uint64_t mCamUpdates = 0, mCamOwned = 0, mCamProbes = 0, mCamHeld = 0, mHeadFailures = 0, mFovHooks = 0,
              mWallFadeUpdates = 0, mStickRotations = 0, mStickBypassed = 0, mTurns = 0, mQuakes = 0,
-             mSeqSamples = 0, mProbeRuns = 0;
-    double mSeqLagSum = 0.0, mThetaAbsMax = 0.0;
+             mSeqSamples = 0, mProbeRuns = 0, mFovWidened = 0, mFovRestored = 0, mReseeds = 0, mRescues = 0,
+             mReseedHits = 0;
+    double mSeqLagSum = 0.0, mThetaAbsMax = 0.0, mFovMax = 0.0;
     float mFovLoaded = 0.0F;
 };
 

@@ -120,7 +120,7 @@ bool XrWorldSession::ConfigureCamera(bool topScreenProfile) {
         if (!topScreenProfile) reason = "ui_profile";
     }
     mModeR = mCameraMode == XrCameraMode::ModeR;
-    mStickEnabled = mCameraMode != XrCameraMode::Native;
+    const bool native = mCameraMode == XrCameraMode::Native;
     const std::string_view move = EnvText("TRIAEVUM_XR_MOVE_REF");
     if (!move.empty()) {
         if (!C::ParseMoveReference(move, &mMoveRef)) {
@@ -128,16 +128,26 @@ bool XrWorldSession::ConfigureCamera(bool topScreenProfile) {
                        static_cast<int>(move.size()), move.data());
             mMoveRef = C::MoveReference::HeadLatched;
         }
-        mStickEnabled = mMoveRef != C::MoveReference::Native;
+        // The native A/B baseline is W1's: no stick rotation whatever MOVE_REF says.
+        if (native && mMoveRef != C::MoveReference::Native)
+            XrWorldLog("TRIAEVUM_XR_STICK move_ref=%s ignored camera=native", C::MoveReferenceName(mMoveRef));
     }
+    mStickEnabled = !native && mMoveRef != C::MoveReference::Native;
     mCullFov = C::ParseCullFov(std::getenv("TRIAEVUM_XR_CULL_FOV"));
+    mWriteFov = mCullFov;
     const std::string_view turn = EnvText("TRIAEVUM_XR_TURN");
     mSmoothTurn = turn == "smooth";
     if (!turn.empty() && !mSmoothTurn) mTurnDegrees = EnvNumber("TRIAEVUM_XR_TURN", M::kDefaultSnapDegrees, 10.0, 90.0);
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    // W2's right-stick job (§5.5, §7): snap turns and D-pad flicks in mode R and mode L. The native A/B
+    // baseline keeps W1's right stick (it moves Link while the left stick is idle, nothing else).
+    TriAevumQuestXr::SetWorldFlicks(!native);
+#endif
     XrWorldLog("TRIAEVUM_XR_WORLD camera=%s reason=%s ui_profile=%s cull_fov=%.0f move_ref=%s stick=%d turn=%s "
-               "turn_deg=%.0f",
+               "turn_deg=%.0f flicks=%d vignette=%d",
                XrCameraModeName(mCameraMode), reason, topScreenProfile ? "topscreen" : "other", mCullFov,
-               C::MoveReferenceName(mMoveRef), mStickEnabled ? 1 : 0, mSmoothTurn ? "smooth" : "snap", mTurnDegrees);
+               C::MoveReferenceName(mMoveRef), mStickEnabled ? 1 : 0, mSmoothTurn ? "smooth" : "snap", mTurnDegrees,
+               native ? 0 : 1, native ? 0 : 1);
     return mModeR;
 }
 
@@ -251,18 +261,25 @@ void XrWorldSession::LogRig(const char* event, double distanceM) {
     XrWorldLog("TRIAEVUM_XR_RIG event=%s link_t=%.2f,%.2f head_t=%.2f,%.2f psi=%.1f s=%.1f dist_m=%.2f epoch=%u "
                "anchor=%.1f,%.1f,%.1f seat_y=%.2f bounded=%d head=%d",
                event, linkT.X, linkT.Z, hasHead ? head.Position.X : 0.0, hasHead ? head.Position.Z : 0.0,
-               M::RadiansToDegrees(mRig.Yaw), mRig.Scale, distanceM, mState.RigEpoch, mRig.Anchor.X, mRig.Anchor.Y,
+               M::RadiansToDegrees(mRig.Yaw), mRig.Scale, distanceM, mRigEpoch, mRig.Anchor.X, mRig.Anchor.Y,
                mRig.Anchor.Z, mSeatY, mBounded ? 1 : 0, hasHead ? 1 : 0);
 }
 
 void XrWorldSession::BumpEpoch(const char* event, double distanceM) {
-    ++mState.RigEpoch;
+    ++mRigEpoch;
     LogRig(event, distanceM);
 }
 
 double XrWorldSession::ProbeLengthM() const {
     // How far a placement puts Link ahead of Jamal (TRIAEVUM_XR_PLACE_M) plus the probe's 0.3 m margin.
     return mPlaceM + C::ProbeConfig{}.MarginM;
+}
+
+M::Vec3 XrWorldSession::LinkHeadGame(const XrGuestSnapshot& snapshot) const {
+    // TopScreen's look-at height: L + 50 u adult / 38 u child (game world).
+    if (!snapshot.PlayerValid) return {std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0};
+    return M::Vec3{snapshot.Position[0], snapshot.Position[1], snapshot.Position[2]} +
+           M::Vec3{0.0, C::LinkHeadHeightU(snapshot.LinkAge != 0), 0.0};
 }
 
 void XrWorldSession::Place(const XrGuestSnapshot& snapshot, const char* reason, double now,
@@ -323,24 +340,27 @@ void XrWorldSession::Place(const XrGuestSnapshot& snapshot, const char* reason, 
     ++mPlacements;
     const std::string_view why(reason);
     const char* event = why == "door" ? "door" : why == "recenter" ? "recenter" : "place";
-    ++mState.RigEpoch;
+    ++mRigEpoch;
     XrWorldLog("TRIAEVUM_XR_RIG event=%s reason=%s link_t=%.2f,%.2f head_t=%.2f,%.2f psi=%.1f s=%.1f dist_m=%.2f "
                "near_centre=%d epoch=%u anchor=%.1f,%.1f,%.1f eye_height_m=%.2f seat_y=%.2f bounded=%d probed=%d",
                event, reason, result.LinkT.X, result.LinkT.Z, head.Position.X, head.Position.Z,
                M::RadiansToDegrees(mRig.Yaw), mRig.Scale, result.DistanceM, result.NearCentre ? 1 : 0,
-               mState.RigEpoch, mRig.Anchor.X, mRig.Anchor.Y, mRig.Anchor.Z, mEyeHeightM, mSeatY, mBounded ? 1 : 0,
+               mRigEpoch, mRig.Anchor.X, mRig.Anchor.Y, mRig.Anchor.Z, mEyeHeightM, mSeatY, mBounded ? 1 : 0,
                probes != nullptr && probes->Used && probes->Choice.Probed ? 1 : 0);
     if (probes != nullptr && probes->Used) {
         const auto& c = probes->Choice;
         const auto clear = [&](size_t i) { return std::isfinite(c.ClearM[i]) ? c.ClearM[i] : -1.0; };
+        // held_bypassed: the Held rows the probes ran over (a walk-in, status != 7 after a load ...).
         XrWorldLog("TRIAEVUM_XR_PROBE reason=%s choice=%s offset_deg=%.0f dist_m=%.2f placed_m=%.2f "
-                   "clear_m=%.2f,%.2f,%.2f,%.2f,%.2f probes=%d fallback=%d timeout=%d",
+                   "clear_m=%.2f,%.2f,%.2f,%.2f,%.2f probes=%d fallback=%d timeout=%d wait_s=%.2f "
+                   "held_bypassed=0x%04X (%s) held_updates=%u",
                    reason, c.Name, Degrees(c.OffsetYaw), std::isfinite(c.DistanceM) ? c.DistanceM : -1.0,
                    result.DistanceM, clear(0), clear(1), clear(2), clear(3), clear(4), c.Count, c.Fallback ? 1 : 0,
-                   probes->TimedOut ? 1 : 0);
+                   probes->TimedOut ? 1 : 0, mPending.Active ? now - mPending.Since : 0.0, mPending.HeldBypassed,
+                   C::HeldNames(mPending.HeldBypassed).c_str(), mPending.HeldUpdates);
     }
-    mGeometryEpoch = UINT32_MAX;  // q restarts at the placed head (§4.4)
-    SetWallFade(0.0);
+    mGeometryResetPending = true;  // q restarts at the placed head (§4.4)
+    SetWallFade(0.0, "place");
 #if defined(TRIAEVUM_QUEST_OPENXR)
     TriAevumQuestXr::Pulse(2, 60);
 #endif
@@ -352,7 +372,7 @@ void XrWorldSession::StartPlacement(const XrGuestSnapshot& snapshot, const char*
         Place(snapshot, reason, now);
         return;
     }
-    mPending = {true, reason, now};
+    mPending = {true, reason, now, 0U, 0U};
     mProbes.Start(ProbeLengthM());
     ++mProbeRuns;
     XrWorldLog("TRIAEVUM_XR_PROBE start reason=%s length_m=%.2f", reason, mProbes.LengthM());
@@ -367,18 +387,20 @@ void XrWorldSession::FinishPendingPlacement(const XrGuestSnapshot& snapshot, dou
     outcome.Used = true;
     outcome.Choice = mProbes.Choose();
     outcome.TimedOut = !done;
-    const uint32_t before = mState.RigEpoch;
+    const uint32_t before = mRigEpoch;
     Place(snapshot, mPending.Reason, now, &outcome);
-    if (mState.RigEpoch == before) return;  // no head yet: kept pending (the probes stay valid)
+    if (mRigEpoch == before) return;  // no head yet: kept pending (the probes stay valid)
     mPending.Active = false;
     mProbes.Cancel();
 }
 
-void XrWorldSession::SetWallFade(double fade) {
+void XrWorldSession::SetWallFade(double fade, const char* cause) {
     fade = std::clamp(std::isfinite(fade) ? fade : 0.0, 0.0, 1.0);
+    // cause: q | link (the test from Link's head) | below_floor | reseed | place | layer.
     if ((fade > 0.0) != (mWallFade > 0.0))
-        XrWorldLog("TRIAEVUM_XR_GEOMETRY fade=%.2f q=%.1f,%.1f,%.1f head=%.1f,%.1f,%.1f", fade, mGeometry.Q().X,
-                   mGeometry.Q().Y, mGeometry.Q().Z, mHeadGame.Position.X, mHeadGame.Position.Y, mHeadGame.Position.Z);
+        XrWorldLog("TRIAEVUM_XR_GEOMETRY fade=%.2f cause=%s q=%.1f,%.1f,%.1f head=%.1f,%.1f,%.1f", fade, cause,
+                   mGeometry.Q().X, mGeometry.Q().Y, mGeometry.Q().Z, mHeadGame.Position.X, mHeadGame.Position.Y,
+                   mHeadGame.Position.Z);
     if (fade == mWallFade) return;
     mWallFade = fade;
 #if defined(TRIAEVUM_QUEST_OPENXR)
@@ -421,19 +443,22 @@ void XrWorldSession::LogDecision(const C::OwnerDecision& d, const XrGuestSnapsho
                                  const XrCameraGuest& camera) {
     const bool changed = !mDecisionLogged || d.Vr != mLoggedDecision.Vr || d.Probe != mLoggedDecision.Probe ||
                          d.Held != mLoggedDecision.Held || d.RigFrozen != mLoggedDecision.RigFrozen ||
-                         d.Talking != mLoggedDecision.Talking || d.ZTarget != mLoggedDecision.ZTarget;
+                         d.Talking != mLoggedDecision.Talking || d.ZTarget != mLoggedDecision.ZTarget ||
+                         d.ProbeHeld != mLoggedDecision.ProbeHeld;
     if (!changed) return;
     // Held entries by reason (the W2 exit's list).
     const uint32_t entered = d.Held & ~(mDecisionLogged ? mLoggedDecision.Held : 0U);
     for (size_t bit = 0; bit < mHeldEntries.size(); ++bit)
         if ((entered & (1U << bit)) != 0U) ++mHeldEntries[bit];
-    XrWorldLog("TRIAEVUM_XR_CAMERA owner=%s held=0x%04X (%s) rig_frozen=%d talking=%d shop=%d z_target=%d "
-               "layer=%s pending=%d flags1=0x%08X flags2=0x%08X setting=0x%02X status=%d active_camera=%d "
-               "scene=0x%X cutscene=0x%X",
-               Owner(d), d.Held, C::HeldNames(d.Held).c_str(), d.RigFrozen ? 1 : 0, d.Talking ? 1 : 0,
+    // probe_held: the Held rows a placement probe runs over; wall_fade is kept through Held updates.
+    XrWorldLog("TRIAEVUM_XR_CAMERA owner=%s held=0x%04X (%s) probe_held=0x%04X rig_frozen=%d talking=%d shop=%d "
+               "z_target=%d layer=%s pending=%d wall_fade=%.2f flags1=0x%08X flags2=0x%08X setting=0x%02X status=%d "
+               "active_camera=%d scene=0x%X cutscene=0x%X",
+               Owner(d), d.Held, C::HeldNames(d.Held).c_str(), d.ProbeHeld, d.RigFrozen ? 1 : 0, d.Talking ? 1 : 0,
                d.Shop ? 1 : 0, d.ZTarget ? 1 : 0, W::XrWorldStateName(mState.Mode), mPending.Active ? 1 : 0,
-               snapshot.Flags1, snapshot.Flags2, static_cast<unsigned>(static_cast<uint16_t>(camera.Setting)),
-               camera.Status, snapshot.ActiveCamera, static_cast<unsigned>(static_cast<uint16_t>(snapshot.Scene)),
+               mWallFade, snapshot.Flags1, snapshot.Flags2,
+               static_cast<unsigned>(static_cast<uint16_t>(camera.Setting)), camera.Status, snapshot.ActiveCamera,
+               static_cast<unsigned>(static_cast<uint16_t>(snapshot.Scene)),
                static_cast<unsigned>(snapshot.CutsceneIndex));
     if (d.Vr && !d.Probe && (!mLoggedDecision.Vr || mLoggedDecision.Probe || !mDecisionLogged)) mFirstWriteLogged = false;
     mLoggedDecision = d;
@@ -445,18 +470,21 @@ void XrWorldSession::LogDecision(const C::OwnerDecision& d, const XrGuestSnapsho
 void XrWorldSession::ApplyRigInputs(const XrGuestSnapshot& snapshot, double now, double dt) {
     mLastRigInputs = now;
 #if defined(TRIAEVUM_QUEST_OPENXR)
-    const int32_t turns = TriAevumQuestXr::TakeSnapTurns();
+    // The native A/B baseline has no turns (its right stick is W1's; the XR side takes no flicks then).
+    const bool turnsOn = mCameraMode != XrCameraMode::Native;
+    const int32_t taken = TriAevumQuestXr::TakeSnapTurns();
+    const int32_t turns = turnsOn ? taken : 0;
     const bool worldShown = mState.Mode == W::XrWorldState::World && mRigValid && !mPending.Active;
     const uint32_t recenters = TriAevumQuestXr::TakeWorldRecenter();
     if (recenters != 0U && worldShown && snapshot.PlayerValid) {
         // Black at once; the placement that follows (probed when the hook is live) fades it in.
-        TriAevumQuestXr::RequestBlink(mState.RigEpoch + 1U, 150);
+        TriAevumQuestXr::RequestBlink(mRigEpoch + 1U, 150);
         if (HookLive(now)) {
             StartPlacement(snapshot, "recenter", now);
         } else {
-            const uint32_t before = mState.RigEpoch;
+            const uint32_t before = mRigEpoch;
             Place(snapshot, "recenter", now);
-            if (mState.RigEpoch != before) TriAevumQuestXr::RequestBlink(mState.RigEpoch, 150);
+            if (mRigEpoch != before) TriAevumQuestXr::RequestBlink(mRigEpoch, 150);
         }
         return;
     }
@@ -469,12 +497,13 @@ void XrWorldSession::ApplyRigInputs(const XrGuestSnapshot& snapshot, double now,
         mRig = M::SnapTurn(mRig, head.Position, direction, M::DegreesToRadians(mTurnDegrees));
         ++mTurns;
         ++mBlinks;
+        // The turn pivots on the head (head_w does not move): q stays valid, no reseed (§4.4).
         BumpEpoch("turn", 0.0);
-        XrWorldLog("TRIAEVUM_XR_TURN dir=%s step_deg=%.0f psi=%.1f flicks=%d", direction > 0 ? "right" : "left",
-                   mTurnDegrees, Degrees(mRig.Yaw), turns);
-        TriAevumQuestXr::RequestBlink(mState.RigEpoch, 80);
+        XrWorldLog("TRIAEVUM_XR_TURN dir=%s step_deg=%.0f psi=%.1f flicks=%d wall_fade=%.2f",
+                   direction > 0 ? "right" : "left", mTurnDegrees, Degrees(mRig.Yaw), turns, mWallFade);
+        TriAevumQuestXr::RequestBlink(mRigEpoch, 80);
         TriAevumQuestXr::Pulse(1, 25);
-    } else if (mSmoothTurn && dt > 0.0) {
+    } else if (mSmoothTurn && turnsOn && dt > 0.0) {
         const float axis = TriAevumQuestXr::WorldTurnAxis();
         if (std::fabs(axis) > 0.2F) {
             const double rate = -static_cast<double>(axis) * M::DegreesToRadians(mSmoothTurnDegreesPerSecond);
@@ -489,6 +518,54 @@ void XrWorldSession::ApplyRigInputs(const XrGuestSnapshot& snapshot, double now,
 #endif
 }
 
+// Following Link (§5.3, §5.4): the leash blink, the idle re-centre, the glide and the floor. Not while a Held
+// row freezes the rig (talks, shops, item gets, cutscenes, subcameras). A blink moves the head in the game
+// world, so the head-in-geometry test is reseeded from Link's head (§4.4).
+void XrWorldSession::FollowLink(const XrGuestSnapshot& snapshot, double dt, bool frozen) {
+    mAnchorSpeedMps = 0.0;
+    if (mClassifierState != W::XrWorldState::World || !mRigValid || mPending.Active || !snapshot.PlayerValid ||
+        frozen || !(dt > 0.0))
+        return;
+    M::Pose head;
+    if (!HeadInTracking(&head)) return;
+    const M::Vec3 linkWorld = LinkVrWorld(snapshot, false);
+    const double facing = M::YawToVrWorld(M::BinAngleToRadians(snapshot.ShapeYaw), mState.Mirrored);
+    const auto tether = M::UpdateTether(mTetherState, mTether, mRig, linkWorld, facing, head.Position, dt);
+    if (tether.Event == M::RigEvent::Blink || tether.Event == M::RigEvent::Idle) {
+        mRig = tether.NewRig;
+        ++mBlinks;
+        BumpEpoch(M::RigEventName(tether.Event), tether.HeadDistanceM);
+        mGeometry.ReseedHard();
+#if defined(TRIAEVUM_QUEST_OPENXR)
+        TriAevumQuestXr::RequestBlink(mRigEpoch, 120);
+#endif
+    } else if (tether.Event == M::RigEvent::Glide) {
+        mRig = tether.NewRig;
+        mAnchorSpeedMps = std::max(mAnchorSpeedMps, tether.AnchorSpeedMps);
+    }
+    M::FloorInput floor;
+    floor.LinkY = linkWorld.Y;
+    floor.FloorY = std::isfinite(snapshot.FloorHeight) ? snapshot.FloorHeight : std::numeric_limits<double>::quiet_NaN();
+    floor.Hanging = (snapshot.Flags1 & kFlags1Hanging) != 0U;
+    floor.Climbing = (snapshot.Flags1 & kFlags1Climbing) != 0U;
+    floor.Swimming = (snapshot.Flags1 & kFlags1Swimming) != 0U;
+    floor.WaterY = std::isfinite(snapshot.WaterY) ? snapshot.WaterY : std::numeric_limits<double>::quiet_NaN();
+    floor.EyeHeightM = mEyeHeightM;
+    floor.Scale = mScale;
+    floor.Dt = dt;
+    const auto floorStep = M::UpdateFloor(mFloor, mFloorConfig, floor);
+    if (std::isfinite(floorStep.AnchorY)) mRig.Anchor.Y = floorStep.AnchorY;
+    mAnchorSpeedMps = std::max(mAnchorSpeedMps, floorStep.SpeedMps);
+    if (floorStep.Blink) {
+        ++mBlinks;
+        BumpEpoch("floor", 0.0);
+        mGeometry.ReseedHard();
+#if defined(TRIAEVUM_QUEST_OPENXR)
+        TriAevumQuestXr::RequestBlink(mRigEpoch, 120);
+#endif
+    }
+}
+
 XrCameraUpdate XrWorldSession::BeginCameraUpdate(const XrGuestSnapshot& snapshot, const XrCameraGuest& camera,
                                                  uint64_t recording) {
     XrCameraUpdate update;
@@ -497,8 +574,28 @@ XrCameraUpdate XrWorldSession::BeginCameraUpdate(const XrGuestSnapshot& snapshot
     const double dt = mLastCameraUpdate < 0.0 ? 0.0 : std::clamp(now - mLastCameraUpdate, 0.0, 0.2);
     mLastCameraUpdate = now;
     mRecordingSequence = recording;
+    mCameraSnapshot = snapshot;
     ++mCamUpdates;
+
+    // Every rig change of this guest frame happens here, before the head is computed (§4.5): turns and
+    // recenters, the placement a finished probe run chose, following Link and the floor. The frame this
+    // update culls is then drawn with the same rig (StampFrame only publishes it).
     ApplyRigInputs(snapshot, now, dt);
+    if (mPending.Active && snapshot.PlayerValid) FinishPendingPlacement(snapshot, now, false);
+    {
+        // The rig-freezing rows from the guest's own flags (talks, shops, Held-static rows) and the
+        // classifier's last hold.
+        C::OwnerInput rows;
+        rows.LayerWorld = true;
+        rows.RigValid = rows.HeadValid = true;
+        rows.PlayerValid = snapshot.PlayerValid;
+        rows.Flags1 = snapshot.Flags1;
+        rows.Flags2 = snapshot.Flags2;
+        rows.Setting = camera.Setting;
+        rows.ActiveCamera = snapshot.ActiveCamera;
+        const bool frozen = (mClassifierBlockers & W::kXrHoldRig) != 0U || C::DecideOwner(rows).RigFrozen;
+        FollowLink(snapshot, dt, frozen);
+    }
 
     // The head predicted for this frame's target display time T_N (§3.4 item 2, §4.2).
     M::Pose headT;
@@ -515,7 +612,8 @@ XrCameraUpdate XrWorldSession::BeginCameraUpdate(const XrGuestSnapshot& snapshot
 
     C::OwnerInput in;
     in.MainCamera = true;
-    in.LayerWorld = mState.Mode == W::XrWorldState::World && mRigValid && !mPending.Active;
+    // The classifier's state, not the last shown one: a placement finished above owns this very update.
+    in.LayerWorld = mClassifierState == W::XrWorldState::World && mRigValid && !mPending.Active;
     in.Probing = mPending.Active && mProbes.Active();
     in.RigValid = mRigValid;
     in.HeadValid = mHeadGame.Valid;
@@ -532,17 +630,25 @@ XrCameraUpdate XrWorldSession::BeginCameraUpdate(const XrGuestSnapshot& snapshot
     mDecision = C::DecideOwner(in);
     // The cutscene camera's motion (§4.3): the view the game drew last, never while talking. The view
     // at the first Held-static update is still the head the host wrote: sampling starts once the native
-    // camera has run one update, so the hand-over itself is never a move.
+    // camera has run one update, and the window opens only once the hand-over settled (the native camera's
+    // catch-up from the head is not a move).
     mHeldStaticRun = mDecision.HeldStatic ? mHeldStaticRun + 1U : 0U;
     const M::Vec3 view = camera.ViewEye;
     const M::Vec3 look = camera.ViewAt - camera.ViewEye;
     const bool wasMoving = mCutsceneMoving;
+    const bool wasSettled = mCutsceneMonitor.Settled();
     mCutsceneMoving = mCutsceneMonitor.Update(mDecision.HeldStatic && !mDecision.Talking && mHeldStaticRun >= 2U,
                                               now, view, std::atan2(look.X, look.Z), mScale);
+    if (mCutsceneMonitor.Settled() && !wasSettled)
+        XrWorldLog("TRIAEVUM_XR_CAMERA cutscene_camera_settled settle_s=%.2f by=%s held=0x%04X (%s)",
+                   mCutsceneMonitor.SettleSeconds(), mCutsceneMonitor.SettledStill() ? "still" : "time",
+                   mDecision.Held, C::HeldNames(mDecision.Held).c_str());
     if (mCutsceneMoving && !wasMoving)
-        XrWorldLog("TRIAEVUM_XR_CAMERA cutscene_camera_moved moved_m=%.2f turned_deg=%.1f held=0x%04X (%s)",
-                   mCutsceneMonitor.TripMovedM(), mCutsceneMonitor.TripTurnedDegrees(), mDecision.Held,
-                   C::HeldNames(mDecision.Held).c_str());
+        XrWorldLog("TRIAEVUM_XR_CAMERA cutscene_camera_moved moved_m=%.2f turned_deg=%.1f settle_s=%.2f by=%s "
+                   "held=0x%04X (%s)",
+                   mCutsceneMonitor.TripMovedM(), mCutsceneMonitor.TripTurnedDegrees(),
+                   mCutsceneMonitor.SettleSeconds(), mCutsceneMonitor.SettledStill() ? "still" : "time",
+                   mDecision.Held, C::HeldNames(mDecision.Held).c_str());
     LogDecision(mDecision, snapshot, camera);
 
     mOwnedLast = false;
@@ -550,8 +656,11 @@ XrCameraUpdate XrWorldSession::BeginCameraUpdate(const XrGuestSnapshot& snapshot
     if (mDecision.Vr && mDecision.Probe) {
         // A placement probe from Link's head (§4.4); the camera holds where it is.
         ++mCamProbes;
-        const M::Vec3 link{snapshot.Position[0], snapshot.Position[1], snapshot.Position[2]};
-        const M::Vec3 linkHead = link + M::Vec3{0.0, C::LinkHeadHeightU(snapshot.LinkAge != 0), 0.0};
+        if (mDecision.ProbeHeld != 0U) {
+            mPending.HeldBypassed |= mDecision.ProbeHeld;
+            ++mPending.HeldUpdates;
+        }
+        const M::Vec3 linkHead = LinkHeadGame(snapshot);
         C::ProbeRequest request;
         if (mProbes.Next(linkHead, M::BinAngleToRadians(snapshot.ShapeYaw), mScale, &request)) {
             mProbeIndex = request.Index;
@@ -568,12 +677,19 @@ XrCameraUpdate XrWorldSession::BeginCameraUpdate(const XrGuestSnapshot& snapshot
         // The head owns the camera (§4.2): culling, billboards, Z-targets and audio follow it.
         update.Write = C::BuildCameraWrite(mHeadGame);
         if (update.Write.Valid) {
-            if (mGeometryEpoch != mState.RigEpoch || !mGeometry.Valid()) {
-                mGeometry.Reset(mHeadGame.Position);
-                mGeometryEpoch = mState.RigEpoch;
+            if (mGeometryResetPending || !mGeometry.Valid()) {
+                mGeometry.Reset(mHeadGame.Position);  // q = the placed head (§4.4)
+                mGeometryResetPending = false;
+            } else if (!mLastUpdateHeadOwned) {
+                mGeometry.ReseedSoft();  // the head may have walked around something while Held
             }
-            update.Segment = mGeometry.Segment(mHeadGame.Position);
-            update.FovDegrees = static_cast<float>(mCullFov);
+            update.Segment = mGeometry.Segment(mHeadGame.Position, LinkHeadGame(snapshot));
+            // The cull FOV, widened while the head looks past the written pitch's +-60 deg (§6).
+            mWriteFov = C::CullFovForPitch(mCullFov, C::HeadPitch(mHeadGame));
+            if (mWriteFov > mCullFov + 1e-6) ++mFovWidened;
+            mFovMax = std::max(mFovMax, mWriteFov);
+            update.FovDegrees = static_cast<float>(mWriteFov);
+            mLastHostFov = update.FovDegrees;
             update.Own = true;
             mOwnedLast = true;
             ++mCamOwned;
@@ -583,15 +699,15 @@ XrCameraUpdate XrWorldSession::BeginCameraUpdate(const XrGuestSnapshot& snapshot
                 XrWorldLog("TRIAEVUM_XR_CAMWRITE first eye=%.1f,%.1f,%.1f at=%.1f,%.1f,%.1f yaw=%.1f pitch=%.1f "
                            "fov=%.0f head_t=%.2f,%.2f,%.2f target_ns=%lld epoch=%u",
                            mWrite.Eye.X, mWrite.Eye.Y, mWrite.Eye.Z, mWrite.At.X, mWrite.At.Y, mWrite.At.Z,
-                           Degrees(mWrite.Yaw), Degrees(mWrite.Pitch), mCullFov, headT.Position.X, headT.Position.Y,
-                           headT.Position.Z, static_cast<long long>(target), mState.RigEpoch);
+                           Degrees(mWrite.Yaw), Degrees(mWrite.Pitch), mWriteFov, headT.Position.X, headT.Position.Y,
+                           headT.Position.Z, static_cast<long long>(target), mRigEpoch);
             }
         }
     }
-    if (!update.Own) {
-        ++mCamHeld;
-        SetWallFade(0.0);
-    }
+    // Held and head-less updates keep the wall fade (the head is still where it was); only a placement or
+    // the world leaving the view clears it.
+    if (!update.Own) ++mCamHeld;
+    mLastUpdateHeadOwned = mOwnedLast;
     PublishActorHead(mOwnedLast, mHeadGame.Position);
     return update;
 }
@@ -606,7 +722,22 @@ void XrWorldSession::CommitCameraUpdate(const M::Vec3& collided) {
     // Link's floor in the game world is the rig's a.y (the mirror keeps y).
     const auto step = mGeometry.Update(mHeadGame.Position, collided, mRig.Anchor.Y, mScale);
     if (step.Fade > 0.0) ++mWallFadeUpdates;
-    SetWallFade(step.Fade);
+    if (step.Reseed != C::GeometryReseed::None) {
+        ++mReseeds;
+        XrWorldLog("TRIAEVUM_XR_GEOMETRY reseed=%s result=%s p_u=%.1f fade=%.2f head=%.1f,%.1f,%.1f epoch=%u",
+                   C::GeometryReseedName(step.Reseed), step.Clear ? "clear" : "hit", step.PenetrationU, step.Fade,
+                   mHeadGame.Position.X, mHeadGame.Position.Y, mHeadGame.Position.Z, mRigEpoch);
+    } else if (step.Test == C::GeometryTest::FromLink && step.Clear) {
+        ++mRescues;  // q's test had failed; the head is in Link's open space
+    }
+    const char* cause = step.BelowFloor ? "below_floor" : C::GeometryTestName(step.Test);
+    if (step.ReseedHit) {
+        // A blink landed the head in geometry (§4.4): re-placed under black with the probes instead.
+        ++mReseedHits;
+        StartPlacement(mCameraSnapshot, "blink_geometry", Now());
+        cause = "reseed";
+    }
+    SetWallFade(step.Fade, cause);
 }
 
 void XrWorldSession::NoteCameraQuake(bool active) {
@@ -623,11 +754,32 @@ void XrWorldSession::NoteCameraQuake(bool active) {
 }
 
 bool XrWorldSession::CameraFov(float loaded, float* degrees) {
-    if (!mOwnedLast || degrees == nullptr) return false;
+    // Only while the head owned the last main-camera update and Camera_Update still runs: the pause screen
+    // stops Camera_Update with the picture still drawn (StampFrame clears mOwnedLast once the world leaves).
+    if (!mOwnedLast || degrees == nullptr || !HookLive(Now())) return false;
     ++mFovHooks;
     mFovLoaded = loaded;
-    *degrees = static_cast<float>(mCullFov);
+    *degrees = static_cast<float>(mWriteFov);
     return true;
+}
+
+float XrWorldSession::NativeLoadedFov(float loaded) {
+    if (!std::isfinite(loaded)) return loaded;
+    const bool stale = mLastHostFov > 0.0F && loaded == mLastHostFov;
+    if (!stale) {
+        // A native Camera_Update wrote play+0x198 since the host's last write.
+        mNativeFov = loaded;
+        mNativeFovValid = true;
+        mFovRestoring = false;
+        return loaded;
+    }
+    if (!mNativeFovValid) return loaded;
+    ++mFovRestored;
+    if (!mFovRestoring) {
+        mFovRestoring = true;
+        XrWorldLog("TRIAEVUM_XR_CAMWRITE fov_restored loaded=%.1f native=%.1f", loaded, mNativeFov);
+    }
+    return mNativeFov;
 }
 
 void XrWorldSession::RotateStick(const XrGuestSnapshot& snapshot, bool ocarina, int16_t& x, int16_t& y) {
@@ -771,6 +923,8 @@ void XrWorldSession::StampFrame(const XrGuestSnapshot& snapshot, const XrFrameFa
         mLastBlockers = visible;
     }
 
+    mClassifierState = step.State;
+    mClassifierBlockers = step.Blockers;
     if (step.State != W::XrWorldState::World && mPending.Active) {
         XrWorldLog("TRIAEVUM_XR_PROBE cancelled reason=%s state=%s probes=%d", mPending.Reason,
                    W::XrWorldStateName(step.State), mProbes.Count());
@@ -778,77 +932,44 @@ void XrWorldSession::StampFrame(const XrGuestSnapshot& snapshot, const XrFrameFa
         mProbes.Cancel();
     }
     if (step.Place) {
-        StartPlacement(snapshot, step.PlaceReason, now);
+        StartPlacement(snapshot, step.PlaceReason, now);  // probed (and placed at Camera_Update) while the hook runs
     } else if (step.State == W::XrWorldState::World && !mRigValid && !mPending.Active && snapshot.PlayerValid) {
-        // A placement that found no head (tracking lost) is retried each frame; Black meanwhile.
-        Place(snapshot, "retry", now);
+        // A placement that found no head (tracking lost) is retried; Black meanwhile. With the hook it waits
+        // as a pending placement (FinishPendingPlacement retries at each Camera_Update).
+        if (hookLive) StartPlacement(snapshot, "retry", now);
+        else Place(snapshot, "retry", now);
     }
-    if (mPending.Active && snapshot.PlayerValid) FinishPendingPlacement(snapshot, now, false);
-    // Turns and recenters: at Camera_Update while the hook runs, else here.
-    if (!hookLive) ApplyRigInputs(snapshot, now, dt);
-
-    // Following Link (§5.3, §5.4): not while a Held row freezes the rig (talks, item gets, subcameras).
-    mAnchorSpeedMps = 0.0;
-    const bool frozen = (step.Blockers & W::kXrHoldRig) != 0U || (hookLive && mDecision.RigFrozen);
-    if (step.State == W::XrWorldState::World && mRigValid && !mPending.Active && snapshot.PlayerValid && !frozen &&
-        dt > 0.0) {
-        M::Pose head;
-        if (HeadInTracking(&head)) {
-            const M::Vec3 linkWorld = LinkVrWorld(snapshot, false);
-            const double facing = M::YawToVrWorld(M::BinAngleToRadians(snapshot.ShapeYaw), mState.Mirrored);
-            const auto tether = M::UpdateTether(mTetherState, mTether, mRig, linkWorld, facing, head.Position, dt);
-            if (tether.Event == M::RigEvent::Blink || tether.Event == M::RigEvent::Idle) {
-                mRig = tether.NewRig;
-                ++mBlinks;
-                BumpEpoch(M::RigEventName(tether.Event), tether.HeadDistanceM);
-#if defined(TRIAEVUM_QUEST_OPENXR)
-                TriAevumQuestXr::RequestBlink(mState.RigEpoch, 120);
-#endif
-            } else if (tether.Event == M::RigEvent::Glide) {
-                mRig = tether.NewRig;
-                mAnchorSpeedMps = std::max(mAnchorSpeedMps, tether.AnchorSpeedMps);
-            }
-            M::FloorInput floor;
-            floor.LinkY = linkWorld.Y;
-            floor.FloorY = std::isfinite(snapshot.FloorHeight) ? snapshot.FloorHeight
-                                                                : std::numeric_limits<double>::quiet_NaN();
-            floor.Hanging = (snapshot.Flags1 & kFlags1Hanging) != 0U;
-            floor.Climbing = (snapshot.Flags1 & kFlags1Climbing) != 0U;
-            floor.Swimming = (snapshot.Flags1 & kFlags1Swimming) != 0U;
-            floor.WaterY = std::isfinite(snapshot.WaterY) ? snapshot.WaterY : std::numeric_limits<double>::quiet_NaN();
-            floor.EyeHeightM = mEyeHeightM;
-            floor.Scale = mScale;
-            floor.Dt = dt;
-            const auto floorStep = M::UpdateFloor(mFloor, mFloorConfig, floor);
-            if (std::isfinite(floorStep.AnchorY)) mRig.Anchor.Y = floorStep.AnchorY;
-            mAnchorSpeedMps = std::max(mAnchorSpeedMps, floorStep.SpeedMps);
-            if (floorStep.Blink) {
-                ++mBlinks;
-                BumpEpoch("floor", 0.0);
-#if defined(TRIAEVUM_QUEST_OPENXR)
-                TriAevumQuestXr::RequestBlink(mState.RigEpoch, 120);
-#endif
-            }
-        }
+    if (!hookLive) {
+        // Without the hook (W1's TRIAEVUM_XR_CAMERA=native, mode L, the game not updating) the rig changes
+        // here, as in W1; with it they happened at this frame's Camera_Update (§4.5).
+        if (mPending.Active && snapshot.PlayerValid) FinishPendingPlacement(snapshot, now, false);
+        ApplyRigInputs(snapshot, now, dt);
+        FollowLink(snapshot, dt, (step.Blockers & W::kXrHoldRig) != 0U);
     }
 
     const bool world = step.State == W::XrWorldState::World && mRigValid && !mPending.Active;
     const W::XrWorldState shown = step.State == W::XrWorldState::World && !world ? W::XrWorldState::Black : step.State;
     if (shown != mRequested) {
 #if defined(TRIAEVUM_QUEST_OPENXR)
-        TriAevumQuestXr::RequestLayerMode(LayerFor(shown), 150, mState.RigEpoch);
+        TriAevumQuestXr::RequestLayerMode(LayerFor(shown), 150, mRigEpoch);
 #endif
         mRequested = shown;
     }
+    // Published together: the rig and its epoch of this frame's camera write.
     mState.Mode = shown;
     mState.World = world;
     mState.Rig = mRig;
-    // §5.7: the vignette from the anchor's glides and the smooth turn's yaw rate, World only.
-    SetVignette(world ? M::VignetteStrength(mAnchorSpeedMps, mYawRate) : 0.0);
+    mState.RigEpoch = mRigEpoch;
+    // §5.7: the vignette from the anchor's glides and the smooth turn's yaw rate, World only; the native A/B
+    // baseline has none (W1).
+    SetVignette(world && mCameraMode != XrCameraMode::Native ? M::VignetteStrength(mAnchorSpeedMps, mYawRate) : 0.0);
     if (!world) {
-        SetWallFade(0.0);
+        SetWallFade(0.0, "layer");
         if (mActorHeadPublished) PublishActorHead(false, {});
     }
+    // The FovScalar returns the cull FOV only while the head owns a running camera (the pause screen
+    // stops Camera_Update; the picture is then the screen's, at the game's own FOV).
+    if (!world || !hookLive) mOwnedLast = false;
 }
 
 void XrWorldSession::LogPeriodic(double audioBufferedMs) {
@@ -878,7 +999,7 @@ void XrWorldSession::LogPeriodic(double audioBufferedMs) {
                static_cast<unsigned long long>(mPredictFailures.exchange(0)), audioBufferedMs, mPacer.Divisor(),
                mState.TickPacing ? 1 : 0, W::XrWorldStateName(mState.Mode),
                static_cast<unsigned long long>(mPlacements), static_cast<unsigned long long>(mBlinks),
-               mState.RigEpoch, static_cast<unsigned long long>(mResyncs),
+               mRigEpoch, static_cast<unsigned long long>(mResyncs),
                static_cast<unsigned long long>(mHeldFrames), mSafety.Holding() ? 1 : 0);
     if (mState.World) {
         M::Pose head;
@@ -889,7 +1010,7 @@ void XrWorldSession::LogPeriodic(double audioBufferedMs) {
                    linkT.X, linkT.Y, linkT.Z, hasHead ? head.Position.X : 0.0, hasHead ? head.Position.Y : 0.0,
                    hasHead ? head.Position.Z : 0.0,
                    hasHead ? M::DistanceXZ(linkT, head.Position) : -1.0, M::RadiansToDegrees(mRig.Yaw),
-                   static_cast<int>(mFloor.Mode), mRig.Anchor.Y, mState.RigEpoch);
+                   static_cast<int>(mFloor.Mode), mRig.Anchor.Y, mRigEpoch);
     }
     if (mCameraMode != XrCameraMode::Native) {
         uint64_t alwaysCandidates = 0, alwaysGranted = 0;
@@ -898,19 +1019,25 @@ void XrWorldSession::LogPeriodic(double audioBufferedMs) {
             alwaysGranted = std::exchange(mActors->VrAlwaysGranted, 0U);
         }
         const double owned = mCamUpdates != 0U ? 100.0 * static_cast<double>(mCamOwned) / static_cast<double>(mCamUpdates) : 0.0;
+        // fov: the cull FOV setting; fov_max / fov_widened: the pitch widening past +-60 deg (§6);
+        // fov_restored: FovScalar loads whose stale host FOV became the native one (pause); reseeds /
+        // rescues / reseed_hits: the head-in-geometry tests from Link's head (§4.4).
         XrWorldLog("TRIAEVUM_XR_CAMWRITE camera=%s updates=%llu owned=%llu owned_pct=%.1f probes=%llu held=%llu "
-                   "owner=%s eye=%.1f,%.1f,%.1f yaw=%.1f pitch=%.1f fov=%.0f fov_hooks=%llu fov_loaded=%.1f "
-                   "head_failures=%llu seq_lag=%.2f seq_samples=%llu wall_fade_updates=%llu wall_fade=%.2f "
+                   "owner=%s eye=%.1f,%.1f,%.1f yaw=%.1f pitch=%.1f fov=%.0f fov_max=%.0f fov_widened=%llu "
+                   "fov_hooks=%llu fov_loaded=%.1f fov_restored=%llu head_failures=%llu seq_lag=%.2f seq_samples=%llu "
+                   "wall_fade_updates=%llu wall_fade=%.2f reseeds=%llu rescues=%llu reseed_hits=%llu "
                    "always_candidates=%llu always_granted=%llu quakes=%llu turns=%llu probe_runs=%llu",
                    XrCameraModeName(mCameraMode), static_cast<unsigned long long>(mCamUpdates),
                    static_cast<unsigned long long>(mCamOwned), owned, static_cast<unsigned long long>(mCamProbes),
                    static_cast<unsigned long long>(mCamHeld), Owner(mDecision), mWrite.Eye.X, mWrite.Eye.Y,
                    mWrite.Eye.Z, Degrees(mWrite.Yaw), Degrees(mWrite.Pitch), mCullFov,
-                   static_cast<unsigned long long>(mFovHooks), mFovLoaded,
+                   mFovMax > 0.0 ? mFovMax : mCullFov, static_cast<unsigned long long>(mFovWidened),
+                   static_cast<unsigned long long>(mFovHooks), mFovLoaded, static_cast<unsigned long long>(mFovRestored),
                    static_cast<unsigned long long>(mHeadFailures),
                    mSeqSamples != 0U ? mSeqLagSum / static_cast<double>(mSeqSamples) : -1.0,
                    static_cast<unsigned long long>(mSeqSamples), static_cast<unsigned long long>(mWallFadeUpdates),
-                   mWallFade, static_cast<unsigned long long>(alwaysCandidates),
+                   mWallFade, static_cast<unsigned long long>(mReseeds), static_cast<unsigned long long>(mRescues),
+                   static_cast<unsigned long long>(mReseedHits), static_cast<unsigned long long>(alwaysCandidates),
                    static_cast<unsigned long long>(alwaysGranted), static_cast<unsigned long long>(mQuakes),
                    static_cast<unsigned long long>(mTurns), static_cast<unsigned long long>(mProbeRuns));
         if (mStickEnabled)
@@ -926,7 +1053,8 @@ void XrWorldSession::LogPeriodic(double audioBufferedMs) {
         if (!held.empty()) XrWorldLog("TRIAEVUM_XR_HELD entries=%s", held.c_str());
         mCamUpdates = mCamOwned = mCamProbes = mCamHeld = mHeadFailures = mFovHooks = mWallFadeUpdates = 0;
         mStickRotations = mStickBypassed = mQuakes = mTurns = mSeqSamples = mProbeRuns = 0;
-        mSeqLagSum = mThetaAbsMax = 0.0;
+        mFovWidened = mFovRestored = mReseeds = mRescues = mReseedHits = 0;
+        mSeqLagSum = mThetaAbsMax = mFovMax = 0.0;
     }
     mOverruns = mBeats = mPresentations = mPlacements = mBlinks = mResyncs = mHeldFrames = 0;
 }

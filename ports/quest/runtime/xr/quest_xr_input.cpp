@@ -45,6 +45,8 @@ Logic::Pulse gSelectPulse, gMenuPulse;
 // In-world (W2): right stick flicks while the world shows (snap turns to the guest, D-pad pulses here).
 Logic::StickFlicks gFlicks;
 Logic::Pulse gDpadUpPulse, gDpadDownPulse;
+std::atomic<bool> gWorldFlicks{false};  // set by the guest (SetWorldFlicks)
+bool gFlicksTaken = false;              // XR thread: the last SyncInput took flicks (log edges)
 std::atomic<int32_t> gSnapTurns{0};
 std::atomic<float> gTurnAxis{0.0F};
 Logic::Hysteresis gGripL, gGripR;
@@ -243,10 +245,17 @@ void SyncInput(XrTime) {
         PushSettingsKey();
         Haptic(true, false, 40);
     }
-    // In-world (inworld-spec §5.5, §7): while the world shows, right stick X flicks are snap turns (the
-    // guest applies them at Camera_Update) and Y flicks press the D-pad (up: TopScreen's first-person view);
-    // the game's C-stick sees nothing (TakePad).
-    if (WorldRequested() && RequestedLayerMode() == LayerMode::World) {
+    // In-world (inworld-spec §5.5, §7): while the world shows and flicks are armed (mode R, mode L), right
+    // stick X flicks are snap turns (the guest applies them at Camera_Update) and Y flicks press the D-pad
+    // (up: TopScreen's first-person view), but only while the left controller is active: without it the
+    // right stick moves Link instead. The game's C-stick sees nothing (TakePad).
+    const auto job = Logic::WorldRightStickJob(worldShown, gWorldFlicks.load(), leftActive);
+    if (job.Flicks != gFlicksTaken && worldShown) {
+        XRLOG("TRIAEVUM_XR_INPUT flicks=%d left_active=%d armed=%d", job.Flicks ? 1 : 0, leftActive ? 1 : 0,
+              gWorldFlicks.load() ? 1 : 0);
+    }
+    gFlicksTaken = job.Flicks;
+    if (job.Flicks) {
         const auto flicks = gFlicks.Update(right.x, right.y);
         if (flicks.Turn != 0) {
             gSnapTurns.fetch_add(flicks.Turn);
@@ -273,9 +282,10 @@ void SyncInput(XrTime) {
     pad.LeftX = Logic::AxisToSdl(left.x);
     pad.LeftY = Logic::AxisToSdl(left.y);
     if (worldShown) {
-        // The Circle Pad: the left stick, or the right one while the left is idle or inactive; the
-        // larger deflection wins. TakePad still hides the right stick from the game's C-stick.
-        const auto move = Logic::PickMoveStick(left.x, left.y, leftActive, right.x, right.y);
+        // The Circle Pad: the left stick, or the right one while the left is idle or inactive (flicks armed:
+        // only while the left controller is inactive); the larger deflection wins. TakePad still hides the
+        // right stick from the game's C-stick.
+        const auto move = Logic::PickMoveStick(left.x, left.y, leftActive, right.x, right.y, job.Move);
         pad.LeftX = Logic::AxisToSdl(move.X);
         pad.LeftY = Logic::AxisToSdl(move.Y);
         if (gStickSource.Update(move.Source))
@@ -304,6 +314,7 @@ void ReleaseInput() {
     gDpadUpPulse = {};
     gDpadDownPulse = {};
     gFlicks.Reset();
+    gFlicksTaken = false;
     gTurnAxis.store(0.0F);
     gGripL.On = gGripR.On = false;
     gStickSource = {};
@@ -327,6 +338,13 @@ bool TakePad(PadSnapshot* pad) {
 }
 
 int32_t TakeSnapTurns() { return gSnapTurns.exchange(0); }
+
+void SetWorldFlicks(bool armed) {
+    gWorldFlicks.store(armed);
+    if (!armed) gSnapTurns.store(0);
+    XRLOG("TRIAEVUM_XR_INPUT right_stick=%s", armed ? "flicks (moves Link only with the left controller off)"
+                                                    : "move (W1: moves Link while the left stick is idle)");
+}
 
 float WorldTurnAxis() { return gTurnAxis.load(); }
 

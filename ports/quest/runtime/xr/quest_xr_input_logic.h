@@ -127,6 +127,20 @@ inline bool StickIdle(float x, float y) {
 
 enum class RightStickMove : uint8_t { WhenLeftIdle, WhenLeftInactive };
 
+// The right stick's jobs while the world shows. Flicks armed (W2: mode R, mode L): flicks only while the
+// left controller is active, and the right stick moves Link only while it is not; flicks off (the native
+// A/B baseline, W1): the right stick moves Link while the left stick is idle, never flicks.
+struct RightStickJob {
+    bool Flicks = false;
+    RightStickMove Move = RightStickMove::WhenLeftIdle;
+};
+inline RightStickJob WorldRightStickJob(bool worldShown, bool flicksArmed, bool leftActive) {
+    RightStickJob job;
+    job.Move = flicksArmed ? RightStickMove::WhenLeftInactive : RightStickMove::WhenLeftIdle;
+    job.Flicks = worldShown && flicksArmed && leftActive;
+    return job;
+}
+
 inline MoveStick PickMoveStick(float lx, float ly, bool leftActive, float rx, float ry,
                                RightStickMove policy = RightStickMove::WhenLeftIdle) {
     if (!std::isfinite(lx) || !std::isfinite(ly)) lx = ly = 0.0F;

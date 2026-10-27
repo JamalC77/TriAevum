@@ -132,6 +132,11 @@ bool VrCameraSource::Fov(float loaded, float* degrees) {
     return mSession != nullptr && mSession->CameraFov(loaded, degrees);
 }
 
+float VrCameraSource::NativeLoadedFov(float loaded) {
+    if (mPreview || mSession == nullptr) return loaded;
+    return mSession->NativeLoadedFov(loaded);
+}
+
 bool VrCameraSource::BeginPreview(NativeA32Memory& memory, const TopScreenVrCameraBegin& begin) {
     const bool main = begin.GlobalContextAddress != 0U &&
                       begin.CameraAddress == begin.GlobalContextAddress + kPlayMainCamera;
@@ -166,7 +171,7 @@ bool VrCameraSource::BeginPreview(NativeA32Memory& memory, const TopScreenVrCame
     if (!mPreviewGeometry.Valid()) mPreviewGeometry.Reset(head.Position);
     mPreviewHead = head.Position;
     mPreviewFloorY = std::isfinite(snapshot.FloorHeight) ? snapshot.FloorHeight : link.Y;
-    const auto segment = mPreviewGeometry.Segment(head.Position);
+    const auto segment = mPreviewGeometry.Segment(head.Position, link + M::Vec3{0.0, C::LinkHeadHeightU(snapshot.LinkAge != 0), 0.0});
     mSegment = {FromVec(segment.From), FromVec(segment.To)};
     mWrite = ToWrite(write, static_cast<float>(C::kDefaultCullFovDegrees));
     mOwned = true;

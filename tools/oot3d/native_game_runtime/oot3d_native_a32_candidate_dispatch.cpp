@@ -795,9 +795,12 @@ bool ExecuteTopScreenUiSourcePortBlock(
         *blocksConsumed = 1U;
       return true;
     }
+    const float loadedFov =
+        dispatch.VrCamera != nullptr
+            ? dispatch.VrCamera->NativeLoadedFov(std::bit_cast<float>(nativeFovBits))
+            : std::bit_cast<float>(nativeFovBits);
     const float resolvedFov = Oot3dNativeGame::ResolveTopScreenCameraFovDegrees(
-        std::bit_cast<float>(nativeFovBits),
-        dispatch.TopScreenCamera.Camera.FovPercent);
+        loadedFov, dispatch.TopScreenCamera.Camera.FovPercent);
     state.vfp[16] = std::bit_cast<std::uint32_t>(resolvedFov);
     nextPc = pc + 4U;
     state.r[15] = nextPc;

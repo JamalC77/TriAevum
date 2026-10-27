@@ -120,6 +120,29 @@ inline CameraWrite HoldCameraWrite(const M::Vec3& eye, const M::Vec3& at) {
     return write;
 }
 
+// The written pitch stops at +-60 deg but the head does not: looking past it, the eye's far edge (Quest 3:
+// about 50 deg below and above the gaze; kEyeEdgeDegrees with margin) leaves the cull frustum
+// (limit + fov / 2) once |pitch| > limit + fov / 2 - edge (75 deg at 130). The FOV then widens just enough to
+// cover it, up to kMaxCullFovDegrees (straight down keeps a strip of about 5 deg toward his back).
+inline constexpr double kEyeEdgeDegrees = 55.0;
+inline double CullFovForPitch(double cullFovDegrees, double headPitch, double pitchLimitDegrees = kPitchLimitDegrees,
+                              double eyeEdgeDegrees = kEyeEdgeDegrees) {
+    if (!std::isfinite(cullFovDegrees)) return kDefaultCullFovDegrees;
+    if (!std::isfinite(headPitch) || !std::isfinite(pitchLimitDegrees) || !std::isfinite(eyeEdgeDegrees))
+        return cullFovDegrees;
+    const double pitch = std::fabs(M::RadiansToDegrees(headPitch));
+    const double limit = std::clamp(pitchLimitDegrees, 0.0, 89.0);
+    if (pitch <= limit) return cullFovDegrees;
+    const double needed = 2.0 * (std::min(pitch, 90.0) + eyeEdgeDegrees - limit);
+    return std::clamp(needed, cullFovDegrees, std::max(cullFovDegrees, kMaxCullFovDegrees));
+}
+// The head's pitch (up-positive) from its gaze.
+inline double HeadPitch(const GameHead& head) {
+    const double length = M::Length(head.Forward);
+    if (!head.Valid || !(length > 1e-9)) return 0.0;
+    return std::asin(std::clamp(head.Forward.Y / length, -1.0, 1.0));
+}
+
 // TRIAEVUM_XR_CULL_FOV: degrees, clamped; anything unparsable keeps the default.
 inline double ParseCullFov(const char* text) {
     if (text == nullptr || *text == '\0') return kDefaultCullFovDegrees;
@@ -149,6 +172,11 @@ enum HeldReason : uint32_t {
     kHeldConfig = 1U << 12,          // TRIAEVUM_XR_CAMERA=held, or no TopScreen profile (mode L)
 };
 inline constexpr uint32_t kHeldStaticMask = kHeldSecondaryCamera | kHeldCutscene | kHeldItem;
+// While a placement waits under black, its probes take the update whatever else holds it (the scene-entry
+// walk-in's 0x20000000, a status != 7 just after a load, an item get ...): skipping up to five native camera
+// updates under black is invisible. Only these hold the probes off: no main camera, no Link to probe from,
+// a screen row (the classifier leaves World for it anyway) and mode L.
+inline constexpr uint32_t kHeldProbeBlockMask = kHeldNotMain | kHeldNoPlayer | kHeldCinemaRow | kHeldConfig;
 
 inline std::string HeldNames(uint32_t held) {
     static constexpr std::pair<uint32_t, const char*> kNames[] = {
@@ -223,6 +251,7 @@ struct OwnerDecision {
     bool StickBypass = false;  // talk, shop, first person, crawl (ocarina and Cinema are the caller's)
     bool ZTarget = false;      // flags1 0x10, 0x8000, 0x10000, 0x20000 (carved out of TopScreen's mask)
     bool HeldStatic = false;   // the rows whose camera motion may send the state to Cinema
+    uint32_t ProbeHeld = 0;    // a probe update: the Held reasons it ran over (kHeldProbeBlockMask excluded)
 };
 
 inline OwnerDecision DecideOwner(const OwnerInput& in) {
@@ -250,9 +279,10 @@ inline OwnerDecision DecideOwner(const OwnerInput& in) {
     d.StickBypass = d.Talking || d.Shop || (in.Flags1 & kFlags1FirstPerson) != 0U || crawl;
     d.ZTarget = (in.Flags1 & kFlags1ZTargetMask) != 0U;
     if (!in.LayerWorld) {
-        if (in.Probing && held == 0U) {
+        if (in.Probing && (held & kHeldProbeBlockMask) == 0U) {
             d.Vr = true;
             d.Probe = true;
+            d.ProbeHeld = held;
             return d;
         }
         held |= kHeldLayer;
@@ -268,23 +298,62 @@ inline OwnerDecision DecideOwner(const OwnerInput& in) {
 // The cutscene camera's motion (§4.3): a Held-static row goes to Cinema once the native camera moved more
 // than 2 m * s or turned more than 45 deg within 1 s; never while talking. The trip holds until the row ends,
 // so a cutscene that pauses its camera does not thrash between World and Cinema (risk 16).
+//
+// The hand-over is not a move: the native camera (or a subcamera copied from it) starts from the head the
+// host wrote last and needs a while to reach its own view (Normal1's lerp, a OnePoint camera's first cut).
+// The window opens once the view has settled: kSettleUpdates updates in a row each moving less than
+// kStillMetres * s and kStillDegrees, or kSettleSeconds after the row began, whichever comes first (a
+// scripted move that never rests still trips, at most kSettleSeconds late).
 
 class CutsceneCameraMonitor {
   public:
     static constexpr double kWindowSeconds = 1.0;
     static constexpr double kMoveMetres = 2.0;
     static constexpr double kTurnDegrees = 45.0;
+    static constexpr double kSettleSeconds = 0.75;
+    static constexpr int kSettleUpdates = 5;
+    static constexpr double kStillMetres = 0.05;
+    static constexpr double kStillDegrees = 1.0;
 
     bool Update(bool active, double now, const M::Vec3& eye, double yaw, double scale) {
         if (!active) {
             mCount = 0;
             mNext = 0;
             mTripped = false;
+            mActive = false;
+            mSettled = false;
+            mHasLast = false;
+            mStill = 0;
             return false;
         }
         if (mTripped) return true;
         if (!M::IsFinite(eye) || !std::isfinite(yaw) || !std::isfinite(now)) return false;
-        const double moveLimit = kMoveMetres * (scale > 0.0 && std::isfinite(scale) ? scale : M::kDefaultScale);
+        const double unit = scale > 0.0 && std::isfinite(scale) ? scale : M::kDefaultScale;
+        if (!mActive) {
+            mActive = true;
+            mSince = now;
+            mStill = 0;
+            mHasLast = false;
+            mSettled = false;
+            mSettleSeconds = 0.0;
+            mSettledStill = false;
+        }
+        if (!mSettled) {
+            if (mHasLast) {
+                const bool still = M::Length(eye - mLastEye) <= kStillMetres * unit &&
+                                   std::fabs(M::WrapAngle(yaw - mLastYaw)) <= M::DegreesToRadians(kStillDegrees);
+                mStill = still ? mStill + 1 : 0;
+            }
+            mLastEye = eye;
+            mLastYaw = yaw;
+            mHasLast = true;
+            const bool settledStill = mStill >= kSettleUpdates;
+            if (!settledStill && now - mSince < kSettleSeconds) return false;
+            mSettled = true;
+            mSettledStill = settledStill;
+            mSettleSeconds = now - mSince;
+        }
+        const double moveLimit = kMoveMetres * unit;
         const double turnLimit = M::DegreesToRadians(kTurnDegrees);
         for (size_t i = 0; i < mCount; ++i) {
             const Sample& s = mSamples[i];
@@ -302,8 +371,12 @@ class CutsceneCameraMonitor {
         return false;
     }
     bool Tripped() const { return mTripped; }
+    bool Settled() const { return mSettled; }
     double TripMovedM() const { return mTripMoved; }
     double TripTurnedDegrees() const { return mTripTurned; }
+    // How long the hand-over took before the window opened, and whether it ended by resting (else by time).
+    double SettleSeconds() const { return mSettleSeconds; }
+    bool SettledStill() const { return mSettledStill; }
 
   private:
     struct Sample {
@@ -315,6 +388,10 @@ class CutsceneCameraMonitor {
     size_t mCount = 0, mNext = 0;
     bool mTripped = false;
     double mTripMoved = 0.0, mTripTurned = 0.0;
+    bool mActive = false, mSettled = false, mHasLast = false, mSettledStill = false;
+    double mSince = 0.0, mSettleSeconds = 0.0, mLastYaw = 0.0;
+    M::Vec3 mLastEye;
+    int mStill = 0;
 };
 
 // ---------------------------------------------------------------------------------------------------
@@ -323,6 +400,19 @@ class CutsceneCameraMonitor {
 // toward q, on a hit it returns the hit pushed 1 u out along the polygon's normal. The penetration is the
 // part of the segment behind the collided point; a hit beyond the head (a wall just ahead of the motion)
 // is no penetration.
+//
+// q is only trusted while the head moves continuously through the game world. Where it may not have:
+//  - a placement (the probes chose the spot): Reset, q = the placed head;
+//  - a turn pivots on the head (head_w does not move): q is kept;
+//  - a blink (leash, idle re-centre, floor) moves the head in the game world: ReseedHard. The next test runs
+//    from Link's head (L + 50/38 u, a point Link stands in); clear: q = the head; a hit: ReseedHit, the
+//    caller re-places (Black + probes) instead of trusting a head that may have landed in a wall;
+//  - updates the host did not own (Held rows, a missed head pose) let the head walk around a pillar while q
+//    stood still: ReseedSoft, the next test runs from Link's head; clear: q = the head; a hit keeps the last
+//    fade and the test after it runs from q again.
+// While q's test fails, every other update runs the same rescue test from Link's head: it can only clear a
+// fade (Link line of sight never darkens the world, §4.4: it would black out behind every fence), so a head
+// that left a wall in Link's open space is never held black by a stale q.
 
 struct GeometrySegment {
     M::Vec3 From, To;
@@ -334,11 +424,25 @@ struct GeometryConfig {
     double FullFadeM = 0.3;         // ... to black at 0.3 m * s
     double BelowFloorM = 0.2;       // the head below Link's floor + 0.2 m * s: black
 };
+enum class GeometryTest : uint8_t { FromQ, FromLink };
+inline const char* GeometryTestName(GeometryTest test) { return test == GeometryTest::FromLink ? "link" : "q"; }
+enum class GeometryReseed : uint8_t { None, Soft, Hard };
+inline const char* GeometryReseedName(GeometryReseed reseed) {
+    switch (reseed) {
+    case GeometryReseed::None: return "none";
+    case GeometryReseed::Soft: return "soft";
+    case GeometryReseed::Hard: return "hard";
+    }
+    return "?";
+}
 struct GeometryStep {
     double Fade = 0.0;
     double PenetrationU = 0.0;
     bool Clear = false;
     bool BelowFloor = false;
+    GeometryTest Test = GeometryTest::FromQ;
+    GeometryReseed Reseed = GeometryReseed::None;  // the reseed this test answered
+    bool ReseedHit = false;  // a hard reseed hit geometry: re-place (the head may be inside a wall)
 };
 
 class HeadInGeometry {
@@ -346,42 +450,93 @@ class HeadInGeometry {
     void Reset(const M::Vec3& clear) {
         mValid = M::IsFinite(clear);
         mQ = clear;
+        mReseed = GeometryReseed::None;
+        mRescueNext = false;
+        mLastFade = 0.0;
+    }
+    void ReseedHard() { mReseed = GeometryReseed::Hard; }
+    void ReseedSoft() {
+        if (mReseed == GeometryReseed::None) mReseed = GeometryReseed::Soft;
     }
     void Invalidate() { mValid = false; }
     bool Valid() const { return mValid; }
     const M::Vec3& Q() const { return mQ; }
-    GeometrySegment Segment(const M::Vec3& head) const { return {mValid ? mQ : head, head}; }
-    // `collided`: BgCheckInfo's end of Segment(head); `floorY`: Link's floor (u); `scale`: u per metre.
+    GeometryReseed PendingReseed() const { return mReseed; }
+    double LastFade() const { return mLastFade; }
+    // This update's segment: from Link's head for a reseed or the rescue test, else from q (the head itself
+    // before any q). `linkHead`: L + (0, 50 u adult / 38 u child, 0).
+    GeometrySegment Segment(const M::Vec3& head, const M::Vec3& linkHead) {
+        const bool fromLink = (mReseed != GeometryReseed::None || mRescueNext) && M::IsFinite(linkHead);
+        mTest = fromLink ? GeometryTest::FromLink : GeometryTest::FromQ;
+        mFrom = fromLink ? linkHead : (mValid ? mQ : head);
+        mTestReseed = fromLink ? mReseed : GeometryReseed::None;
+        mHasSegment = true;
+        return {mFrom, head};
+    }
+    // `collided`: BgCheckInfo's end of the last Segment(); `floorY`: Link's floor (u); `scale`: u per metre.
     GeometryStep Update(const M::Vec3& head, const M::Vec3& collided, double floorY, double scale,
                         const GeometryConfig& config = {}) {
         GeometryStep step;
+        step.Fade = mLastFade;
         if (!M::IsFinite(head)) return step;
         const double s = std::isfinite(scale) && scale > 0.0 ? scale : M::kDefaultScale;
-        if (!mValid) Reset(head);
-        const M::Vec3 segment = head - mQ;
+        if (!mHasSegment) Segment(head, {std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0});
+        mHasSegment = false;
+        step.Test = mTest;
+        step.Reseed = mTestReseed;
+        const M::Vec3 from = mFrom;
+        const M::Vec3 segment = head - from;
         const double length = M::Length(segment);
         double penetration = 0.0;
         if (length > 1e-6 && M::IsFinite(collided)) {
-            const double along = M::Dot(collided - mQ, segment) / length;
+            const double along = M::Dot(collided - from, segment) / length;
             penetration = std::max(0.0, length - along);
         }
         step.PenetrationU = penetration;
+        const double depthFade =
+            penetration > config.FadeStartU ? std::clamp(penetration / (config.FullFadeM * s), 0.0, 1.0) : 0.0;
+        double fade = 0.0;
         if (penetration <= config.ClearU + config.ToleranceU) {
             step.Clear = true;
+            mValid = true;
             mQ = head;
-        } else if (penetration > config.FadeStartU) {
-            step.Fade = std::clamp(penetration / (config.FullFadeM * s), 0.0, 1.0);
+            mReseed = GeometryReseed::None;
+            mRescueNext = false;
+        } else if (mTest == GeometryTest::FromQ) {
+            fade = depthFade;
+            mRescueNext = true;  // the rescue test from Link's head next update
+        } else {
+            // From Link's head and not clear: a hard reseed asks for a re-placement (and shows the depth until
+            // it comes); a soft reseed or the rescue keeps the last fade and hands back to q.
+            if (mTestReseed == GeometryReseed::Hard) {
+                step.ReseedHit = true;
+                fade = depthFade;
+            } else {
+                fade = mLastFade;
+            }
+            mReseed = GeometryReseed::None;
+            mRescueNext = false;
         }
         if (std::isfinite(floorY) && head.Y < floorY + config.BelowFloorM * s) {
             step.BelowFloor = true;
-            step.Fade = 1.0;
+            fade = 1.0;
         }
+        step.Fade = fade;
+        mLastFade = fade;
         return step;
     }
 
   private:
     bool mValid = false;
     M::Vec3 mQ;
+    GeometryReseed mReseed = GeometryReseed::None;
+    bool mRescueNext = false;
+    double mLastFade = 0.0;
+    // The last Segment() (Update measures against it).
+    bool mHasSegment = false;
+    GeometryTest mTest = GeometryTest::FromQ;
+    GeometryReseed mTestReseed = GeometryReseed::None;
+    M::Vec3 mFrom;
 };
 
 // ---------------------------------------------------------------------------------------------------
