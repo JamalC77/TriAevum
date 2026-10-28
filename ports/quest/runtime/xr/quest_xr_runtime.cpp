@@ -613,16 +613,20 @@ void LogPerf(const SinkStats& sink) {
           release.c_str(), xrSubmit.c_str(), xrCpu.c_str());
     const std::string holdXr = t(PerfPhase::LockHoldXr), holdRenderer = t(PerfPhase::LockHoldRenderer),
                       waitXr = t(PerfPhase::LockWaitXr), waitRenderer = t(PerfPhase::LockWaitRenderer),
-                      shown = t(PerfPhase::PairShown);
+                      shown = t(PerfPhase::PairShown), deviceWait = t(PerfPhase::RendererDeviceWait),
+                      gpu = t(PerfPhase::GpuFrame);
     XRLOG("TRIAEVUM_XR_PERF thread=sink lock_hold_xr=%s lock_hold_renderer=%s lock_wait_xr=%s "
-          "lock_wait_renderer=%s pair_shown=%s frame_copy=%d frame_copies=%llu frame_copy_misses=%llu "
-          "queue_copies=%llu held_image_waits=%llu orphans=%llu held_acquire_failures=%llu held_wait_timeouts=%llu",
-          holdXr.c_str(), holdRenderer.c_str(), waitXr.c_str(), waitRenderer.c_str(), shown.c_str(),
-          FrameCopyEnabled() ? 1 : 0, static_cast<unsigned long long>(sink.FrameCopies),
+          "lock_wait_renderer=%s renderer_device_wait=%s pair_shown=%s frame_copy=%d frame_copies=%llu "
+          "frame_copy_misses=%llu queue_copies=%llu held_image_waits=%llu deferred=%llu orphans=%llu "
+          "held_acquire_failures=%llu held_wait_timeouts=%llu",
+          holdXr.c_str(), holdRenderer.c_str(), waitXr.c_str(), waitRenderer.c_str(), deviceWait.c_str(),
+          shown.c_str(), FrameCopyEnabled() ? 1 : 0, static_cast<unsigned long long>(sink.FrameCopies),
           static_cast<unsigned long long>(sink.FrameCopyMisses), static_cast<unsigned long long>(sink.QueueCopies),
-          static_cast<unsigned long long>(sink.HeldImageWaits), static_cast<unsigned long long>(sink.FrameCopyOrphans),
+          static_cast<unsigned long long>(sink.HeldImageWaits), static_cast<unsigned long long>(sink.FrameCopyDeferred),
+          static_cast<unsigned long long>(sink.FrameCopyOrphans),
           static_cast<unsigned long long>(sink.HeldAcquireFailures),
           static_cast<unsigned long long>(sink.HeldWaitTimeouts));
+    XRLOG("TRIAEVUM_XR_PERF thread=gpu frame=%s", gpu.c_str());
 }
 
 void LogStats(FrameStats& frames) {
@@ -1417,8 +1421,15 @@ void StopSession() {
     g.Stop = true;
     if (g.Thread.joinable()) g.Thread.join();
     if (g.Queue != VK_NULL_HANDLE) {
+        // Both queues: with the in-frame copy the renderer's queue-0 frames write the eye and HUD swapchain
+        // images too, so nothing may still run on either queue when the swapchains go. The XR thread is
+        // joined and the renderer is in its shutdown (this call), so the lock covers every queue user.
         QueueLock lock("shutdown");
-        vkQueueWaitIdle(g.Queue);
+        if (g.Device != VK_NULL_HANDLE) {
+            vkDeviceWaitIdle(g.Device);
+        } else {
+            vkQueueWaitIdle(g.Queue);
+        }
     }
     g.SessionStopped = true;
     DestroyQuadSwapchain();

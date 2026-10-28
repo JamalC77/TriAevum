@@ -132,6 +132,8 @@ enum class PerfPhase : uint8_t {
     LockWaitXr,       // waiting for the lock: the XR thread
     LockWaitRenderer, //   the renderer
     PairShown,        // a pair from its publication (just after the frame's submit) to its release
+    RendererDeviceWait, // the renderer's device waits (in-world: queue 0 idle plus the copy timeline)
+    GpuFrame,         // the GPU time of one renderer frame (timestamps at its start and end)
     Count
 };
 bool PerfEnabled();  // in-world and TRIAEVUM_XR_PERF != 0; valid before init

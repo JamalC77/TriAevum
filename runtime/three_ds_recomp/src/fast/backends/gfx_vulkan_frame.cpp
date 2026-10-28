@@ -783,10 +783,11 @@ void GfxRenderingAPIVulkan::StartFrame() {
     uint64_t xrCopyWaitValue = 0;
     if (mXrPresent) {
         xrPresent = true;
-        if (!mXrRendererThreadRegistered) {
-            TriAevumQuestXr::RegisterThread(TriAevumQuestXr::ThreadRole::RendererWorker,
-                                            static_cast<int>(gettid()));
-            mXrRendererThreadRegistered = true;
+        // By thread, not once: the first frames can run on the game thread (the inline stream before the
+        // render worker starts), which RegisterThread ignores, and the worker must still get its hint.
+        if (const int tid = static_cast<int>(gettid()); tid != mXrRendererThreadTid) {
+            TriAevumQuestXr::RegisterThread(TriAevumQuestXr::ThreadRole::RendererWorker, tid);
+            mXrRendererThreadTid = tid;
         }
         if (!TriAevumQuestXr::RendererMayRun()) {
             return;  // session not focused (or stopping): no active frame, the guest is held
@@ -994,6 +995,11 @@ void GfxRenderingAPIVulkan::StartFrame() {
         mFrameCounter > kFramesInFlight) {
         if (timings)
             mDiagnostics.SetGpuTimings(mFrameCounter - kFramesInFlight, *timings);
+#if defined(TRIAEVUM_QUEST_OPENXR)
+        // In-world TRIAEVUM_XR_PERF: the slot's previous frame on the GPU (thread=gpu frame=).
+        if (mXrWorld && timings && timings->FrameMilliseconds)
+            TriAevumQuestXr::PerfNote(TriAevumQuestXr::PerfPhase::GpuFrame, *timings->FrameMilliseconds);
+#endif
         if (Oot3d::GrassStageProfileEnabled()) {
             const auto measured = timings.value_or(Oot3dVulkanGpuTimings{});
             Oot3d::ReportGrassStageFrame(

@@ -1235,7 +1235,7 @@ class GfxRenderingAPIVulkan final : public GfxRenderingAPI,
     bool mXrPresent = false;
     uint32_t mXrQueueIndex = 1;
     uint64_t mXrRenderValue = 0;
-    bool mXrRendererThreadRegistered = false;
+    int mXrRendererThreadTid = 0;  // the thread last registered as the renderer worker (0: none yet)
     // In-world mode (TriAevumQuestXr::WorldRequested(), inworld-spec §2.4): three images per frame slot,
     // each with its own extent; SelectXrView switches the current image, extent and picture, and keeps
     // each view's "presented this frame" flag and last presented display transfer apart.

@@ -629,8 +629,12 @@ void GfxRenderingAPIVulkan::Init() {
                                    mDepthFormat, mPipelineCache);
     CreateFrameResources();
     mScanoutProbe.Initialize(mPhysicalDevice, mDevice, kFramesInFlight);
-    mGpuProfiler.Initialize(mPhysicalDevice, mDevice, mGraphicsQueueFamily,
-                            mDiagnostics.Enabled());
+    bool gpuTimestamps = mDiagnostics.Enabled();
+#if defined(TRIAEVUM_QUEST_OPENXR)
+    // In-world TRIAEVUM_XR_PERF reports the GPU frame time (thread=gpu): the frame scope's timestamps.
+    if (mXrWorld && TriAevumQuestXr::PerfEnabled()) gpuTimestamps = true;
+#endif
+    mGpuProfiler.Initialize(mPhysicalDevice, mDevice, mGraphicsQueueFamily, gpuTimestamps);
     if (mGpuProfiler.TimelineEnabled() && mNriInterop.Available())
         mNriInterop.SetTimelineMark([this](uint32_t frameSlot, const char* label) {
             mGpuProfiler.Mark(frameSlot, label, mCommandBuffers[frameSlot]);

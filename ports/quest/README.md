@@ -415,27 +415,38 @@ Implementation notes (where W2 differs from the spec text):
 World mode runs at full intensity by default. There are no comfort features, and each change below has
 a one-line kill switch for A/B runs on the device (put it in `<ext>/triaevum-env.txt`).
 
-- **In-frame copy** (`TRIAEVUM_XR_FRAME_COPY`, default on). The XR thread keeps one eye image and one HUD
-  image acquired and waited ahead (1 ms waits, retried every display frame). The render worker copies
+- **In-frame copy** (`TRIAEVUM_XR_FRAME_COPY`, default on). OpenXR lets an application wait only one image
+  of a swapchain at a time, so the eyes and the HUD each get a second swapchain (`eye_b`, `hud_b`: set 1,
+  same extent and format; about 30 MB more). Each set holds one image: the XR thread acquires and waits it
+  as soon as the set's previous image is released (1 ms waits, retried every display frame), so one set
+  is ready while the other's pair is still on the GPU. The render worker copies
   the pair, and the HUD panel, into those images at the end of its own frame command buffer, in the
   same queue-0 submit. The XR thread releases them at the first display frame after the render timeline
   reaches that frame. Before releasing, it makes one empty queue-1 submit that waits on the
   already-reached timeline value. The copy therefore no longer waits on queue 1 behind the next
   frame's rendering. That queueing was what made the renderer stall 25-29 ms in `WaitTargetFree`
   (`copy_wait_ms_max`) and xrBeginFrame hold the queue lock for 8-11 ms (`TRIAEVUM_XR_QUEUE_LOCK`).
-  When no image is held at the end of a frame (`frame_copy_misses`), that pair takes the old XR-queue
-  copy path (`queue_copies`), still released in acquire order.
-- **The renderer never touches the XR queue** (`TRIAEVUM_XR_RENDERER_WAIT`, default `queue`). Its
+  The layers show the set of the newest released pair (by serial), so an older pair released later on the
+  other set is never shown. When no set is ready at the end of a frame (`frame_copy_misses`), that pair
+  takes the XR-queue copy (`queue_copies`) into the next ready set, unless a renderer frame already holds a
+  newer, unpublished claim (`deferred`; the newer pair supersedes it). A claim that is not published (an
+  abandoned frame, a failed copy) is an orphan: never released; once its frame is GPU-complete the
+  still-waited image is reused for the next pair (`orphans`).
+- **The renderer never touches the XR queue** (`TRIAEVUM_XR_RENDERER_WAIT`, default `queue`, world mode
+  only; the Q3 screen and cinema keep `vkDeviceWaitIdle` under the lock). Its
   `vkDeviceWaitIdle` calls become `vkQueueWaitIdle` on queue 0 plus a wait on the copy timeline at its
   last submitted value. A resource recreate therefore never waits behind a blocking `xrBeginFrame`.
-  `device` restores `vkDeviceWaitIdle` under the queue lock.
+  `device` restores `vkDeviceWaitIdle` under the queue lock. Shutdown idles both queues (under the lock,
+  after the XR thread is joined) before the swapchains are destroyed.
 - **BOOST clocks** (`TRIAEVUM_XR_PERF_LEVEL`). The default is `boost` in world mode, logged as
   `TRIAEVUM_XR_PERF cpu=0 gpu=0 level=boost`. `sustained_high` restores the old level. The Q3 screen
   keeps `sustained_high`.
 - **Thread priority** (`TRIAEVUM_XR_THREAD_NICE`, default -10, `0` leaves the threads alone). The guest
-  thread, the render worker and the XR thread run at nice -10 in addition to the runtime's thread
-  hints (`TRIAEVUM_XR_THREAD_NICE role= tid= requested=-10 result=0 errno=0 now=-10`). `result=-1
-  errno=13` means Android refused it.
+  thread (`application_main`), the render worker (`renderer_worker`, registered by thread on its first
+  frame, after any inline frames on the game thread) and the XR thread (`renderer_main`) run at nice -10
+  in addition to the runtime's thread hints (`TRIAEVUM_XR_THREAD_NICE role= tid= requested=-10 result=0
+  errno=0 now=-10`, one line each). `result=-1 errno=13` means Android refused it. The game thread feeds
+  the audio queue (`SDL_QueueAudio`); SDL's own audio thread runs at Android's audio priority, above -10.
 
 | Key | Values |
 |---|---|
@@ -445,7 +456,7 @@ a one-line kill switch for A/B runs on the device (put it in `<ext>/triaevum-env
 | `TRIAEVUM_XR_THREAD_NICE` | -20..0, default -10 (0: unchanged) |
 | `TRIAEVUM_XR_PERF` | `0` turns the `TRIAEVUM_XR_PERF thread=` lines off (default on in world mode) |
 
-Every 5 s, world mode logs four `TRIAEVUM_XR_PERF thread=` lines. Each field reads
+Every 5 s, world mode logs five `TRIAEVUM_XR_PERF thread=` lines. Each field reads
 `mean/p95/max` in ms, then `x` and the sample count. p95 comes from 0.25 ms buckets and never exceeds the
 max.
 
@@ -454,9 +465,11 @@ max.
 | `TRIAEVUM_XR_PERF thread=guest frame= update= stream_wait= cpu=` | one host frame (RunFrame to RunFrame); one guest refresh (`RunGuestRefresh`); time the guest blocked on the render worker (frame backpressure, synchronous commands); the guest thread's CPU per frame |
 | `TRIAEVUM_XR_PERF thread=worker frame= start= fence= target_free= ns1= eye_l= eye_r= ui= tick_wait= submit= cpu= idle=` | the render worker per frame: StartFrame and, within it, the slot fence and the XR-copy wait; the canonical namespace-1 replay; each eye (built and replayed); the TopScreen HUD / menu passes; the pace-tick wait (idle by design); EndFrame (in-frame copy and submit); its CPU; time waiting for guest commands |
 | `TRIAEVUM_XR_PERF thread=xr wait_frame= begin_frame= end_frame= acquire= wait_image= release= submit= cpu=` | the XR thread's OpenXR and queue-1 calls and its CPU per display frame |
-| `TRIAEVUM_XR_PERF thread=sink lock_hold_xr= lock_hold_renderer= lock_wait_xr= lock_wait_renderer= pair_shown= frame_copy= frame_copies= frame_copy_misses= queue_copies= held_image_waits= orphans= held_acquire_failures= held_wait_timeouts=` | queue-lock hold and wait times by holder; publication to release per pair; in-frame copy counters (5 s) |
+| `TRIAEVUM_XR_PERF thread=sink lock_hold_xr= lock_hold_renderer= lock_wait_xr= lock_wait_renderer= renderer_device_wait= pair_shown= frame_copy= frame_copies= frame_copy_misses= queue_copies= held_image_waits= deferred= orphans= held_acquire_failures= held_wait_timeouts=` | queue-lock hold and wait times by holder; the renderer's device waits on the world-mode path (queue 0 idle plus the copy timeline: resource recreates); publication to release per pair; in-frame copy counters (5 s): `deferred` = XR-queue pairs held back behind a renderer frame's newer claim, `orphans` = unpublished claims whose image was reused |
+| `TRIAEVUM_XR_PERF thread=gpu frame=` | GPU time of one renderer frame (the frame scope's timestamps; the profiler is on in world mode with `TRIAEVUM_XR_PERF`) |
 | `TRIAEVUM_XR_FRAME_COPY enabled=1`, `TRIAEVUM_XR_FRAME_COPY first slot= hud= eye=`, `TRIAEVUM_XR_HUD first_copy ... in_frame=1` | the in-frame copy is on and wrote its first pair |
-| `TRIAEVUM_XR_FRAME_COPY acquire_failed swapchain= result= held= capacity=` | the runtime refused a second acquired image: the queue holds only what it gave (at most 4 lines) |
+| `TRIAEVUM_XR_SWAPCHAIN eye_b= array=2 images= (in-frame copy set 1)`, `TRIAEVUM_XR_SWAPCHAIN hud_b= images=` | the second swapchain set exists |
+| `TRIAEVUM_XR_FRAME_COPY acquire_failed swapchain= result=`, `TRIAEVUM_XR_ERROR call=xrWaitSwapchainImage swapchain= result=` | an acquire or a non-timeout wait failed (at most 4 lines each; counted in `held_acquire_failures` / `held_wait_timeouts`) |
 | `TRIAEVUM_XR_RENDERER_WAIT mode=queue\|device` | the renderer's device-wait mode, at its first device wait |
 
 How to read a busy view (Lon Lon Ranch looking across the field, the case W2 measured at 24 Hz):
@@ -468,8 +481,8 @@ How to read a busy view (Lon Lon Ranch looking across the field, the case W2 mea
 - CPU-bound render worker: worker `frame` mean above 33.3 with `tick_wait` near 0 and `idle` near 0.
   `ns1 + eye_l + eye_r + ui` is where the time goes.
 - Guest-bound: worker `idle` high while guest `update` plus `stream_wait` fill the frame.
-- GPU-bound: `fence` (the slot fence, two frames back) grows and `pair_shown` approaches two pair periods
-  while worker `frame` stays under 33.3. With the in-frame copy, `TRIAEVUM_XR_STATS incomplete_skips`
+- GPU-bound: `thread=gpu frame` mean near or above 33.3, `fence` (the slot fence, two frames back) grows
+  and `pair_shown` approaches two pair periods while worker `frame` stays under 33.3. With the in-frame copy, `TRIAEVUM_XR_STATS incomplete_skips`
   counts only XR-queue publications (cinema, misses), so it no longer measures GPU lag.
 
 ## Title pairing

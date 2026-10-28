@@ -6,7 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
+#include <utility>
 #include <vector>
 
 namespace TriAevumQuestXr::Logic {
@@ -439,65 +439,83 @@ inline double PerfPercentileMs(const uint32_t* counts, size_t buckets, uint64_t 
     return maxMs;
 }
 
-// ---- The in-frame copy's swapchain images (in-world, TRIAEVUM_XR_FRAME_COPY): the XR thread acquires and
-// waits one image ahead (Ready); the renderer claims it at the end of a frame that drew a pair and records
-// the copy into that frame's own command buffer (Claimed); the frame's publication commits it with the
-// frame's render value (Written); the XR thread releases it once the render timeline reached that value.
-// OpenXR waits and releases images in acquire order, so the queue is oldest first and only its front is
-// ever released. A claim that was never committed (an older claim when a newer one commits) becomes an
-// orphan: it is released only in the same pass as a later image, so its content is never the one shown.
+// ---- The in-frame copy's swapchain images (in-world, TRIAEVUM_XR_FRAME_COPY). OpenXR lets an application
+// wait only one image of a swapchain at a time ("the app must release before waiting on the next acquired
+// swapchain image"), so each role (eyes, HUD) has two swapchains, set 0 and set 1, and each set holds at
+// most one image: Empty -> acquired (Unwaited) -> waited (Ready) -> claimed by a frame that drew a pair
+// (Claimed; the copy is recorded into that frame's own command buffer) -> committed with the frame's render
+// value (Written) -> released by the XR thread once the render timeline reached it (Empty again). While one
+// set's pair is still on the GPU the other set is Ready for the next frame. A claim that will not be
+// published (abandoned, or an older renderer claim when a newer one commits) is an orphan: it is never
+// released; once its writer is GPU-complete the still-waited image becomes Ready again (the next claim
+// discards its content), so an orphan can neither be shown nor block a set.
 template <typename Payload>
-class HeldImageQueue {
+class HeldImageSets {
   public:
-    enum class Stage : uint8_t { Unwaited, Ready, Claimed, Written };
+    enum class Stage : uint8_t { Empty, Unwaited, Ready, Claimed, Written };
     struct Entry {
+        int Set = -1;
         int Index = -1;
-        Stage State = Stage::Unwaited;
+        Stage State = Stage::Empty;
         uint64_t Token = 0;
         uint64_t RenderValue = 0;
         bool Orphan = false;
+        bool Renderer = false;  // claimed by the renderer's frame (not the XR queue's fallback copy)
         Payload Data{};
     };
+    struct ClaimResult {
+        int Set = -1;
+        int Index = -1;
+        explicit operator bool() const { return Set >= 0; }
+    };
 
-    explicit HeldImageQueue(size_t capacity = 2) : mCapacity(std::max<size_t>(1, capacity)) {}
-    void SetCapacity(size_t capacity) { mCapacity = std::max<size_t>(1, capacity); }
-    size_t Capacity() const { return mCapacity; }
-    size_t Size() const { return mEntries.size(); }
+    explicit HeldImageSets(size_t sets = 2) { Reset(sets); }
+    void Reset(size_t sets) {
+        mEntries.assign(std::max<size_t>(1, sets), Entry{});
+        for (size_t i = 0; i < mEntries.size(); ++i) mEntries[i].Set = static_cast<int>(i);
+    }
+    void Clear() { Reset(mEntries.size()); }
+    size_t Sets() const { return mEntries.size(); }
+    const Entry& At(size_t set) const { return mEntries[set]; }
+
+    bool NeedsAcquire(size_t set) const { return set < mEntries.size() && mEntries[set].State == Stage::Empty; }
+    void Acquired(size_t set, int index) {
+        if (!NeedsAcquire(set)) return;
+        mEntries[set].State = Stage::Unwaited;
+        mEntries[set].Index = index;
+    }
+    // The set's only image is acquired and not yet waited (no other image of that swapchain is waited).
+    bool NeedsWait(size_t set) const { return set < mEntries.size() && mEntries[set].State == Stage::Unwaited; }
+    bool Waited(size_t set) {
+        if (!NeedsWait(set)) return false;
+        mEntries[set].State = Stage::Ready;
+        return true;
+    }
     bool HasState(Stage state) const {
         return std::any_of(mEntries.begin(), mEntries.end(), [state](const Entry& e) { return e.State == state; });
     }
-    bool HasUnwaited() const { return HasState(Stage::Unwaited); }
     bool HasReady() const { return HasState(Stage::Ready); }
-    // One image ahead: acquire only with nothing unwaited, nothing ready and room left.
-    bool NeedsAcquire() const { return !HasUnwaited() && !HasReady() && mEntries.size() < mCapacity; }
-    void Acquired(int index) {
-        Entry entry;
-        entry.Index = index;
-        mEntries.push_back(entry);
+    // A renderer frame holds a claim it has not committed yet: its pair is newer than any XR-queue publication.
+    bool HasRendererClaim() const {
+        return std::any_of(mEntries.begin(), mEntries.end(),
+                           [](const Entry& e) { return e.State == Stage::Claimed && e.Renderer; });
     }
-    // The oldest unwaited image is ready (xrWaitSwapchainImage returned).
-    bool Waited() {
-        for (auto& e : mEntries)
-            if (e.State == Stage::Unwaited) {
-                e.State = Stage::Ready;
-                return true;
-            }
-        return false;
-    }
-    // The ready image's index, now claimed by `token` (non-zero); -1 when none is ready.
-    int Claim(uint64_t token) {
-        if (token == 0U) return -1;
+    // Claims a Ready image for `token` (non-zero); none when no set is ready.
+    ClaimResult Claim(uint64_t token, bool renderer = true) {
+        if (token == 0U) return {};
         for (auto& e : mEntries)
             if (e.State == Stage::Ready) {
                 e.State = Stage::Claimed;
                 e.Token = token;
-                return e.Index;
+                e.Renderer = renderer;
+                e.Orphan = false;
+                return {e.Set, e.Index};
             }
-        return -1;
+        return {};
     }
     // The claim of `token` was written by a submission that signals `renderValue` (0: already complete).
-    // With `orphanOlder` (the renderer, whose claims commit in order), older claims become orphans of the
-    // same value: their content is no publication's.
+    // With `orphanOlder` (the renderer, whose claims commit in order), older renderer claims become orphans
+    // of the same value: their content is no publication's. The XR queue's own claims are never touched.
     bool Commit(uint64_t token, uint64_t renderValue, const Payload& data, bool orphanOlder = true) {
         bool found = false;
         for (auto& e : mEntries) {
@@ -507,17 +525,16 @@ class HeldImageQueue {
                 e.RenderValue = renderValue;
                 e.Data = data;
                 found = true;
-                break;
+            } else if (orphanOlder && e.Renderer && e.Token < token) {
+                e.State = Stage::Written;
+                e.RenderValue = renderValue;
+                e.Orphan = true;
             }
-            if (!orphanOlder) continue;
-            e.State = Stage::Written;
-            e.RenderValue = renderValue;
-            e.Orphan = true;
         }
         return found;
     }
-    // The claim of `token` will not be published (a failed copy, a frame without its pair): an orphan,
-    // complete once the timeline reaches `renderValue`.
+    // The claim of `token` will not be published (a failed copy, a frame without its pair): an orphan whose
+    // writer completes at `renderValue` (0: never written), Ready again from then on.
     bool Abandon(uint64_t token, uint64_t renderValue) {
         for (auto& e : mEntries)
             if (e.State == Stage::Claimed && e.Token == token) {
@@ -528,24 +545,33 @@ class HeldImageQueue {
             }
         return false;
     }
-    // Pops what may be released now, oldest first: the written front entries whose render value the
-    // timeline reached (`completed`), without a trailing orphan.
+    // Pops the written images whose render value the timeline reached (`completed`), in set order; their sets
+    // become Empty. Completed orphans become Ready again instead (still waited, never released).
     std::vector<Entry> TakeReleasable(uint64_t completed) {
-        size_t count = 0;
-        while (count < mEntries.size() && mEntries[count].State == Stage::Written &&
-               mEntries[count].RenderValue <= completed)
-            ++count;
-        while (count != 0U && mEntries[count - 1].Orphan) --count;
-        std::vector<Entry> out(mEntries.begin(), mEntries.begin() + static_cast<std::ptrdiff_t>(count));
-        mEntries.erase(mEntries.begin(), mEntries.begin() + static_cast<std::ptrdiff_t>(count));
+        std::vector<Entry> out;
+        for (auto& e : mEntries) {
+            if (e.State != Stage::Written || e.RenderValue > completed) continue;
+            if (e.Orphan) {
+                e.State = Stage::Ready;
+                e.Token = 0;
+                e.RenderValue = 0;
+                e.Orphan = false;
+                e.Renderer = false;
+                ++mRecycled;
+                continue;
+            }
+            out.push_back(e);
+            const int set = e.Set;
+            e = Entry{};
+            e.Set = set;
+        }
         return out;
     }
-    void Clear() { mEntries.clear(); }
-    const std::deque<Entry>& Entries() const { return mEntries; }
+    uint64_t TakeRecycled() { return std::exchange(mRecycled, uint64_t{0}); }
 
   private:
-    size_t mCapacity;
-    std::deque<Entry> mEntries;
+    std::vector<Entry> mEntries;
+    uint64_t mRecycled = 0;
 };
 
 }  // namespace TriAevumQuestXr::Logic
